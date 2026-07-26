@@ -1,0 +1,93 @@
+.settings-container {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+.version-control {
+  background-color: rgba(26, 26, 26, 0.8);
+  border-radius: 12px;
+  padding: 20px;
+  border: 1px solid #333;
+  margin-top: 20px;
+  margin-bottom: 30px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 15px;
+}
+
+.version-select {
+  background-color: #222;
+  color: #fff;
+  border: 1px solid #444;
+  padding: 10px 15px;
+  border-radius: 8px;
+  font-size: 1rem;
+  min-width: 200px;
+}
+
+.version-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.prompts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 25px;
+}
+
+.prompt-item {
+  background-color: rgba(26, 26, 26, 0.8);
+  border-radius: 12px;
+  padding: 20px;
+  border: 1px solid #333;
+}
+
+.prompt-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.prompt-header label {
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 1.1rem;
+}
+
+.help-text {
+  color: #888;
+  font-size: 0.85em;
+  font-style: italic;
+  background: #111;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.prompt-textarea {
+  width: 100%;
+  padding: 15px;
+  border-radius: 8px;
+  border: 1px solid #444;
+  background-color: #1a1a1a;
+  color: #e0e0e0;
+  font-size: 0.95rem;
+  font-family: inherit;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.prompt-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(243, 156, 18, 0.2);
+}
+
+.btn-large {
+  padding: 12px 24px;
+  font-size: 1.05rem;
+}

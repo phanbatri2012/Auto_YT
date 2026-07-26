@@ -1,0 +1,10 @@
+{
+  "gpt_account1": {
+    "email": "YOUR_EMAIL@gmail.com",
+    "password": "YOUR_PASSWORD",
+    "totp_secret": "YOUR_BASE32_TOTP_SECRET",
+    "session_cookie": [],
+    "folder_user_data": "PROFILE_GPT_1",
+    "type_account": "plus"
+  }
+}

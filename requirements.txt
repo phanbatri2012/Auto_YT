@@ -1,0 +1,4 @@
+PyQt6>=6.5
+playwright>=1.40
+pyotp>=2.9
+asyncpg>=0.29

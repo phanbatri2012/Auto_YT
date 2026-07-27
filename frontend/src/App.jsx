@@ -15,8 +15,9 @@ function App() {
   const [activeTab, setActiveTab] = useState('summary')
   const [savedVideos, setSavedVideos] = useState({ items: [], total: 0 })
   const [currentPage, setCurrentPage] = useState(1)
-  const [isGenThumbnail, setIsGenThumbnail] = useState(false)
+  const [generatingThumbnailType, setGeneratingThumbnailType] = useState(null)
   const [isGenAudio, setIsGenAudio] = useState(false)
+  const [audioStatus, setAudioStatus] = useState('not_started')
   const [progressMsg, setProgressMsg] = useState('')
   const [currentVideoId, setCurrentVideoId] = useState(null)
   const [isCurrentVideoPublished, setIsCurrentVideoPublished] = useState(false)
@@ -86,6 +87,46 @@ function App() {
       setCurrentPage(1);
     }
   }, [activeView])
+
+  useEffect(() => {
+    if (!currentVideoId) return;
+
+    let stopped = false;
+    let intervalId = null;
+    const syncAudio = async () => {
+      try {
+        const response = await fetch(
+          `http://127.0.0.1:8080/api/videos/${currentVideoId}/audio-status`
+        );
+        const data = await response.json();
+        if (stopped || !data.success) return;
+
+        const status = data.audio_task?.status || 'not_started';
+        setAudioStatus(status);
+        setIsGenAudio(status === 'pending' || status === 'processing');
+
+        if (status === 'completed') {
+          const videoResponse = await fetch(
+            `http://127.0.0.1:8080/api/videos/${currentVideoId}`
+          );
+          const video = await videoResponse.json();
+          if (!stopped) setResultText(video.generated_script);
+          if (intervalId) clearInterval(intervalId);
+        } else if (status === 'failed' && intervalId) {
+          clearInterval(intervalId);
+        }
+      } catch (error) {
+        console.error('Failed to sync audio status', error);
+      }
+    };
+
+    syncAudio();
+    intervalId = setInterval(syncAudio, 5000);
+    return () => {
+      stopped = true;
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [currentVideoId])
   
   const fetchPromptVersions = async () => {
     try {
@@ -110,6 +151,7 @@ function App() {
     setShowResult(false)
     setErrorMsg('')
     setResultText('')
+    setAudioStatus('not_started')
     setChatUrl('')
     setProgressMsg('⏳ Đang khởi động...')
     
@@ -138,6 +180,10 @@ function App() {
               setChatUrl(data.chat_url || '');
               setCurrentVideoId(data.video_id);
               setIsCurrentVideoPublished(false);
+              setAudioStatus(data.audio_task?.status || 'not_started');
+              if (data.audio_error) {
+                alert('Audio chưa được gửi: ' + data.audio_error);
+              }
               resolve();
             } else if (job.status === 'error') {
               clearInterval(interval);
@@ -203,6 +249,7 @@ function App() {
       setShowResult(true);
       setActiveView('fetcher');
       setCurrentVideoId(id);  // track which video is loaded
+      setAudioStatus('not_started');
     } catch (err) {
       console.error("Failed to load video", err);
       alert("Failed to load video from database.");
@@ -287,14 +334,18 @@ function App() {
     }
   };
 
-  const handleGenerateThumbnails = async () => {
+  const handleGenerateThumbnail = async (thumbnailType) => {
     if (!resultText) return;
-    setIsGenThumbnail(true);
+    setGeneratingThumbnailType(thumbnailType);
     try {
       const res = await fetch('http://127.0.0.1:8080/api/generate-thumbnails', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ script: resultText, video_id: currentVideoId })
+        body: JSON.stringify({
+          script: resultText,
+          video_id: currentVideoId,
+          thumbnail_type: thumbnailType
+        })
       });
       const data = await res.json();
       if (data.success) {
@@ -319,43 +370,66 @@ function App() {
     } catch (err) {
       alert('Không thể kết nối Backend.');
     } finally {
-      setIsGenThumbnail(false);
+      setGeneratingThumbnailType(null);
     }
   };
   const handleGenerateAudio = async () => {
     if (!currentVideoId) return;
     setIsGenAudio(true);
+    let keepPolling = false;
     try {
       const res = await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}/generate-audio`, {
         method: 'POST',
       });
-      const { job_id, success, error: immediateError } = await res.json();
-      if (immediateError) { alert('Lỗi: ' + immediateError); return; }
-      if (!job_id) throw new Error('No job_id returned');
+      const data = await res.json();
+      if (!data.success) {
+        setAudioStatus(data.audio_task?.status || 'failed');
+        alert('Lỗi: ' + (data.error || 'Không thể tạo audio.'));
+        return;
+      }
 
-      // Poll until done
-      await new Promise((resolve) => {
-        const interval = setInterval(async () => {
-          try {
-            const jr = await fetch(`http://127.0.0.1:8080/api/jobs/${job_id}`);
-            const job = await jr.json();
-            if (job.status === 'done') {
-              clearInterval(interval);
-              setResultText(job.result.updated_script);
-              alert('✅ Tạo Audio thành công!');
-              resolve();
-            } else if (job.status === 'error') {
-              clearInterval(interval);
-              alert('Lỗi tạo Audio: ' + (job.error || 'Unknown error'));
-              resolve();
-            }
-          } catch (e) { /* keep polling */ }
-        }, 3000);
-      });
+      const status = data.audio_task?.status || 'pending';
+      setAudioStatus(status);
+      keepPolling = status === 'pending' || status === 'processing';
+      if (status === 'completed') {
+        const videoResponse = await fetch(
+          `http://127.0.0.1:8080/api/videos/${currentVideoId}`
+        );
+        const video = await videoResponse.json();
+        setResultText(video.generated_script);
+      }
     } catch (err) {
       alert('Không thể kết nối Backend.');
     } finally {
+      setIsGenAudio(keepPolling);
+    }
+  };
+
+  const handleRetryAudio = async () => {
+    if (!currentVideoId) return;
+    const confirmed = window.confirm(
+      'Genmax sẽ trừ credit thêm một lần. Bạn có chắc muốn retry audio?'
+    );
+    if (!confirmed) return;
+
+    setIsGenAudio(true);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/retry-audio`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirm_credit_charge: true })
+        }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể retry audio.');
+      }
+      setAudioStatus(data.audio_task?.status || 'pending');
+    } catch (error) {
       setIsGenAudio(false);
+      alert('Lỗi: ' + error.message);
     }
   };
 
@@ -784,15 +858,26 @@ function App() {
                           Raw Transcript
                         </button>
                         <button
-                          onClick={handleGenerateThumbnails}
-                          disabled={isGenThumbnail}
+                          onClick={() => handleGenerateThumbnail('with_text')}
+                          disabled={generatingThumbnailType !== null}
                           style={{
-                            padding: '4px 14px', borderRadius: '4px', cursor: isGenThumbnail ? 'not-allowed' : 'pointer',
-                            border: '1px solid #9b59b6', background: isGenThumbnail ? '#333' : 'rgba(155,89,182,0.2)',
-                            color: isGenThumbnail ? '#888' : '#c39bd3', fontWeight: 'bold'
+                            padding: '4px 14px', borderRadius: '4px', cursor: generatingThumbnailType ? 'not-allowed' : 'pointer',
+                            border: '1px solid #9b59b6', background: generatingThumbnailType ? '#333' : 'rgba(155,89,182,0.2)',
+                            color: generatingThumbnailType ? '#888' : '#c39bd3', fontWeight: 'bold'
                           }}
                         >
-                          {isGenThumbnail ? '⏳ Đang tạo ảnh...' : '🎨 Tạo Thumbnail'}
+                          {generatingThumbnailType === 'with_text' ? '⏳ Đang tạo có chữ...' : '🎨 Tạo lại thumbnail có chữ'}
+                        </button>
+                        <button
+                          onClick={() => handleGenerateThumbnail('without_text')}
+                          disabled={generatingThumbnailType !== null}
+                          style={{
+                            padding: '4px 14px', borderRadius: '4px', cursor: generatingThumbnailType ? 'not-allowed' : 'pointer',
+                            border: '1px solid #3498db', background: generatingThumbnailType ? '#333' : 'rgba(52,152,219,0.2)',
+                            color: generatingThumbnailType ? '#888' : '#85c1e9', fontWeight: 'bold'
+                          }}
+                        >
+                          {generatingThumbnailType === 'without_text' ? '⏳ Đang tạo không chữ...' : '🖼️ Tạo lại thumbnail không chữ'}
                         </button>
                         {currentVideoId && (
                           <button 
@@ -809,15 +894,26 @@ function App() {
                         )}
                         {currentVideoId && !audioUrl && (
                           <button
-                            onClick={handleGenerateAudio}
+                            onClick={
+                              audioStatus === 'failed'
+                                ? handleRetryAudio
+                                : handleGenerateAudio
+                            }
                             disabled={isGenAudio}
                             style={{
-                              padding: '4px 14px', borderRadius: '4px', cursor: isGenAudio ? 'not-allowed' : 'pointer',
-                              border: '1px solid #1abc9c', background: isGenAudio ? '#333' : 'rgba(26,188,156,0.2)',
-                              color: isGenAudio ? '#888' : '#1abc9c', fontWeight: 'bold'
+                              padding: '4px 14px', borderRadius: '4px',
+                              cursor: isGenAudio ? 'not-allowed' : 'pointer',
+                              border: '1px solid #1abc9c',
+                              background: isGenAudio ? '#333' : 'rgba(26,188,156,0.2)',
+                              color: isGenAudio ? '#888' : '#1abc9c',
+                              fontWeight: 'bold'
                             }}
                           >
-                            {isGenAudio ? '⏳ Đang tạo audio...' : '🎵 Tạo Audio'}
+                            {isGenAudio
+                              ? '⏳ Đang chờ Genmax...'
+                              : audioStatus === 'failed'
+                                ? '⚠️ Retry Audio (sẽ tốn credit)'
+                                : '🎵 Tạo Audio'}
                           </button>
                         )}
                         {chatUrl && (

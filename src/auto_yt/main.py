@@ -2,10 +2,11 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Literal, Optional
 import asyncio
 import json
 import threading
+import time
 import uuid
 from auto_yt.paths import ACCOUNT_PATH, DATA_DIR, CHROME_USER_DATA_DIR, gpt_profile_dir, PROMPTS_PATH, THUMBNAILS_DIR
 from auto_yt.default_prompts import DEFAULT_PROMPTS_DATA
@@ -110,6 +111,10 @@ class VideoResponse(BaseModel):
     error: str = None
     video_id: Optional[int] = None
 
+
+class RetryAudioRequest(BaseModel):
+    confirm_credit_charge: bool
+
 def apply_tts_filters(text: str) -> str:
     """
     Bộ lọc xử lý văn bản trước khi gửi cho TTS API để tránh đọc sai.
@@ -146,6 +151,186 @@ def get_clean_script_for_tts(text: str) -> str:
         pass
     return script
 
+
+AUDIO_VOICE_ID = "e1d9617c-045c-4072-8d17-9be0ec113723"
+AUDIO_POLL_INTERVAL_SECONDS = 15
+_audio_submit_lock = threading.Lock()
+_audio_watchers: dict[int, threading.Thread] = {}
+_audio_watchers_lock = threading.Lock()
+
+
+def _audio_task_response(task: dict) -> dict:
+    return {
+        "video_id": task["video_id"],
+        "task_id": task["task_id"],
+        "status": task["status"],
+        "audio_url": task.get("audio_url", ""),
+        "error": task.get("error", ""),
+        "updated_at": task["updated_at"],
+    }
+
+
+def _save_audio_url(video_id: int, audio_url: str) -> str:
+    video = db.get_video(video_id)
+    if not video:
+        raise RuntimeError("Video không còn tồn tại.")
+
+    script = video["generated_script"]
+    audio_section = f"### [AUDIO]\n{audio_url}"
+    if "### [AUDIO]" in script:
+        updated_script = re.sub(
+            r"### \[AUDIO\]\n.*?(?=\n### \[|\Z)",
+            audio_section,
+            script,
+            flags=re.DOTALL,
+        )
+    else:
+        updated_script = f"{script.rstrip()}\n\n{audio_section}"
+
+    if updated_script != script:
+        db.update_script(video_id, updated_script)
+    return updated_script
+
+
+def _sync_audio_task(video_id: int) -> dict:
+    stored_task = db.get_audio_task(video_id)
+    if not stored_task:
+        raise RuntimeError("Không tìm thấy audio task.")
+
+    remote_task = tts.get_tts_task(stored_task["task_id"])
+    status = remote_task.get("status", stored_task["status"])
+    audio_url = (remote_task.get("result") or {}).get("audio_url", "")
+    error = remote_task.get("error") or remote_task.get("detail_error") or ""
+
+    if status == "completed" and not audio_url:
+        raise RuntimeError("Task Genmax hoàn thành nhưng thiếu URL audio.")
+
+    task = db.upsert_audio_task(
+        video_id=video_id,
+        request_hash=stored_task["request_hash"],
+        task_id=stored_task["task_id"],
+        status=status,
+        audio_url=audio_url,
+        error=str(error),
+    )
+    if status == "completed":
+        _save_audio_url(video_id, audio_url)
+    return task
+
+
+def _watch_audio_task(video_id: int) -> None:
+    try:
+        while True:
+            try:
+                task = _sync_audio_task(video_id)
+                if task["status"] in {"completed", "failed"}:
+                    return
+            except Exception as exc:
+                print(
+                    f"Audio task sync failed for video {video_id}: {exc}",
+                    file=sys.stderr,
+                )
+            time.sleep(AUDIO_POLL_INTERVAL_SECONDS)
+    finally:
+        with _audio_watchers_lock:
+            _audio_watchers.pop(video_id, None)
+
+
+def _start_audio_watcher(video_id: int) -> None:
+    with _audio_watchers_lock:
+        watcher = _audio_watchers.get(video_id)
+        if watcher and watcher.is_alive():
+            return
+        watcher = threading.Thread(
+            target=_watch_audio_task,
+            args=(video_id,),
+            daemon=True,
+        )
+        _audio_watchers[video_id] = watcher
+        watcher.start()
+
+
+def _ensure_audio_task(video_id: int) -> dict:
+    video = db.get_video(video_id)
+    if not video:
+        raise RuntimeError("Video không tồn tại.")
+
+    script_for_tts = get_clean_script_for_tts(video["generated_script"])
+    if not script_for_tts:
+        raise RuntimeError(
+            "Không tìm thấy kịch bản để đọc (thiếu INTRO/BODY/OUTRO)."
+        )
+
+    filtered_script = apply_tts_filters(script_for_tts)
+    request_hash = tts.get_request_hash(filtered_script, AUDIO_VOICE_ID)
+
+    with _audio_submit_lock:
+        stored_task = db.get_audio_task(video_id)
+        if stored_task:
+            if stored_task["request_hash"] != request_hash:
+                if stored_task["status"] in {"pending", "processing"}:
+                    raise RuntimeError(
+                        "Video đang có một audio task cho phiên bản kịch bản trước."
+                    )
+            else:
+                if stored_task["status"] == "completed":
+                    _save_audio_url(video_id, stored_task["audio_url"])
+                elif stored_task["status"] in {"pending", "processing"}:
+                    _start_audio_watcher(video_id)
+                return stored_task
+
+        shared_task = db.get_audio_task_by_request_hash(request_hash)
+        if shared_task:
+            task = db.upsert_audio_task(
+                video_id=video_id,
+                request_hash=request_hash,
+                task_id=shared_task["task_id"],
+                status=shared_task["status"],
+                audio_url=shared_task.get("audio_url", ""),
+                error=shared_task.get("error", ""),
+            )
+            if task["status"] == "completed":
+                _save_audio_url(video_id, task["audio_url"])
+            elif task["status"] in {"pending", "processing"}:
+                _start_audio_watcher(video_id)
+            return task
+
+        # Fail closed: if history cannot be checked, no new paid task is submitted.
+        remote_task = tts.find_matching_task(filtered_script, AUDIO_VOICE_ID)
+        if remote_task:
+            status = remote_task.get("status", "pending")
+            audio_url = (remote_task.get("result") or {}).get("audio_url", "")
+            error = remote_task.get("error") or remote_task.get("detail_error") or ""
+            task = db.upsert_audio_task(
+                video_id=video_id,
+                request_hash=request_hash,
+                task_id=remote_task["id"],
+                status=status,
+                audio_url=audio_url,
+                error=str(error),
+            )
+            if status == "completed" and audio_url:
+                _save_audio_url(video_id, audio_url)
+            elif status in {"pending", "processing"}:
+                _start_audio_watcher(video_id)
+            return task
+
+        submitted_task = tts.submit_tts_task(filtered_script, AUDIO_VOICE_ID)
+        task = db.upsert_audio_task(
+            video_id=video_id,
+            request_hash=request_hash,
+            task_id=submitted_task["id"],
+            status=submitted_task.get("status", "pending"),
+        )
+        _start_audio_watcher(video_id)
+        return task
+
+
+@app.on_event("startup")
+def resume_audio_watchers() -> None:
+    for task in db.get_active_audio_tasks():
+        _start_audio_watcher(task["video_id"])
+
 @app.post("/api/process-video")
 def process_video(request: VideoRequest):
     job_id = uuid.uuid4().hex[:12]
@@ -169,21 +354,17 @@ def process_video(request: VideoRequest):
             summary_text = worker_result["script"] if isinstance(worker_result, dict) else worker_result
             chat_url = worker_result.get("chat_url", "") if isinstance(worker_result, dict) else ""
 
-            # Generate Audio
-            script_for_tts = get_clean_script_for_tts(summary_text)
-            if script_for_tts:
-                try:
-                    update("🎙️ Đang tạo giọng đọc AI (tối đa 5 phút)...")
-                    filtered_script = apply_tts_filters(script_for_tts)
-                    voice_id = "e1d9617c-045c-4072-8d17-9be0ec113723"
-                    audio_url = tts.generate_tts(filtered_script, voice_id)
-                    if audio_url:
-                        summary_text += f"\n\n### [AUDIO]\n{audio_url}"
-                except Exception as e:
-                    print(f"Error generating Audio: {e}")
-
             update("💾 Đang lưu vào database...")
             video_id = db.save_video(request.url, title, full_transcript, summary_text, chat_url, request.prompt_version or 'default')
+            audio_task = None
+            audio_error = None
+            if get_clean_script_for_tts(summary_text):
+                try:
+                    update("🎙️ Đang kiểm tra và gửi yêu cầu audio an toàn...")
+                    audio_task = _ensure_audio_task(video_id)
+                    summary_text = db.get_video(video_id)["generated_script"]
+                except Exception as exc:
+                    audio_error = str(exc)
 
             with _jobs_lock:
                 _jobs[job_id].update({
@@ -194,7 +375,11 @@ def process_video(request: VideoRequest):
                         "full_transcript": full_transcript,
                         "summary": summary_text,
                         "chat_url": chat_url,
-                        "video_id": video_id
+                        "video_id": video_id,
+                        "audio_task": (
+                            _audio_task_response(audio_task) if audio_task else None
+                        ),
+                        "audio_error": audio_error,
                     }
                 })
 
@@ -232,6 +417,7 @@ def get_videos(limit: int = 10, offset: int = 0, is_published: Optional[int] = N
 class GenerateThumbnailsRequest(BaseModel):
     script: str
     video_id: int = None  # optional - if given, updates db record
+    thumbnail_type: Literal["with_text", "without_text"]
 
 @app.post("/api/generate-thumbnails")
 async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, background_tasks: BackgroundTasks):
@@ -252,7 +438,12 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: generate_thumbnails_only(req.script, resolved_chat_url, resolved_prompt_version)
+            lambda: generate_thumbnails_only(
+                req.script,
+                resolved_chat_url,
+                resolved_prompt_version,
+                req.thumbnail_type,
+            )
         )
         
         # If video_id provided, patch the stored script to add image URLs
@@ -262,54 +453,31 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
                 script = video["generated_script"]
                 import re
                 
-                # Handling Thumbnail 1
-                new_text1 = result.get("thumb_text")
-                if not new_text1:  # Treat empty string as None
-                    new_text1 = None
-                
-                if new_text1 is None:
-                    # User provided a custom prompt, so we keep the original text but append the image url
-                    match1 = re.search(r'### \[THUMBNAIL CÓ CHỮ\]\n(.*?)(?=\n### \[|\Z)', script, re.DOTALL)
-                    if match1:
-                        candidate = match1.group(1).strip()
-                        # Only keep if it has meaningful content (not just emoji or short reaction)
-                        if len(candidate) > 20:
-                            new_text1 = candidate
-                
-                if new_text1 is None:
-                    new_text1 = ""
-                    
-                if new_text1 or result.get("image1_url"):
-                    if result.get("image1_url"):
-                        # Remove any existing [IMAGE_URL] tag before appending the new one
-                        new_text1 = re.sub(r'\[IMAGE_URL:.*?\]', '', new_text1).strip()
-                        new_text1 += f"\n\n[IMAGE_URL:{result['image1_url']}]"
-                    
-                    if "### [THUMBNAIL CÓ CHỮ]" in script:
-                        script = re.sub(r'(### \[THUMBNAIL CÓ CHỮ\]\n).*?(?=\n### \[|\Z)', rf'\1{new_text1.strip()}\n\n', script, flags=re.DOTALL)
+                if req.thumbnail_type == "with_text":
+                    section_title = "THUMBNAIL CÓ CHỮ"
+                    generated_text = result.get("thumb_text")
+                    image_url = result.get("image1_url")
+                else:
+                    section_title = "THUMBNAIL KHÔNG CHỮ"
+                    generated_text = result.get("thumb_notext")
+                    image_url = result.get("image2_url")
 
-                # Handling Thumbnail 2
-                new_text2 = result.get("thumb_notext")
-                if not new_text2:
-                    new_text2 = None
-                    
-                if new_text2 is None:
-                    match2 = re.search(r'### \[THUMBNAIL KHÔNG CHỮ\]\n(.*?)(?=\n### \[|\Z)', script, re.DOTALL)
-                    if match2:
-                        candidate2 = match2.group(1).strip()
-                        if len(candidate2) > 20:
-                            new_text2 = candidate2
-                        
-                if new_text2 is None:
-                    new_text2 = ""
-                    
-                if new_text2 or result.get("image2_url"):
-                    if result.get("image2_url"):
-                        new_text2 = re.sub(r'\[IMAGE_URL:.*?\]', '', new_text2).strip()
-                        new_text2 += f"\n\n[IMAGE_URL:{result['image2_url']}]"
-                        
-                    if "### [THUMBNAIL KHÔNG CHỮ]" in script:
-                        script = re.sub(r'(### \[THUMBNAIL KHÔNG CHỮ\]\n).*?(?=\n### \[|\Z)', rf'\1{new_text2.strip()}\n', script, flags=re.DOTALL)
+                section_pattern = rf'### \[{re.escape(section_title)}\]\n(.*?)(?=\n### \[|\Z)'
+                section_match = re.search(section_pattern, script, re.DOTALL)
+                current_text = section_match.group(1).strip() if section_match else ""
+                updated_text = generated_text or current_text
+
+                if image_url:
+                    updated_text = re.sub(r'\[IMAGE_URL:.*?\]', '', updated_text).strip()
+                    updated_text += f"\n\n[IMAGE_URL:{image_url}]"
+
+                if section_match:
+                    script = re.sub(
+                        rf'(### \[{re.escape(section_title)}\]\n).*?(?=\n### \[|\Z)',
+                        rf'\1{updated_text.strip()}\n',
+                        script,
+                        flags=re.DOTALL,
+                    )
                         
                 db.update_script(req.video_id, script)
         
@@ -323,48 +491,110 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
 
 @app.post("/api/videos/{video_id}/generate-audio")
 def generate_audio_for_video(video_id: int):
-    """Generate TTS audio for an existing video. Returns job_id immediately."""
+    """Create or resume the single persistent Genmax task for a video."""
     video = db.get_video(video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
     script = video["generated_script"]
     if "### [AUDIO]" in script:
-        return {"success": False, "error": "Video đã có audio. Không cần tạo lại."}
+        stored_task = db.get_audio_task(video_id)
+        if stored_task:
+            return {
+                "success": True,
+                "audio_task": _audio_task_response(stored_task),
+            }
+        return {
+            "success": True,
+            "audio_task": {
+                "video_id": video_id,
+                "status": "completed",
+                "audio_url": script.split("### [AUDIO]", 1)[1].strip(),
+                "error": "",
+            },
+        }
 
-    script_for_tts = get_clean_script_for_tts(script)
-    if not script_for_tts:
-        return {"success": False, "error": "Không tìm thấy kịch bản để đọc (thiếu INTRO/BODY/OUTRO)."}
+    try:
+        task = _ensure_audio_task(video_id)
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
 
-    job_id = uuid.uuid4().hex[:12]
-    with _jobs_lock:
-        _jobs[job_id] = {"status": "running", "progress": "🎙️ Đang tạo giọng đọc AI...", "result": None, "error": None}
+    if task["status"] == "failed":
+        return {
+            "success": False,
+            "error": (
+                "Task Genmax đã thất bại. Hệ thống không tự retry để tránh "
+                "trừ credit lần nữa."
+            ),
+            "audio_task": _audio_task_response(task),
+        }
+    return {"success": True, "audio_task": _audio_task_response(task)}
 
-    def _run():
-        try:
-            filtered_script = apply_tts_filters(script_for_tts)
-            voice_id = "e1d9617c-045c-4072-8d17-9be0ec113723"
-            audio_url = tts.generate_tts(filtered_script, voice_id)
-            if not audio_url:
-                raise Exception("TTS API không trả về URL audio.")
-            new_script = script + f"\n\n### [AUDIO]\n{audio_url}"
-            db.update_script(video_id, new_script)
-            with _jobs_lock:
-                _jobs[job_id].update({
-                    "status": "done",
-                    "progress": "✅ Tạo audio thành công!",
-                    "result": {"success": True, "audio_url": audio_url, "updated_script": new_script}
-                })
-        except Exception as e:
-            with _jobs_lock:
-                _jobs[job_id].update({
-                    "status": "error",
-                    "progress": f"❌ Lỗi: {str(e)[:100]}",
-                    "error": str(e)
-                })
 
-    threading.Thread(target=_run, daemon=True).start()
-    return {"job_id": job_id}
+@app.get("/api/videos/{video_id}/audio-status")
+def get_audio_status(video_id: int):
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    task = db.get_audio_task(video_id)
+    if task:
+        if task["status"] in {"pending", "processing"}:
+            _start_audio_watcher(video_id)
+        return {"success": True, "audio_task": _audio_task_response(task)}
+
+    script = video["generated_script"]
+    if "### [AUDIO]" in script:
+        return {
+            "success": True,
+            "audio_task": {
+                "video_id": video_id,
+                "status": "completed",
+                "audio_url": script.split("### [AUDIO]", 1)[1].strip(),
+                "error": "",
+            },
+        }
+    return {
+        "success": True,
+        "audio_task": {
+            "video_id": video_id,
+            "status": "not_started",
+            "audio_url": "",
+            "error": "",
+        },
+    }
+
+
+@app.post("/api/videos/{video_id}/retry-audio")
+def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
+    if not request.confirm_credit_charge:
+        raise HTTPException(
+            status_code=400,
+            detail="Phải xác nhận Genmax sẽ trừ credit lần nữa.",
+        )
+
+    with _audio_submit_lock:
+        task = db.get_audio_task(video_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Audio task not found")
+        if task["status"] != "failed":
+            raise HTTPException(
+                status_code=409,
+                detail="Chỉ được retry task đã thất bại.",
+            )
+
+        retried_task = tts.retry_tts_task(task["task_id"])
+        updated_task = db.upsert_audio_task(
+            video_id=video_id,
+            request_hash=task["request_hash"],
+            task_id=retried_task["id"],
+            status=retried_task.get("status", "pending"),
+        )
+        _start_audio_watcher(video_id)
+        return {
+            "success": True,
+            "audio_task": _audio_task_response(updated_task),
+        }
 
 
 @app.put("/api/videos/{video_id}/publish")

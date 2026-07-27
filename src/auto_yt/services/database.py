@@ -38,6 +38,23 @@ def init_db():
         c.execute("ALTER TABLE videos ADD COLUMN prompt_version TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS audio_tasks (
+            video_id INTEGER PRIMARY KEY,
+            request_hash TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            audio_url TEXT DEFAULT '',
+            error TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE
+        )
+    ''')
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_audio_tasks_request_hash '
+        'ON audio_tasks(request_hash)'
+    )
     conn.commit()
     conn.close()
 
@@ -105,6 +122,7 @@ def get_video(video_id: int) -> dict:
 def delete_video(video_id: int) -> bool:
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
+    c.execute('DELETE FROM audio_tasks WHERE video_id = ?', (video_id,))
     c.execute('DELETE FROM videos WHERE id = ?', (video_id,))
     deleted = c.rowcount > 0
     conn.commit()
@@ -119,6 +137,92 @@ def update_script(video_id: int, new_script: str) -> bool:
     conn.commit()
     conn.close()
     return success
+
+def get_audio_task(video_id: int) -> dict:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM audio_tasks WHERE video_id = ?', (video_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_audio_task_by_request_hash(request_hash: str) -> dict:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        '''
+        SELECT * FROM audio_tasks
+        WHERE request_hash = ?
+        ORDER BY
+            CASE status
+                WHEN 'completed' THEN 0
+                WHEN 'processing' THEN 1
+                WHEN 'pending' THEN 2
+                WHEN 'failed' THEN 3
+                ELSE 4
+            END,
+            created_at ASC
+        LIMIT 1
+        ''',
+        (request_hash,),
+    )
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_active_audio_tasks() -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        "SELECT * FROM audio_tasks WHERE status IN ('pending', 'processing')"
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def upsert_audio_task(
+    video_id: int,
+    request_hash: str,
+    task_id: str,
+    status: str,
+    audio_url: str = '',
+    error: str = '',
+) -> dict:
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    conn = sqlite3.connect(str(DB_PATH))
+    c = conn.cursor()
+    c.execute(
+        '''
+        INSERT INTO audio_tasks (
+            video_id, request_hash, task_id, status, audio_url, error,
+            created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(video_id) DO UPDATE SET
+            request_hash = excluded.request_hash,
+            task_id = excluded.task_id,
+            status = excluded.status,
+            audio_url = excluded.audio_url,
+            error = excluded.error,
+            updated_at = excluded.updated_at
+        ''',
+        (
+            video_id,
+            request_hash,
+            task_id,
+            status,
+            audio_url,
+            error,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return get_audio_task(video_id)
 
 # Initialize tables when module is imported
 init_db()

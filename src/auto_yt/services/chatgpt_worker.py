@@ -371,12 +371,25 @@ def run(transcript: str) -> str:
 
         return {"script": final_script, "chat_url": chat_url}
 
-def generate_thumbnails_only(script_text: str, chat_url: str = '', prompt_version: str = '') -> dict:
+def generate_thumbnails_only(
+    script_text: str,
+    chat_url: str = '',
+    prompt_version: str = '',
+    thumbnail_type: str | None = None,
+) -> dict:
     """Run only thumbnail generation steps (8 & 9).
     If chat_url is provided, navigates to that session to keep context.
     Otherwise opens a new chat.
     Uses the specified prompt_version if provided.
     """
+    if thumbnail_type is not None:
+        return _generate_single_thumbnail(
+            script_text,
+            chat_url,
+            prompt_version,
+            thumbnail_type,
+        )
+
     profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
     if not profile_dir.exists():
         raise Exception("Profile directory not found. Please run the auto-login tool first.")
@@ -494,6 +507,7 @@ def generate_thumbnails_only(script_text: str, chat_url: str = '', prompt_versio
         # Step 8: Thumbnail Có Chữ
         print(">>>> GEN THUMBNAIL (CÓ CHỮ)", file=sys.stderr)
         text1_regenerated = False
+        thumb1 = None
 
         # Kiểm tra ảnh đã có sẵn trong chat trước khi gửi prompt mới
         images_before = page.locator('div[data-message-author-role="assistant"] img[src*="backend-api/estuary"]')
@@ -595,6 +609,200 @@ def generate_thumbnails_only(script_text: str, chat_url: str = '', prompt_versio
             "image1_url": image1_url,
             "image2_url": image2_url,
         }
+
+
+def _generate_single_thumbnail(
+    script_text: str,
+    chat_url: str,
+    prompt_version: str,
+    thumbnail_type: str,
+) -> dict:
+    thumbnail_configs = {
+        "with_text": {
+            "section": "### [THUMBNAIL CÓ CHỮ]",
+            "prompt_key": "thumb_text",
+            "text_result_key": "thumb_text",
+            "image_result_key": "image1_url",
+            "label": "CÓ CHỮ",
+        },
+        "without_text": {
+            "section": "### [THUMBNAIL KHÔNG CHỮ]",
+            "prompt_key": "thumb_notext",
+            "text_result_key": "thumb_notext",
+            "image_result_key": "image2_url",
+            "label": "KHÔNG CHỮ",
+        },
+    }
+    config = thumbnail_configs.get(thumbnail_type)
+    if config is None:
+        raise ValueError(f"Unsupported thumbnail type: {thumbnail_type}")
+
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception("Profile directory not found. Please run the auto-login tool first.")
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            str(profile_dir),
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+            viewport={"width": 1280, "height": 800},
+        )
+
+        page = context.pages[0] if context.pages else context.new_page()
+        target_url = chat_url if chat_url and chat_url.startswith("https://chatgpt.com/c/") else "https://chatgpt.com"
+        print(f"    -> Navigating to: {target_url}", file=sys.stderr)
+        page.goto(target_url, wait_until="domcontentloaded")
+        time.sleep(2)
+
+        import os
+        original_prompt_version = os.environ.get("PROMPT_VERSION")
+        if prompt_version:
+            os.environ["PROMPT_VERSION"] = prompt_version
+        try:
+            prompts = get_active_prompts()
+        finally:
+            if original_prompt_version is not None:
+                os.environ["PROMPT_VERSION"] = original_prompt_version
+            else:
+                os.environ.pop("PROMPT_VERSION", None)
+
+        def get_image_locator():
+            selectors = (
+                'img[src*="backend-api/estuary"]',
+                'img[alt*="Generated image"]',
+                'img[alt*="DALL"]',
+                'img[src*="files/"]',
+            )
+            for selector in selectors:
+                images = page.locator(selector)
+                if images.count() > 0:
+                    return images
+            return None
+
+        def download_image(chatgpt_url: str) -> str:
+            try:
+                THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
+                filename = f"thumb_{uuid.uuid4().hex[:12]}.png"
+                destination = THUMBNAILS_DIR / filename
+                image_base64 = page.evaluate(
+                    """
+                    async (url) => {
+                        const response = await fetch(url, { credentials: 'include' });
+                        if (!response.ok) throw new Error(`Image download failed: ${response.status}`);
+                        const buffer = await response.arrayBuffer();
+                        const bytes = new Uint8Array(buffer);
+                        let binary = '';
+                        for (let i = 0; i < bytes.byteLength; i++) {
+                            binary += String.fromCharCode(bytes[i]);
+                        }
+                        return btoa(binary);
+                    }
+                    """,
+                    chatgpt_url,
+                )
+                import base64
+                destination.write_bytes(base64.b64decode(image_base64))
+                return f"/api/thumbnails/{filename}"
+            except Exception as exc:
+                print(f"    -> Image download failed: {exc}", file=sys.stderr)
+                return ""
+
+        def extract_new_image(previous_count: int) -> str:
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                images = get_image_locator()
+                image_count = images.count() if images is not None else 0
+                if image_count > previous_count:
+                    chatgpt_url = images.nth(image_count - 1).get_attribute("src")
+                    if chatgpt_url:
+                        return download_image(chatgpt_url) or chatgpt_url
+                time.sleep(1)
+            return ""
+
+        def extract_section_prompt() -> str:
+            pattern = re.escape(config["section"]) + r'(.*?)(?=### \[|\Z)'
+            section_match = re.search(pattern, script_text, re.DOTALL)
+            if not section_match:
+                return ""
+            prompt_match = re.search(
+                r'Prompt hình ảnh:\s*(.*?)(?=\n\n|\Z)',
+                section_match.group(1),
+                re.IGNORECASE | re.DOTALL,
+            )
+            return prompt_match.group(1).strip() if prompt_match else ""
+
+        def extract_draw_prompt(response_text: str) -> str:
+            prompt_match = re.search(
+                r'Prompt hình ảnh:\s*(.*?)(?=\n\n|\Z)',
+                response_text,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if prompt_match:
+                return prompt_match.group(1).strip()
+
+            json_match = re.search(r'```(?:json)?\n(.*?)```', response_text, re.IGNORECASE | re.DOTALL)
+            if json_match:
+                return json_match.group(1).strip()
+
+            json_object_match = re.search(r'(\{.*\})', response_text, re.DOTALL)
+            if json_object_match:
+                return json_object_match.group(1).strip()
+
+            return response_text.strip() if len(response_text.strip()) > 20 and '👍' not in response_text else ""
+
+        extracted_prompt = extract_section_prompt()
+        is_original_chat = chat_url and chat_url.startswith("https://chatgpt.com/c/")
+        if not is_original_chat and not extracted_prompt:
+            context_prompt = f"Đây là nội dung kịch bản video YouTube tôi cần tạo thumbnail:\n\n{script_text[:3000]}"
+            send_prompt(page, context_prompt)
+
+        if extracted_prompt:
+            generation_prompt = (
+                "Vui lòng vẽ chính xác hình ảnh (Tỷ lệ 16:9) bám sát tuyệt đối "
+                f"mô tả sau đây:\n\n{extracted_prompt}\n\n"
+                "LƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN."
+            )
+            text_regenerated = False
+        else:
+            generation_prompt = prompts.get(config["prompt_key"], "")
+            generation_prompt += (
+                "\n\nLƯU Ý QUAN TRỌNG: TRẢ LỜI TRỰC TIẾP VÀO NỘI DUNG. "
+                "TUYỆT ĐỐI KHÔNG CHÀO HỎI, KHÔNG DẠ VÂNG, KHÔNG THÊM CÂU DẪN. "
+                "CHỈ IN RA ĐÚNG NỘI DUNG CẦN VIẾT."
+            )
+            text_regenerated = True
+
+        existing_images = get_image_locator()
+        previous_image_count = existing_images.count() if existing_images is not None else 0
+        print(f">>>> REGENERATE THUMBNAIL ({config['label']})", file=sys.stderr)
+        response_text = send_prompt(page, generation_prompt)
+        image_url = extract_new_image(previous_image_count)
+
+        if not image_url and not extracted_prompt:
+            draw_prompt = extract_draw_prompt(response_text)
+            if draw_prompt:
+                existing_images = get_image_locator()
+                previous_image_count = existing_images.count() if existing_images is not None else 0
+                send_prompt(
+                    page,
+                    "Vui lòng vẽ chính xác hình ảnh (Tỷ lệ 16:9) bám sát tuyệt đối "
+                    f"mô tả sau đây:\n\n{draw_prompt}\n\n"
+                    "LƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN.",
+                )
+                image_url = extract_new_image(previous_image_count)
+
+        context.close()
+
+        result = {
+            "thumb_text": None,
+            "thumb_notext": None,
+            "image1_url": "",
+            "image2_url": "",
+        }
+        result[config["text_result_key"]] = response_text if text_regenerated else None
+        result[config["image_result_key"]] = image_url
+        return result
 
 
 if __name__ == "__main__":

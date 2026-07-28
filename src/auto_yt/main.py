@@ -374,6 +374,7 @@ def process_video(request: VideoRequest):
                         "success": True,
                         "full_transcript": full_transcript,
                         "summary": summary_text,
+                        "title": title,
                         "chat_url": chat_url,
                         "video_id": video_id,
                         "audio_task": (

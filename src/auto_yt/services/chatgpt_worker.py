@@ -19,6 +19,53 @@ _HERE = __import__('pathlib').Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parent.parent.parent))
 
 DEFAULT_GPT_PROFILE = "PROFILE_GPT_1"
+PROFILE_WAIT_TIMEOUT_SECONDS = 20 * 60
+PROFILE_RETRY_INTERVAL_SECONDS = 5
+PROFILE_BUSY_ERROR_MARKERS = (
+    "Opening in existing browser session",
+    "profile is already in use",
+    "ProcessSingleton",
+)
+
+
+def launch_chatgpt_context(
+    browser_type,
+    profile_dir,
+    wait_timeout: float = PROFILE_WAIT_TIMEOUT_SECONDS,
+    retry_interval: float = PROFILE_RETRY_INTERVAL_SECONDS,
+):
+    deadline = time.monotonic() + wait_timeout
+
+    while True:
+        try:
+            return browser_type.launch_persistent_context(
+                str(profile_dir),
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled"],
+                viewport={"width": 1280, "height": 800},
+            )
+        except Exception as exc:
+            error_message = str(exc)
+            profile_is_busy = any(
+                marker.lower() in error_message.lower()
+                for marker in PROFILE_BUSY_ERROR_MARKERS
+            )
+            if not profile_is_busy:
+                raise
+
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise RuntimeError(
+                    "ChatGPT browser profile is still busy after waiting "
+                    f"{wait_timeout:g} seconds."
+                ) from exc
+
+            print(
+                "ChatGPT browser profile is busy; waiting for the current "
+                "video or thumbnail job to finish...",
+                file=sys.stderr,
+            )
+            time.sleep(min(retry_interval, remaining_seconds))
 
 def get_active_prompts():
     try:
@@ -191,12 +238,7 @@ def run(transcript: str) -> str:
         raise Exception("Profile directory not found. Please run the auto-login tool first.")
 
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            str(profile_dir),
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-            viewport={"width": 1280, "height": 800},
-        )
+        context = launch_chatgpt_context(p.chromium, profile_dir)
 
         page = context.pages[0] if context.pages else context.new_page()
         page.goto("https://chatgpt.com", wait_until="domcontentloaded")
@@ -395,12 +437,7 @@ def generate_thumbnails_only(
         raise Exception("Profile directory not found. Please run the auto-login tool first.")
 
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            str(profile_dir),
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-            viewport={"width": 1280, "height": 800},
-        )
+        context = launch_chatgpt_context(p.chromium, profile_dir)
 
         page = context.pages[0] if context.pages else context.new_page()
         
@@ -642,12 +679,7 @@ def _generate_single_thumbnail(
         raise Exception("Profile directory not found. Please run the auto-login tool first.")
 
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            str(profile_dir),
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-            viewport={"width": 1280, "height": 800},
-        )
+        context = launch_chatgpt_context(p.chromium, profile_dir)
 
         page = context.pages[0] if context.pages else context.new_page()
         target_url = chat_url if chat_url and chat_url.startswith("https://chatgpt.com/c/") else "https://chatgpt.com"

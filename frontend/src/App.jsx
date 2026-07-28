@@ -20,6 +20,7 @@ function App() {
   const [audioStatus, setAudioStatus] = useState('not_started')
   const [progressMsg, setProgressMsg] = useState('')
   const [currentVideoId, setCurrentVideoId] = useState(null)
+  const [videoTitle, setVideoTitle] = useState('')
   const [isCurrentVideoPublished, setIsCurrentVideoPublished] = useState(false)
   
   const [promptVersions, setPromptVersions] = useState([])
@@ -51,12 +52,10 @@ function App() {
     if (!currentVideoId) return;
     const newStatus = isCurrentVideoPublished ? 0 : 1;
     try {
-      await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}/publish?is_published=${newStatus}`, { method: 'PUT' });
+      const response = await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}/publish?is_published=${newStatus}`, { method: 'PUT' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setIsCurrentVideoPublished(newStatus === 1);
-      setSavedVideos(prev => ({
-        ...prev,
-        items: prev.items.map(v => v.id === currentVideoId ? { ...v, is_published: newStatus } : v)
-      }));
+      await fetchSavedVideos(currentPage, publishFilter);
     } catch (err) {
       console.error('Failed to toggle publish status', err);
     }
@@ -65,13 +64,14 @@ function App() {
   const togglePublish = async (videoId, currentStatus) => {
     const newStatus = currentStatus ? 0 : 1;
     try {
-      await fetch(`http://127.0.0.1:8080/api/videos/${videoId}/publish?is_published=${newStatus}`, {
+      const response = await fetch(`http://127.0.0.1:8080/api/videos/${videoId}/publish?is_published=${newStatus}`, {
         method: 'PUT'
       });
-      setSavedVideos(prev => ({
-        ...prev,
-        items: prev.items.map(v => v.id === videoId ? { ...v, is_published: newStatus } : v)
-      }));
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (videoId === currentVideoId) {
+        setIsCurrentVideoPublished(newStatus === 1);
+      }
+      await fetchSavedVideos(currentPage, publishFilter);
     } catch (err) {
       console.error('Failed to toggle publish status', err);
     }
@@ -151,6 +151,7 @@ function App() {
     setShowResult(false)
     setErrorMsg('')
     setResultText('')
+    setVideoTitle('')
     setAudioStatus('not_started')
     setChatUrl('')
     setProgressMsg('⏳ Đang khởi động...')
@@ -179,6 +180,7 @@ function App() {
               setFullTranscript(data.full_transcript);
               setChatUrl(data.chat_url || '');
               setCurrentVideoId(data.video_id);
+              setVideoTitle(data.title || '');
               setIsCurrentVideoPublished(false);
               setAudioStatus(data.audio_task?.status || 'not_started');
               if (data.audio_error) {
@@ -246,9 +248,11 @@ function App() {
       setResultText(data.generated_script);
       setFullTranscript(data.transcript);
       setChatUrl(data.chat_url || '');
+      setVideoTitle(data.title || '');
       setShowResult(true);
       setActiveView('fetcher');
       setCurrentVideoId(id);  // track which video is loaded
+      setIsCurrentVideoPublished(Boolean(data.is_published));
       setAudioStatus('not_started');
     } catch (err) {
       console.error("Failed to load video", err);
@@ -843,7 +847,9 @@ function App() {
                   <div className="result-header">
                     <div className="thumbnail-placeholder">▶</div>
                     <div className="video-info">
-                      <h3>Auto_YT Extraction</h3>
+                      <h3 title={videoTitle}>
+                        {videoTitle || 'Auto_YT Extraction'}
+                      </h3>
                       <div style={{display: 'flex', gap: '10px', marginTop: '8px', flexWrap: 'wrap', alignItems: 'center'}}>
                         <button 
                           onClick={() => setActiveTab('summary')}

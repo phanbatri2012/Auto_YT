@@ -33,6 +33,52 @@ PROFILE_BUSY_ERROR_MARKERS = (
     "profile is already in use",
     "ProcessSingleton",
 )
+THUMBNAIL_SOURCE_CONTEXT_LIMIT = 4500
+
+
+def extract_thumbnail_source_context(script_text: str) -> str:
+    body_match = re.search(
+        r'### \[BODY\]\s*(.*?)(?=\n### \[|\Z)',
+        script_text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    source_context = body_match.group(1) if body_match else script_text
+    transition_match = re.search(
+        r'\n\s*(?:Tiếp theo|Câu chuyện tiếp theo|Sau đó là câu chuyện)\b',
+        source_context,
+        re.IGNORECASE,
+    )
+    if transition_match:
+        source_context = source_context[:transition_match.start()]
+    return source_context[:THUMBNAIL_SOURCE_CONTEXT_LIMIT].strip()
+
+
+def build_thumbnail_generation_prompt(
+    base_prompt: str,
+    script_text: str,
+    thumbnail_type: str,
+) -> str:
+    source_context = extract_thumbnail_source_context(script_text)
+    generation_prompt = (
+        f"{base_prompt}\n\n"
+        "NGUỒN NỘI DUNG BẮT BUỘC CHO LƯỢT TẠO ẢNH NÀY:\n"
+        f"{source_context}\n\n"
+        "Chỉ dùng nguồn nội dung vừa được đính kèm ở trên. Nếu video có nhiều "
+        "câu chuyện, chỉ tạo thumbnail cho câu chuyện đầu tiên. Không lấy chi "
+        "tiết từ câu chuyện sau, ảnh cũ, cuộc trò chuyện khác hoặc bộ nhớ."
+    )
+    if thumbnail_type == "without_text":
+        generation_prompt += thumbnail_without_text_constraint()
+    return generation_prompt
+
+
+def thumbnail_without_text_constraint() -> str:
+    return (
+        "\n\nRÀNG BUỘC TUYỆT ĐỐI: Ảnh cuối cùng KHÔNG ĐƯỢC CÓ BẤT KỲ "
+        "headline, caption, chữ lớn, chữ trang trí, ký tự hoặc typography "
+        "nào. Hãy kể chuyện hoàn toàn bằng nhân vật, biểu cảm, hành động, "
+        "vật chứng và bối cảnh. ZERO TEXT, NO WORDS, NO LETTERS."
+    )
 
 
 def get_chatgpt_project_url() -> str:
@@ -798,12 +844,10 @@ def _generate_single_thumbnail(
         context = launch_chatgpt_context(p.chromium, profile_dir)
 
         page = context.pages[0] if context.pages else context.new_page()
-        is_original_chat = is_chatgpt_conversation_url(chat_url)
-        target_url = chat_url if is_original_chat else get_chatgpt_project_url()
+        target_url = get_chatgpt_project_url()
         print(f"    -> Navigating to: {target_url}", file=sys.stderr)
         page.goto(target_url, wait_until="domcontentloaded")
-        if not is_original_chat:
-            ensure_expected_project_page(page.url, target_url)
+        ensure_expected_project_page(page.url, target_url)
         time.sleep(2)
 
         import os
@@ -817,19 +861,6 @@ def _generate_single_thumbnail(
                 os.environ["PROMPT_VERSION"] = original_prompt_version
             else:
                 os.environ.pop("PROMPT_VERSION", None)
-
-        def get_image_locator():
-            selectors = (
-                'img[src*="backend-api/estuary"]',
-                'img[alt*="Generated image"]',
-                'img[alt*="DALL"]',
-                'img[src*="files/"]',
-            )
-            for selector in selectors:
-                images = page.locator(selector)
-                if images.count() > 0:
-                    return images
-            return None
 
         def download_image(chatgpt_url: str) -> str:
             try:
@@ -859,15 +890,41 @@ def _generate_single_thumbnail(
                 print(f"    -> Image download failed: {exc}", file=sys.stderr)
                 return ""
 
-        def extract_new_image(previous_count: int) -> str:
-            deadline = time.time() + 15
+        def get_latest_conversation_turn() -> int:
+            if page.url.rstrip("/") == target_url.rstrip("/"):
+                return -1
+            turn_ids = page.locator(
+                '[data-testid^="conversation-turn-"]'
+            ).evaluate_all(
+                """
+                elements => elements
+                    .map(element => element.getAttribute('data-testid') || '')
+                    .map(value => Number(value.replace('conversation-turn-', '')))
+                    .filter(Number.isFinite)
+                """
+            )
+            return max(turn_ids, default=-1)
+
+        def extract_image_from_new_turn(previous_turn: int) -> str:
+            deadline = time.time() + 30
             while time.time() < deadline:
-                images = get_image_locator()
-                image_count = images.count() if images is not None else 0
-                if image_count > previous_count:
-                    chatgpt_url = images.nth(image_count - 1).get_attribute("src")
-                    if chatgpt_url:
-                        return download_image(chatgpt_url) or chatgpt_url
+                turns = page.locator(
+                    '[data-testid^="conversation-turn-"]'
+                )
+                for index in range(turns.count() - 1, -1, -1):
+                    turn = turns.nth(index)
+                    test_id = turn.get_attribute("data-testid") or ""
+                    try:
+                        turn_number = int(test_id.rsplit("-", 1)[-1])
+                    except ValueError:
+                        continue
+                    if turn_number <= previous_turn:
+                        continue
+                    images = turn.locator('img[src*="backend-api/estuary"]')
+                    if images.count() > 0:
+                        chatgpt_url = images.last.get_attribute("src")
+                        if chatgpt_url:
+                            return download_image(chatgpt_url) or chatgpt_url
                 time.sleep(1)
             return ""
 
@@ -884,6 +941,18 @@ def _generate_single_thumbnail(
             return prompt_match.group(1).strip() if prompt_match else ""
 
         def extract_draw_prompt(response_text: str) -> str:
+            normalized_response = response_text.strip().lower()
+            error_markers = (
+                "something went wrong",
+                "please try again",
+                "đã xảy ra lỗi",
+                "hãy thử lại",
+            )
+            if not normalized_response or any(
+                marker in normalized_response for marker in error_markers
+            ):
+                return ""
+
             prompt_match = re.search(
                 r'Prompt hình ảnh:\s*(.*?)(?=\n\n|\Z)',
                 response_text,
@@ -903,9 +972,6 @@ def _generate_single_thumbnail(
             return response_text.strip() if len(response_text.strip()) > 20 and '👍' not in response_text else ""
 
         extracted_prompt = extract_section_prompt()
-        if not is_original_chat and not extracted_prompt:
-            context_prompt = f"Đây là nội dung kịch bản video YouTube tôi cần tạo thumbnail:\n\n{script_text[:3000]}"
-            send_prompt(page, context_prompt)
 
         if extracted_prompt:
             generation_prompt = (
@@ -913,9 +979,15 @@ def _generate_single_thumbnail(
                 f"mô tả sau đây:\n\n{extracted_prompt}\n\n"
                 "LƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN."
             )
+            if thumbnail_type == "without_text":
+                generation_prompt += thumbnail_without_text_constraint()
             text_regenerated = False
         else:
-            generation_prompt = prompts.get(config["prompt_key"], "")
+            generation_prompt = build_thumbnail_generation_prompt(
+                prompts.get(config["prompt_key"], ""),
+                script_text,
+                thumbnail_type,
+            )
             generation_prompt += (
                 "\n\nLƯU Ý QUAN TRỌNG: TRẢ LỜI TRỰC TIẾP VÀO NỘI DUNG. "
                 "TUYỆT ĐỐI KHÔNG CHÀO HỎI, KHÔNG DẠ VÂNG, KHÔNG THÊM CÂU DẪN. "
@@ -923,24 +995,28 @@ def _generate_single_thumbnail(
             )
             text_regenerated = True
 
-        existing_images = get_image_locator()
-        previous_image_count = existing_images.count() if existing_images is not None else 0
         print(f">>>> REGENERATE THUMBNAIL ({config['label']})", file=sys.stderr)
+        previous_turn = get_latest_conversation_turn()
         response_text = send_prompt(page, generation_prompt)
-        image_url = extract_new_image(previous_image_count)
+        image_url = extract_image_from_new_turn(previous_turn)
 
         if not image_url and not extracted_prompt:
             draw_prompt = extract_draw_prompt(response_text)
             if draw_prompt:
-                existing_images = get_image_locator()
-                previous_image_count = existing_images.count() if existing_images is not None else 0
+                previous_turn = get_latest_conversation_turn()
+                output_constraint = (
+                    thumbnail_without_text_constraint()
+                    if thumbnail_type == "without_text"
+                    else ""
+                )
                 send_prompt(
                     page,
                     "Vui lòng vẽ chính xác hình ảnh (Tỷ lệ 16:9) bám sát tuyệt đối "
                     f"mô tả sau đây:\n\n{draw_prompt}\n\n"
-                    "LƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN.",
+                    "LƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN."
+                    f"{output_constraint}",
                 )
-                image_url = extract_new_image(previous_image_count)
+                image_url = extract_image_from_new_turn(previous_turn)
 
         context.close()
 

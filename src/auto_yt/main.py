@@ -482,15 +482,46 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
                 print(f"Using chat_url from DB: {resolved_chat_url}")
 
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: generate_thumbnails_only(
-                req.script,
-                resolved_chat_url,
-                resolved_prompt_version,
-                None if req.thumbnail_type == "both" else req.thumbnail_type,
+        def generate_requested_thumbnails():
+            requested_types = (
+                ("with_text", "without_text")
+                if req.thumbnail_type == "both"
+                else (req.thumbnail_type,)
             )
-        )
+            combined_result = {
+                "thumb_text": None,
+                "thumb_notext": None,
+                "image1_url": "",
+                "image2_url": "",
+            }
+            for thumbnail_type in requested_types:
+                partial_result = generate_thumbnails_only(
+                    req.script,
+                    resolved_chat_url,
+                    resolved_prompt_version,
+                    thumbnail_type,
+                )
+                expected_image_key = (
+                    "image1_url"
+                    if thumbnail_type == "with_text"
+                    else "image2_url"
+                )
+                if not partial_result.get(expected_image_key):
+                    thumbnail_label = (
+                        "có chữ"
+                        if thumbnail_type == "with_text"
+                        else "không chữ"
+                    )
+                    raise RuntimeError(
+                        "ChatGPT không trả về ảnh thumbnail mới "
+                        f"{thumbnail_label}. Ảnh cũ được giữ nguyên."
+                    )
+                for key, value in partial_result.items():
+                    if value:
+                        combined_result[key] = value
+            return combined_result
+
+        result = await loop.run_in_executor(None, generate_requested_thumbnails)
         
         # If video_id provided, patch the stored script to add image URLs
         if req.video_id:

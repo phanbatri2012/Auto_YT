@@ -2,8 +2,10 @@ import sys
 import time
 import asyncio
 import json
+import os
 import re
 import uuid
+from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright, Page
 from auto_yt.paths import gpt_profile_dir, PROMPTS_PATH, THUMBNAILS_DIR
 from auto_yt.default_prompts import DEFAULT_PROMPTS_DATA
@@ -19,6 +21,11 @@ _HERE = __import__('pathlib').Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parent.parent.parent))
 
 DEFAULT_GPT_PROFILE = "PROFILE_GPT_1"
+CHATGPT_PROJECT_URL_ENV = "CHATGPT_PROJECT_URL"
+DEFAULT_CHATGPT_PROJECT_URL = (
+    "https://chatgpt.com/g/"
+    "g-p-6a1f9204f2d88191b39b64eb7f2dbb97-dd-vn2-phan-tich/project"
+)
 PROFILE_WAIT_TIMEOUT_SECONDS = 20 * 60
 PROFILE_RETRY_INTERVAL_SECONDS = 5
 PROFILE_BUSY_ERROR_MARKERS = (
@@ -26,6 +33,57 @@ PROFILE_BUSY_ERROR_MARKERS = (
     "profile is already in use",
     "ProcessSingleton",
 )
+
+
+def get_chatgpt_project_url() -> str:
+    project_url = os.environ.get(
+        CHATGPT_PROJECT_URL_ENV,
+        DEFAULT_CHATGPT_PROJECT_URL,
+    ).strip()
+    parsed_url = urlparse(project_url)
+    path_parts = parsed_url.path.strip("/").split("/")
+    is_project_url = (
+        parsed_url.scheme == "https"
+        and parsed_url.netloc == "chatgpt.com"
+        and len(path_parts) == 3
+        and path_parts[0] == "g"
+        and path_parts[1].startswith("g-p-")
+        and path_parts[2] == "project"
+    )
+    if not is_project_url:
+        raise ValueError(
+            f"{CHATGPT_PROJECT_URL_ENV} must be a ChatGPT Project URL."
+        )
+    return project_url.rstrip("/")
+
+
+def ensure_expected_project_page(actual_url: str, project_url: str) -> None:
+    actual = urlparse(actual_url)
+    expected = urlparse(project_url)
+    if (
+        actual.scheme != expected.scheme
+        or actual.netloc != expected.netloc
+        or actual.path.rstrip("/") != expected.path.rstrip("/")
+    ):
+        raise RuntimeError(
+            "ChatGPT did not stay on the configured Project page. "
+            "No prompt was sent."
+        )
+
+
+def is_chatgpt_conversation_url(url: str) -> bool:
+    parsed_url = urlparse(url)
+    path_parts = parsed_url.path.strip("/").split("/")
+    if parsed_url.scheme != "https" or parsed_url.netloc != "chatgpt.com":
+        return False
+    if len(path_parts) == 2 and path_parts[0] == "c":
+        return True
+    return (
+        len(path_parts) == 4
+        and path_parts[0] == "g"
+        and path_parts[1].startswith("g-p-")
+        and path_parts[2] == "c"
+    )
 
 
 def launch_chatgpt_context(
@@ -241,7 +299,9 @@ def run(transcript: str) -> str:
         context = launch_chatgpt_context(p.chromium, profile_dir)
 
         page = context.pages[0] if context.pages else context.new_page()
-        page.goto("https://chatgpt.com", wait_until="domcontentloaded")
+        project_url = get_chatgpt_project_url()
+        page.goto(project_url, wait_until="domcontentloaded")
+        ensure_expected_project_page(page.url, project_url)
 
         STRICT_NO_FILLER = "\n\nLƯU Ý QUAN TRỌNG: TRẢ LỜI TRỰC TIẾP VÀO NỘI DUNG. TUYỆT ĐỐI KHÔNG CHÀO HỎI, KHÔNG DẠ VÂNG, KHÔNG THÊM BẤT KỲ CÂU DẪN HAY GIẢI THÍCH NÀO (VD: 'Dưới đây là...', 'Trân trọng gửi bạn...'). CHỈ IN RA ĐÚNG NỘI DUNG CẦN VIẾT."
 
@@ -413,6 +473,59 @@ def run(transcript: str) -> str:
 
         return {"script": final_script, "chat_url": chat_url}
 
+
+def generate_chapters_only(
+    script_text: str,
+    chat_url: str = "",
+    prompt_version: str = "",
+) -> str:
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception("Profile directory not found. Please run the auto-login tool first.")
+
+    with sync_playwright() as p:
+        context = launch_chatgpt_context(p.chromium, profile_dir)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            is_original_chat = is_chatgpt_conversation_url(chat_url)
+            target_url = chat_url if is_original_chat else get_chatgpt_project_url()
+            page.goto(target_url, wait_until="domcontentloaded")
+            if not is_original_chat:
+                ensure_expected_project_page(page.url, target_url)
+            time.sleep(2)
+
+            import os
+            original_prompt_version = os.environ.get("PROMPT_VERSION")
+            if prompt_version:
+                os.environ["PROMPT_VERSION"] = prompt_version
+            try:
+                prompts = get_active_prompts()
+            finally:
+                if original_prompt_version is not None:
+                    os.environ["PROMPT_VERSION"] = original_prompt_version
+                else:
+                    os.environ.pop("PROMPT_VERSION", None)
+
+            if not is_original_chat:
+                send_prompt(
+                    page,
+                    "Đây là nội dung kịch bản video YouTube cần tạo chapter:\n\n"
+                    f"{script_text[:12000]}",
+                )
+
+            chapter_prompt = prompts.get("chapters", "")
+            chapter_prompt += (
+                "\n\nLƯU Ý QUAN TRỌNG: Trả lời trực tiếp bằng danh sách chapter. "
+                "Không chào hỏi, không giải thích, không thêm nội dung ngoài chapter."
+            )
+            chapters = send_prompt(page, chapter_prompt).strip()
+            if not chapters:
+                raise RuntimeError("ChatGPT did not return chapter content.")
+            return chapters
+        finally:
+            context.close()
+
+
 def generate_thumbnails_only(
     script_text: str,
     chat_url: str = '',
@@ -442,9 +555,12 @@ def generate_thumbnails_only(
         page = context.pages[0] if context.pages else context.new_page()
         
         # Navigate to the original chat session if URL provided, otherwise open new chat
-        target_url = chat_url if chat_url and chat_url.startswith("https://chatgpt.com/c/") else "https://chatgpt.com"
+        is_original_chat = is_chatgpt_conversation_url(chat_url)
+        target_url = chat_url if is_original_chat else get_chatgpt_project_url()
         print(f"    -> Navigating to: {target_url}", file=sys.stderr)
         page.goto(target_url, wait_until="domcontentloaded")
+        if not is_original_chat:
+            ensure_expected_project_page(page.url, target_url)
         time.sleep(2)  # Let the page settle
 
         STRICT_NO_FILLER = "\n\nLƯU Ý QUAN TRỌNG: TRẢ LỜI TRỰC TIẾP VÀO NỘI DUNG. TUYỆT ĐỐI KHÔNG CHÀO HỎI, KHÔNG DẠ VÂNG, KHÔNG THÊM BẤT KỲ CÂU DẪN HAY GIẢI THÍCH NÀO (VD: 'Dưới đây là...', 'Trân trọng gửi bạn...'). CHỈ IN RA ĐÚNG NỘI DUNG CẦN VIẾT."
@@ -531,7 +647,7 @@ def generate_thumbnails_only(
         print(f"    -> Total assistant messages on page: {msg_count}", file=sys.stderr)
 
         # Nếu là chat mới (không có chat_url), và không trích xuất được prompt hình ảnh trực tiếp -> cần gửi context trước
-        if not (chat_url and chat_url.startswith("https://chatgpt.com/c/")):
+        if not is_original_chat:
             if not extracted_thumb1 and not extracted_thumb2:
                 print("    -> Chat mới, gửi context script trước...", file=sys.stderr)
                 context_prompt = f"Đây là nội dung kịch bản video YouTube tôi cần tạo thumbnail:\n\n{script_text[:3000]}"
@@ -682,9 +798,12 @@ def _generate_single_thumbnail(
         context = launch_chatgpt_context(p.chromium, profile_dir)
 
         page = context.pages[0] if context.pages else context.new_page()
-        target_url = chat_url if chat_url and chat_url.startswith("https://chatgpt.com/c/") else "https://chatgpt.com"
+        is_original_chat = is_chatgpt_conversation_url(chat_url)
+        target_url = chat_url if is_original_chat else get_chatgpt_project_url()
         print(f"    -> Navigating to: {target_url}", file=sys.stderr)
         page.goto(target_url, wait_until="domcontentloaded")
+        if not is_original_chat:
+            ensure_expected_project_page(page.url, target_url)
         time.sleep(2)
 
         import os
@@ -784,7 +903,6 @@ def _generate_single_thumbnail(
             return response_text.strip() if len(response_text.strip()) > 20 and '👍' not in response_text else ""
 
         extracted_prompt = extract_section_prompt()
-        is_original_chat = chat_url and chat_url.startswith("https://chatgpt.com/c/")
         if not is_original_chat and not extracted_prompt:
             context_prompt = f"Đây là nội dung kịch bản video YouTube tôi cần tạo thumbnail:\n\n{script_text[:3000]}"
             send_prompt(page, context_prompt)

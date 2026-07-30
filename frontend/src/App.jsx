@@ -16,6 +16,7 @@ function App() {
   const [savedVideos, setSavedVideos] = useState({ items: [], total: 0 })
   const [currentPage, setCurrentPage] = useState(1)
   const [generatingThumbnailType, setGeneratingThumbnailType] = useState(null)
+  const [isGeneratingChapters, setIsGeneratingChapters] = useState(false)
   const [isGenAudio, setIsGenAudio] = useState(false)
   const [audioStatus, setAudioStatus] = useState('not_started')
   const [progressMsg, setProgressMsg] = useState('')
@@ -377,6 +378,28 @@ function App() {
       setGeneratingThumbnailType(null);
     }
   };
+
+  const handleGenerateChapters = async () => {
+    if (!currentVideoId) return;
+    setIsGeneratingChapters(true);
+    try {
+      const response = await fetch('http://127.0.0.1:8080/api/generate-chapters', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ video_id: currentVideoId })
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể tạo lại chapter.');
+      }
+      setResultText(data.script);
+    } catch (error) {
+      alert('Lỗi tạo chapter: ' + error.message);
+    } finally {
+      setIsGeneratingChapters(false);
+    }
+  };
+
   const handleGenerateAudio = async () => {
     if (!currentVideoId) return;
     setIsGenAudio(true);
@@ -865,25 +888,50 @@ function App() {
                         </button>
                         <button
                           onClick={() => handleGenerateThumbnail('with_text')}
-                          disabled={generatingThumbnailType !== null}
+                          disabled={generatingThumbnailType !== null || isGeneratingChapters}
                           style={{
-                            padding: '4px 14px', borderRadius: '4px', cursor: generatingThumbnailType ? 'not-allowed' : 'pointer',
-                            border: '1px solid #9b59b6', background: generatingThumbnailType ? '#333' : 'rgba(155,89,182,0.2)',
-                            color: generatingThumbnailType ? '#888' : '#c39bd3', fontWeight: 'bold'
+                            padding: '4px 14px', borderRadius: '4px', cursor: generatingThumbnailType || isGeneratingChapters ? 'not-allowed' : 'pointer',
+                            border: '1px solid #9b59b6', background: generatingThumbnailType || isGeneratingChapters ? '#333' : 'rgba(155,89,182,0.2)',
+                            color: generatingThumbnailType || isGeneratingChapters ? '#888' : '#c39bd3', fontWeight: 'bold'
                           }}
                         >
                           {generatingThumbnailType === 'with_text' ? '⏳ Đang tạo có chữ...' : '🎨 Tạo lại thumbnail có chữ'}
                         </button>
                         <button
                           onClick={() => handleGenerateThumbnail('without_text')}
-                          disabled={generatingThumbnailType !== null}
+                          disabled={generatingThumbnailType !== null || isGeneratingChapters}
                           style={{
-                            padding: '4px 14px', borderRadius: '4px', cursor: generatingThumbnailType ? 'not-allowed' : 'pointer',
-                            border: '1px solid #3498db', background: generatingThumbnailType ? '#333' : 'rgba(52,152,219,0.2)',
-                            color: generatingThumbnailType ? '#888' : '#85c1e9', fontWeight: 'bold'
+                            padding: '4px 14px', borderRadius: '4px', cursor: generatingThumbnailType || isGeneratingChapters ? 'not-allowed' : 'pointer',
+                            border: '1px solid #3498db', background: generatingThumbnailType || isGeneratingChapters ? '#333' : 'rgba(52,152,219,0.2)',
+                            color: generatingThumbnailType || isGeneratingChapters ? '#888' : '#85c1e9', fontWeight: 'bold'
                           }}
                         >
                           {generatingThumbnailType === 'without_text' ? '⏳ Đang tạo không chữ...' : '🖼️ Tạo lại thumbnail không chữ'}
+                        </button>
+                        <button
+                          onClick={() => handleGenerateThumbnail('both')}
+                          disabled={generatingThumbnailType !== null || isGeneratingChapters}
+                          style={{
+                            padding: '4px 14px', borderRadius: '4px', cursor: generatingThumbnailType || isGeneratingChapters ? 'not-allowed' : 'pointer',
+                            border: '1px solid #e67e22', background: generatingThumbnailType || isGeneratingChapters ? '#333' : 'rgba(230,126,34,0.2)',
+                            color: generatingThumbnailType || isGeneratingChapters ? '#888' : '#f5b041', fontWeight: 'bold'
+                          }}
+                        >
+                          {generatingThumbnailType === 'both' ? '⏳ Đang tạo cả 2...' : '🎨 Tạo lại cả 2 thumbnail'}
+                        </button>
+                        <button
+                          onClick={handleGenerateChapters}
+                          disabled={isGeneratingChapters || generatingThumbnailType !== null}
+                          style={{
+                            padding: '4px 14px', borderRadius: '4px',
+                            cursor: isGeneratingChapters || generatingThumbnailType ? 'not-allowed' : 'pointer',
+                            border: '1px solid #16a085',
+                            background: isGeneratingChapters || generatingThumbnailType ? '#333' : 'rgba(22,160,133,0.2)',
+                            color: isGeneratingChapters || generatingThumbnailType ? '#888' : '#48c9b0',
+                            fontWeight: 'bold'
+                          }}
+                        >
+                          {isGeneratingChapters ? '⏳ Đang tạo chapter...' : '🕒 Tạo lại chapter'}
                         </button>
                         {currentVideoId && (
                           <button 

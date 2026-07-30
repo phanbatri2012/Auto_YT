@@ -418,7 +418,52 @@ def get_videos(limit: int = 10, offset: int = 0, is_published: Optional[int] = N
 class GenerateThumbnailsRequest(BaseModel):
     script: str
     video_id: int = None  # optional - if given, updates db record
-    thumbnail_type: Literal["with_text", "without_text"]
+    thumbnail_type: Literal["with_text", "without_text", "both"]
+
+
+class GenerateChaptersRequest(BaseModel):
+    video_id: int
+
+
+@app.post("/api/generate-chapters")
+async def generate_chapters_endpoint(req: GenerateChaptersRequest):
+    from auto_yt.services.chatgpt_worker import generate_chapters_only
+
+    video = db.get_video(req.video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    loop = asyncio.get_event_loop()
+    chapters = await loop.run_in_executor(
+        None,
+        lambda: generate_chapters_only(
+            video["generated_script"],
+            video.get("chat_url", ""),
+            video.get("prompt_version", ""),
+        ),
+    )
+
+    script = video["generated_script"]
+    chapter_section = f"### [CHAPTERS]\n{chapters}"
+    if "### [CHAPTERS]" in script:
+        updated_script = re.sub(
+            r"### \[CHAPTERS\]\n.*?(?=\n### \[|\Z)",
+            chapter_section,
+            script,
+            flags=re.DOTALL,
+        )
+    else:
+        updated_script = f"{script.rstrip()}\n\n{chapter_section}"
+
+    if not db.update_script(req.video_id, updated_script):
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    return {
+        "success": True,
+        "chapters": chapters,
+        "script": updated_script,
+    }
+
 
 @app.post("/api/generate-thumbnails")
 async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, background_tasks: BackgroundTasks):
@@ -443,7 +488,7 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
                 req.script,
                 resolved_chat_url,
                 resolved_prompt_version,
-                req.thumbnail_type,
+                None if req.thumbnail_type == "both" else req.thumbnail_type,
             )
         )
         
@@ -454,31 +499,36 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
                 script = video["generated_script"]
                 import re
                 
-                if req.thumbnail_type == "with_text":
-                    section_title = "THUMBNAIL CÓ CHỮ"
-                    generated_text = result.get("thumb_text")
-                    image_url = result.get("image1_url")
-                else:
-                    section_title = "THUMBNAIL KHÔNG CHỮ"
-                    generated_text = result.get("thumb_notext")
-                    image_url = result.get("image2_url")
+                thumbnail_types = (
+                    ("with_text", "without_text")
+                    if req.thumbnail_type == "both"
+                    else (req.thumbnail_type,)
+                )
+                thumbnail_configs = {
+                    "with_text": ("THUMBNAIL CÓ CHỮ", "thumb_text", "image1_url"),
+                    "without_text": ("THUMBNAIL KHÔNG CHỮ", "thumb_notext", "image2_url"),
+                }
 
-                section_pattern = rf'### \[{re.escape(section_title)}\]\n(.*?)(?=\n### \[|\Z)'
-                section_match = re.search(section_pattern, script, re.DOTALL)
-                current_text = section_match.group(1).strip() if section_match else ""
-                updated_text = generated_text or current_text
+                for thumbnail_type in thumbnail_types:
+                    section_title, text_key, image_key = thumbnail_configs[thumbnail_type]
+                    generated_text = result.get(text_key)
+                    image_url = result.get(image_key)
+                    section_pattern = rf'### \[{re.escape(section_title)}\]\n(.*?)(?=\n### \[|\Z)'
+                    section_match = re.search(section_pattern, script, re.DOTALL)
+                    current_text = section_match.group(1).strip() if section_match else ""
+                    updated_text = generated_text or current_text
 
-                if image_url:
-                    updated_text = re.sub(r'\[IMAGE_URL:.*?\]', '', updated_text).strip()
-                    updated_text += f"\n\n[IMAGE_URL:{image_url}]"
+                    if image_url:
+                        updated_text = re.sub(r'\[IMAGE_URL:.*?\]', '', updated_text).strip()
+                        updated_text += f"\n\n[IMAGE_URL:{image_url}]"
 
-                if section_match:
-                    script = re.sub(
-                        rf'(### \[{re.escape(section_title)}\]\n).*?(?=\n### \[|\Z)',
-                        rf'\1{updated_text.strip()}\n',
-                        script,
-                        flags=re.DOTALL,
-                    )
+                    if section_match:
+                        script = re.sub(
+                            rf'(### \[{re.escape(section_title)}\]\n).*?(?=\n### \[|\Z)',
+                            rf'\1{updated_text.strip()}\n',
+                            script,
+                            flags=re.DOTALL,
+                        )
                         
                 db.update_script(req.video_id, script)
         

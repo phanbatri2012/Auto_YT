@@ -28,12 +28,64 @@ DEFAULT_CHATGPT_PROJECT_URL = (
 )
 PROFILE_WAIT_TIMEOUT_SECONDS = 20 * 60
 PROFILE_RETRY_INTERVAL_SECONDS = 5
+THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS = 5 * 60
 PROFILE_BUSY_ERROR_MARKERS = (
     "Opening in existing browser session",
     "profile is already in use",
     "ProcessSingleton",
 )
 THUMBNAIL_SOURCE_CONTEXT_LIMIT = 4500
+THUMBNAIL_GENERATION_ERROR_MARKERS = (
+    "something went wrong",
+    "please try again",
+    "prompt may violate",
+    "may violate our content",
+    "may violate our guardrails",
+    "content policies",
+    "content policy",
+    "image generation failed",
+    "đã xảy ra lỗi",
+    "hãy thử lại",
+)
+THUMBNAIL_SENSITIVE_REPLACEMENTS = (
+    (r'\bquan hệ thể xác\b', "vượt giới hạn hôn nhân"),
+    (r'\bquan hệ tình dục\b', "phản bội hôn nhân"),
+    (r'\bchuyện giường chiếu\b', "đời sống hôn nhân"),
+    (r'\bchuyện chăn gối\b', "đời sống hôn nhân"),
+    (r'\blên giường với\b', "phản bội"),
+    (r'\bqua đêm với\b', "bí mật gặp gỡ"),
+    (r'\bngủ với\b', "phản bội"),
+    (r'\bngủ (?:cùng|chung)\b', "vượt giới hạn"),
+    (r'\blàm tình\b', "phản bội"),
+    (r'\bân ái\b', "phản bội"),
+    (r'\bchuyện ấy\b', "việc vượt giới hạn"),
+    (r'\bgần gũi với\b', "duy trì mối quan hệ mập mờ với"),
+    (r'\bđổi tiền lấy tình\b', "dùng tiền ràng buộc tình cảm"),
+    (r'\bkhỏa thân\b', "trong tình huống nhạy cảm"),
+    (r'\bgợi dục\b', "không phù hợp"),
+    (r'\btình dục\b', "tình cảm"),
+    (r'\bthể xác\b', "giới hạn hôn nhân"),
+)
+
+
+def is_thumbnail_generation_error_response(response_text: str) -> bool:
+    normalized_response = response_text.strip().lower()
+    return not normalized_response or any(
+        marker in normalized_response
+        for marker in THUMBNAIL_GENERATION_ERROR_MARKERS
+    )
+
+
+def sanitize_thumbnail_source_context(source_context: str) -> str:
+    sanitized_context = source_context
+    for pattern, replacement in THUMBNAIL_SENSITIVE_REPLACEMENTS:
+        sanitized_context = re.sub(
+            pattern,
+            replacement,
+            sanitized_context,
+            flags=re.IGNORECASE,
+        )
+    return sanitized_context
 
 
 def extract_thumbnail_source_context(script_text: str) -> str:
@@ -50,7 +102,8 @@ def extract_thumbnail_source_context(script_text: str) -> str:
     )
     if transition_match:
         source_context = source_context[:transition_match.start()]
-    return source_context[:THUMBNAIL_SOURCE_CONTEXT_LIMIT].strip()
+    source_context = source_context[:THUMBNAIL_SOURCE_CONTEXT_LIMIT].strip()
+    return sanitize_thumbnail_source_context(source_context)
 
 
 def build_thumbnail_generation_prompt(
@@ -66,6 +119,12 @@ def build_thumbnail_generation_prompt(
         "Chỉ dùng nguồn nội dung vừa được đính kèm ở trên. Nếu video có nhiều "
         "câu chuyện, chỉ tạo thumbnail cho câu chuyện đầu tiên. Không lấy chi "
         "tiết từ câu chuyện sau, ảnh cũ, cuộc trò chuyện khác hoặc bộ nhớ."
+        "\n\nRÀNG BUỘC AN TOÀN: Chuyển mọi chi tiết nhạy cảm thành hình ảnh "
+        "tâm lý mang tính biểu tượng. Chỉ dùng khuôn mặt, ánh mắt, điện thoại, "
+        "quà tặng hoặc khoảng cách giữa các nhân vật trưởng thành mặc trang "
+        "phục đời thường kín đáo. Bối cảnh là phòng khách, quán cà phê hoặc "
+        "ngoài trời; các nhân vật chỉ đối diện hoặc đứng cách nhau. Không mô "
+        "tả lại từ ngữ nhạy cảm trong image_prompt."
     )
     if thumbnail_type == "without_text":
         generation_prompt += thumbnail_without_text_constraint()
@@ -130,6 +189,33 @@ def is_chatgpt_conversation_url(url: str) -> bool:
         and path_parts[1].startswith("g-p-")
         and path_parts[2] == "c"
     )
+
+
+def get_video_thumbnail_chat_url(chat_url: str) -> str:
+    normalized_url = chat_url.strip().rstrip("/")
+    if not is_chatgpt_conversation_url(normalized_url):
+        raise RuntimeError(
+            "Video does not have a valid ChatGPT conversation URL. "
+            "No thumbnail prompt was sent."
+        )
+    return normalized_url
+
+
+def ensure_expected_conversation_page(
+    actual_url: str,
+    conversation_url: str,
+) -> None:
+    actual = urlparse(actual_url)
+    expected = urlparse(conversation_url)
+    if (
+        actual.scheme != expected.scheme
+        or actual.netloc != expected.netloc
+        or actual.path.rstrip("/") != expected.path.rstrip("/")
+    ):
+        raise RuntimeError(
+            "ChatGPT did not stay on the video's conversation page. "
+            "No thumbnail prompt was sent."
+        )
 
 
 def launch_chatgpt_context(
@@ -844,10 +930,10 @@ def _generate_single_thumbnail(
         context = launch_chatgpt_context(p.chromium, profile_dir)
 
         page = context.pages[0] if context.pages else context.new_page()
-        target_url = get_chatgpt_project_url()
+        target_url = get_video_thumbnail_chat_url(chat_url)
         print(f"    -> Navigating to: {target_url}", file=sys.stderr)
         page.goto(target_url, wait_until="domcontentloaded")
-        ensure_expected_project_page(page.url, target_url)
+        ensure_expected_conversation_page(page.url, target_url)
         time.sleep(2)
 
         import os
@@ -891,8 +977,6 @@ def _generate_single_thumbnail(
                 return ""
 
         def get_latest_conversation_turn() -> int:
-            if page.url.rstrip("/") == target_url.rstrip("/"):
-                return -1
             turn_ids = page.locator(
                 '[data-testid^="conversation-turn-"]'
             ).evaluate_all(
@@ -906,7 +990,7 @@ def _generate_single_thumbnail(
             return max(turn_ids, default=-1)
 
         def extract_image_from_new_turn(previous_turn: int) -> str:
-            deadline = time.time() + 30
+            deadline = time.time() + THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS
             while time.time() < deadline:
                 turns = page.locator(
                     '[data-testid^="conversation-turn-"]'
@@ -941,16 +1025,7 @@ def _generate_single_thumbnail(
             return prompt_match.group(1).strip() if prompt_match else ""
 
         def extract_draw_prompt(response_text: str) -> str:
-            normalized_response = response_text.strip().lower()
-            error_markers = (
-                "something went wrong",
-                "please try again",
-                "đã xảy ra lỗi",
-                "hãy thử lại",
-            )
-            if not normalized_response or any(
-                marker in normalized_response for marker in error_markers
-            ):
+            if is_thumbnail_generation_error_response(response_text):
                 return ""
 
             prompt_match = re.search(

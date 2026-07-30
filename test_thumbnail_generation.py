@@ -7,7 +7,11 @@ from fastapi import BackgroundTasks
 from auto_yt import main
 from auto_yt.services.chatgpt_worker import (
     build_thumbnail_generation_prompt,
+    ensure_expected_conversation_page,
     extract_thumbnail_source_context,
+    get_video_thumbnail_chat_url,
+    is_thumbnail_generation_error_response,
+    sanitize_thumbnail_source_context,
 )
 
 
@@ -170,6 +174,73 @@ Câu chuyện tiếp theo nói về tài sản.
         self.assertIn("Ảnh cũ được giữ nguyên", response["error"])
         generate_thumbnails.assert_called_once()
         update_script.assert_not_called()
+
+    def test_thumbnail_context_softens_sensitive_language(self):
+        sensitive_cases = (
+            ("ngủ với người cũ", "phản bội"),
+            ("muốn ngủ cùng người ấy", "vượt giới hạn"),
+            ("tiếp tục quan hệ thể xác", "vượt giới hạn hôn nhân"),
+            ("qua đêm với đồng nghiệp", "bí mật gặp gỡ"),
+            ("nhắc đến chuyện giường chiếu", "đời sống hôn nhân"),
+            ("mô tả chuyện ấy", "việc vượt giới hạn"),
+            ("hình ảnh gợi dục", "không phù hợp"),
+        )
+
+        for source_context, expected_text in sensitive_cases:
+            with self.subTest(source_context=source_context):
+                sanitized_context = sanitize_thumbnail_source_context(
+                    source_context
+                )
+                self.assertNotEqual(sanitized_context, source_context)
+                self.assertIn(expected_text, sanitized_context)
+
+    def test_content_policy_response_is_not_used_as_draw_prompt(self):
+        response = (
+            "We’re so sorry, but the prompt may violate our content policies. "
+            "Please retry or edit your prompt."
+        )
+
+        self.assertTrue(is_thumbnail_generation_error_response(response))
+
+    def test_thumbnail_reuses_video_conversation_url(self):
+        chat_urls = (
+            "https://chatgpt.com/c/conversation-id",
+            "https://chatgpt.com/g/g-p-project-id/c/conversation-id",
+        )
+
+        for chat_url in chat_urls:
+            with self.subTest(chat_url=chat_url):
+                self.assertEqual(
+                    get_video_thumbnail_chat_url(chat_url),
+                    chat_url,
+                )
+
+    def test_thumbnail_does_not_create_chat_when_video_chat_is_missing(self):
+        invalid_urls = (
+            "",
+            "https://chatgpt.com/",
+            "https://chatgpt.com/g/g-p-project-id/project",
+        )
+
+        for chat_url in invalid_urls:
+            with (
+                self.subTest(chat_url=chat_url),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "valid ChatGPT conversation URL",
+                ),
+            ):
+                get_video_thumbnail_chat_url(chat_url)
+
+    def test_thumbnail_rejects_redirect_away_from_video_chat(self):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "video's conversation page",
+        ):
+            ensure_expected_conversation_page(
+                "https://chatgpt.com/",
+                "https://chatgpt.com/c/conversation-id",
+            )
 
 
 if __name__ == "__main__":

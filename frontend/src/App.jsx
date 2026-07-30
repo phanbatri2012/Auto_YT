@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import './App.css'
 import AutoLogin from './AutoLogin'
 import Settings from './Settings'
@@ -17,18 +17,27 @@ function App() {
   const [currentPage, setCurrentPage] = useState(1)
   const [generatingThumbnailType, setGeneratingThumbnailType] = useState(null)
   const [isGeneratingChapters, setIsGeneratingChapters] = useState(false)
+  const [isGeneratingMetadata, setIsGeneratingMetadata] = useState(false)
   const [isGenAudio, setIsGenAudio] = useState(false)
   const [audioStatus, setAudioStatus] = useState('not_started')
   const [progressMsg, setProgressMsg] = useState('')
   const [currentVideoId, setCurrentVideoId] = useState(null)
+  const currentVideoIdRef = useRef(null)
   const [videoTitle, setVideoTitle] = useState('')
   const [isCurrentVideoPublished, setIsCurrentVideoPublished] = useState(false)
+  const [chatGptStatus, setChatGptStatus] = useState({ busy: false, operation: '' })
   
   const [promptVersions, setPromptVersions] = useState([])
   const [selectedPromptVersion, setSelectedPromptVersion] = useState('default')
   const [publishFilter, setPublishFilter] = useState('all') // 'all' | 'published' | 'unpublished'
   
   const PAGE_SIZE = 10
+  const chatGptControlsDisabled =
+    isFetching ||
+    chatGptStatus.busy ||
+    generatingThumbnailType !== null ||
+    isGeneratingChapters ||
+    isGeneratingMetadata
 
   const fetchSavedVideos = async (page = currentPage, filter = publishFilter) => {
     try {
@@ -90,6 +99,35 @@ function App() {
   }, [activeView])
 
   useEffect(() => {
+    currentVideoIdRef.current = currentVideoId
+  }, [currentVideoId])
+
+  useEffect(() => {
+    let stopped = false
+    const syncChatGptStatus = async () => {
+      try {
+        const response = await fetch('http://127.0.0.1:8080/api/chatgpt-status')
+        const data = await response.json()
+        if (!stopped) {
+          setChatGptStatus({
+            busy: Boolean(data.busy),
+            operation: data.operation || ''
+          })
+        }
+      } catch {
+        // Keep the last known state during transient backend errors.
+      }
+    }
+
+    syncChatGptStatus()
+    const intervalId = setInterval(syncChatGptStatus, 2000)
+    return () => {
+      stopped = true
+      clearInterval(intervalId)
+    }
+  }, [])
+
+  useEffect(() => {
     if (!currentVideoId) return;
 
     let stopped = false;
@@ -147,7 +185,7 @@ function App() {
   }
 
   const handleRun = async () => {
-    if (!url.trim()) return
+    if (!url.trim() || chatGptControlsDisabled) return
     setIsFetching(true)
     setShowResult(false)
     setErrorMsg('')
@@ -242,6 +280,7 @@ function App() {
   };
 
   const viewSavedVideo = async (id) => {
+    if (chatGptControlsDisabled) return;
     try {
       const response = await fetch(`http://127.0.0.1:8080/api/videos/${id}`);
       const data = await response.json();
@@ -340,7 +379,7 @@ function App() {
   };
 
   const handleGenerateThumbnail = async (thumbnailType) => {
-    if (!resultText) return;
+    if (!resultText || chatGptControlsDisabled) return;
     setGeneratingThumbnailType(thumbnailType);
     try {
       const res = await fetch('http://127.0.0.1:8080/api/generate-thumbnails', {
@@ -380,7 +419,7 @@ function App() {
   };
 
   const handleGenerateChapters = async () => {
-    if (!currentVideoId) return;
+    if (!currentVideoId || chatGptControlsDisabled) return;
     setIsGeneratingChapters(true);
     try {
       const response = await fetch('http://127.0.0.1:8080/api/generate-chapters', {
@@ -397,6 +436,45 @@ function App() {
       alert('Lỗi tạo chapter: ' + error.message);
     } finally {
       setIsGeneratingChapters(false);
+    }
+  };
+
+  const handleGenerateMetadata = async () => {
+    if (!currentVideoId || chatGptControlsDisabled) return;
+    const requestedVideoId = currentVideoId;
+    setIsGeneratingMetadata(true);
+    try {
+      const response = await fetch('http://127.0.0.1:8080/api/generate-metadata', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ video_id: requestedVideoId })
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể tạo lại tiêu đề.');
+      }
+      if (data.video_id !== requestedVideoId) {
+        throw new Error('Backend trả về sai video. Giao diện chưa được cập nhật.');
+      }
+
+      const refreshedResponse = await fetch(
+        `http://127.0.0.1:8080/api/videos/${requestedVideoId}?_=${Date.now()}`,
+        { cache: 'no-store' }
+      );
+      if (!refreshedResponse.ok) {
+        throw new Error('Không thể tải metadata mới từ database.');
+      }
+      const refreshedVideo = await refreshedResponse.json();
+      if (currentVideoIdRef.current === requestedVideoId) {
+        setResultText(refreshedVideo.generated_script);
+      } else {
+        alert('Metadata đã được cập nhật. Hãy mở lại đúng video để xem kết quả.');
+      }
+      await fetchSavedVideos(currentPage, publishFilter);
+    } catch (error) {
+      alert('Lỗi tạo metadata: ' + error.message);
+    } finally {
+      setIsGeneratingMetadata(false);
     }
   };
 
@@ -602,10 +680,30 @@ function App() {
           <div className="brand-name">Auto_YT</div>
         </div>
         <ul className="nav-menu">
-          <li className={`nav-item ${activeView === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveView('dashboard')}>Dashboard</li>
-          <li className={`nav-item ${activeView === 'fetcher' ? 'active' : ''}`} onClick={() => setActiveView('fetcher')}>Video Fetcher</li>
-          <li className={`nav-item ${activeView === 'autologin' ? 'active' : ''}`} onClick={() => setActiveView('autologin')}>Auto Login</li>
-          <li className={`nav-item ${activeView === 'settings' ? 'active' : ''}`} onClick={() => setActiveView('settings')}>Settings</li>
+          <li
+            className={`nav-item ${activeView === 'dashboard' ? 'active' : ''}`}
+            aria-disabled={chatGptControlsDisabled}
+            onClick={() => !chatGptControlsDisabled && setActiveView('dashboard')}
+            style={chatGptControlsDisabled ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}
+          >Dashboard</li>
+          <li
+            className={`nav-item ${activeView === 'fetcher' ? 'active' : ''}`}
+            aria-disabled={chatGptControlsDisabled}
+            onClick={() => !chatGptControlsDisabled && setActiveView('fetcher')}
+            style={chatGptControlsDisabled ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}
+          >Video Fetcher</li>
+          <li
+            className={`nav-item ${activeView === 'autologin' ? 'active' : ''}`}
+            aria-disabled={chatGptControlsDisabled}
+            onClick={() => !chatGptControlsDisabled && setActiveView('autologin')}
+            style={chatGptControlsDisabled ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}
+          >Auto Login</li>
+          <li
+            className={`nav-item ${activeView === 'settings' ? 'active' : ''}`}
+            aria-disabled={chatGptControlsDisabled}
+            onClick={() => !chatGptControlsDisabled && setActiveView('settings')}
+            style={chatGptControlsDisabled ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}
+          >Settings</li>
         </ul>
       </aside>
 
@@ -718,7 +816,12 @@ function App() {
                         </div>
                         
                         <div style={{ marginTop: 'auto', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                          <button className="btn-run" style={{ padding: '8px', flex: 1, fontSize: '0.9em' }} onClick={() => viewSavedVideo(video.id)}>📄 Xem Script</button>
+                          <button
+                            className="btn-run"
+                            style={{ padding: '8px', flex: 1, fontSize: '0.9em' }}
+                            disabled={chatGptControlsDisabled}
+                            onClick={() => viewSavedVideo(video.id)}
+                          >📄 Xem Script</button>
                           <button 
                             style={{ 
                               padding: '8px 12px', fontSize: '0.85em', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold',
@@ -841,10 +944,16 @@ function App() {
                   placeholder="https://www.youtube.com/watch?v=..."
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleRun()}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !chatGptControlsDisabled) handleRun()
+                  }}
                 />
-                <button className="btn-run" onClick={handleRun} disabled={isFetching}>
-                  {isFetching ? 'Generating (5-10 mins)...' : 'Lên Kịch Bản & Audio ⚡'}
+                <button className="btn-run" onClick={handleRun} disabled={chatGptControlsDisabled}>
+                  {isFetching
+                    ? 'Generating (5-10 mins)...'
+                    : chatGptStatus.busy
+                      ? 'ChatGPT đang bận...'
+                      : 'Lên Kịch Bản & Audio ⚡'}
                 </button>
               </div>
 
@@ -888,50 +997,65 @@ function App() {
                         </button>
                         <button
                           onClick={() => handleGenerateThumbnail('with_text')}
-                          disabled={generatingThumbnailType !== null || isGeneratingChapters}
+                          disabled={chatGptControlsDisabled}
                           style={{
-                            padding: '4px 14px', borderRadius: '4px', cursor: generatingThumbnailType || isGeneratingChapters ? 'not-allowed' : 'pointer',
-                            border: '1px solid #9b59b6', background: generatingThumbnailType || isGeneratingChapters ? '#333' : 'rgba(155,89,182,0.2)',
-                            color: generatingThumbnailType || isGeneratingChapters ? '#888' : '#c39bd3', fontWeight: 'bold'
+                            padding: '4px 14px', borderRadius: '4px', cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
+                            border: '1px solid #9b59b6', background: chatGptControlsDisabled ? '#333' : 'rgba(155,89,182,0.2)',
+                            color: chatGptControlsDisabled ? '#888' : '#c39bd3', fontWeight: 'bold'
                           }}
                         >
                           {generatingThumbnailType === 'with_text' ? '⏳ Đang tạo có chữ...' : '🎨 Tạo lại thumbnail có chữ'}
                         </button>
                         <button
                           onClick={() => handleGenerateThumbnail('without_text')}
-                          disabled={generatingThumbnailType !== null || isGeneratingChapters}
+                          disabled={chatGptControlsDisabled}
                           style={{
-                            padding: '4px 14px', borderRadius: '4px', cursor: generatingThumbnailType || isGeneratingChapters ? 'not-allowed' : 'pointer',
-                            border: '1px solid #3498db', background: generatingThumbnailType || isGeneratingChapters ? '#333' : 'rgba(52,152,219,0.2)',
-                            color: generatingThumbnailType || isGeneratingChapters ? '#888' : '#85c1e9', fontWeight: 'bold'
+                            padding: '4px 14px', borderRadius: '4px', cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
+                            border: '1px solid #3498db', background: chatGptControlsDisabled ? '#333' : 'rgba(52,152,219,0.2)',
+                            color: chatGptControlsDisabled ? '#888' : '#85c1e9', fontWeight: 'bold'
                           }}
                         >
                           {generatingThumbnailType === 'without_text' ? '⏳ Đang tạo không chữ...' : '🖼️ Tạo lại thumbnail không chữ'}
                         </button>
                         <button
                           onClick={() => handleGenerateThumbnail('both')}
-                          disabled={generatingThumbnailType !== null || isGeneratingChapters}
+                          disabled={chatGptControlsDisabled}
                           style={{
-                            padding: '4px 14px', borderRadius: '4px', cursor: generatingThumbnailType || isGeneratingChapters ? 'not-allowed' : 'pointer',
-                            border: '1px solid #e67e22', background: generatingThumbnailType || isGeneratingChapters ? '#333' : 'rgba(230,126,34,0.2)',
-                            color: generatingThumbnailType || isGeneratingChapters ? '#888' : '#f5b041', fontWeight: 'bold'
+                            padding: '4px 14px', borderRadius: '4px', cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
+                            border: '1px solid #e67e22', background: chatGptControlsDisabled ? '#333' : 'rgba(230,126,34,0.2)',
+                            color: chatGptControlsDisabled ? '#888' : '#f5b041', fontWeight: 'bold'
                           }}
                         >
                           {generatingThumbnailType === 'both' ? '⏳ Đang tạo cả 2...' : '🎨 Tạo lại cả 2 thumbnail'}
                         </button>
                         <button
                           onClick={handleGenerateChapters}
-                          disabled={isGeneratingChapters || generatingThumbnailType !== null}
+                          disabled={chatGptControlsDisabled}
                           style={{
                             padding: '4px 14px', borderRadius: '4px',
-                            cursor: isGeneratingChapters || generatingThumbnailType ? 'not-allowed' : 'pointer',
+                            cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
                             border: '1px solid #16a085',
-                            background: isGeneratingChapters || generatingThumbnailType ? '#333' : 'rgba(22,160,133,0.2)',
-                            color: isGeneratingChapters || generatingThumbnailType ? '#888' : '#48c9b0',
+                            background: chatGptControlsDisabled ? '#333' : 'rgba(22,160,133,0.2)',
+                            color: chatGptControlsDisabled ? '#888' : '#48c9b0',
                             fontWeight: 'bold'
                           }}
                         >
                           {isGeneratingChapters ? '⏳ Đang tạo chapter...' : '🕒 Tạo lại chapter'}
+                        </button>
+                        <button
+                          onClick={handleGenerateMetadata}
+                          disabled={chatGptControlsDisabled}
+                          title="Tạo lại mục 5: Tiêu đề, URL slug, mô tả và quiz trong cùng chat của video"
+                          style={{
+                            padding: '4px 14px', borderRadius: '4px',
+                            cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
+                            border: '1px solid #d4ac0d',
+                            background: chatGptControlsDisabled ? '#333' : 'rgba(212,172,13,0.2)',
+                            color: chatGptControlsDisabled ? '#888' : '#f7dc6f',
+                            fontWeight: 'bold'
+                          }}
+                        >
+                          {isGeneratingMetadata ? '⏳ Đang tạo metadata...' : '✍️ Tạo lại TIÊU ĐỀ'}
                         </button>
                         {currentVideoId && (
                           <button 

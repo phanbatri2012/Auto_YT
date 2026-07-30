@@ -33,6 +33,33 @@ import re
 # In-memory job store: job_id -> {status, progress, result, error}
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
+_chatgpt_profile_lock = threading.Lock()
+_chatgpt_state_lock = threading.Lock()
+_chatgpt_operation = ""
+CHATGPT_BUSY_ERROR = (
+    "ChatGPT đang bận với tác vụ khác. Hãy đợi tác vụ hiện tại hoàn tất."
+)
+
+
+def _try_start_chatgpt_operation(operation: str) -> bool:
+    global _chatgpt_operation
+    if not _chatgpt_profile_lock.acquire(blocking=False):
+        return False
+    with _chatgpt_state_lock:
+        _chatgpt_operation = operation
+    return True
+
+
+def _finish_chatgpt_operation() -> None:
+    global _chatgpt_operation
+    with _chatgpt_state_lock:
+        _chatgpt_operation = ""
+    _chatgpt_profile_lock.release()
+
+
+def _get_chatgpt_operation() -> str:
+    with _chatgpt_state_lock:
+        return _chatgpt_operation
 
 class AccountData(BaseModel):
     email: str = ""
@@ -337,7 +364,18 @@ def process_video(request: VideoRequest):
     with _jobs_lock:
         _jobs[job_id] = {"status": "running", "progress": "⏳ Đang khởi động...", "result": None, "error": None}
 
+    if not _try_start_chatgpt_operation("video"):
+        with _jobs_lock:
+            _jobs[job_id].update({
+                "status": "error",
+                "progress": f"❌ Lỗi: {CHATGPT_BUSY_ERROR}",
+                "error": CHATGPT_BUSY_ERROR,
+            })
+        return {"job_id": job_id}
+
     def _run():
+        profile_reserved = True
+
         def update(msg: str):
             with _jobs_lock:
                 _jobs[job_id]["progress"] = msg
@@ -350,7 +388,12 @@ def process_video(request: VideoRequest):
             combined_text = f"TIÊU ĐỀ KỊCH BẢN: {title}\n\nNỘI DUNG:\n{full_transcript}"
 
             update("🤖 ChatGPT đang viết kịch bản (5-15 phút)...")
-            worker_result = process_prompt_via_chatgpt(combined_text, request.prompt_version)
+            worker_result = process_prompt_via_chatgpt(
+                combined_text,
+                request.prompt_version,
+            )
+            _finish_chatgpt_operation()
+            profile_reserved = False
             summary_text = worker_result["script"] if isinstance(worker_result, dict) else worker_result
             chat_url = worker_result.get("chat_url", "") if isinstance(worker_result, dict) else ""
 
@@ -396,9 +439,16 @@ def process_video(request: VideoRequest):
                     "progress": f"❌ Lỗi: {error_msg[:100]}",
                     "error": error_msg
                 })
+        finally:
+            if profile_reserved:
+                _finish_chatgpt_operation()
 
     thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except Exception:
+        _finish_chatgpt_operation()
+        raise
     return {"job_id": job_id}
 
 
@@ -409,6 +459,15 @@ def get_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@app.get("/api/chatgpt-status")
+def get_chatgpt_status():
+    operation = _get_chatgpt_operation()
+    return {
+        "busy": _chatgpt_profile_lock.locked(),
+        "operation": operation,
+    }
 
 
 @app.get("/api/videos")
@@ -425,6 +484,69 @@ class GenerateChaptersRequest(BaseModel):
     video_id: int
 
 
+class GenerateMetadataRequest(BaseModel):
+    video_id: int
+
+
+def replace_metadata_section(
+    script: str,
+    metadata: str,
+) -> str:
+    metadata_match = re.search(
+        r"### \[METADATA & QUIZ\]\n(.*?)(?=\n### \[|\Z)",
+        script,
+        flags=re.DOTALL,
+    )
+    if not metadata_match:
+        raise RuntimeError("Video script does not contain METADATA & QUIZ.")
+
+    return (
+        script[:metadata_match.start(1)]
+        + metadata.strip()
+        + "\n"
+        + script[metadata_match.end(1):]
+    )
+
+
+@app.post("/api/generate-metadata")
+async def generate_metadata_endpoint(req: GenerateMetadataRequest):
+    from auto_yt.services.chatgpt_worker import generate_metadata_only
+
+    video = db.get_video(req.video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not _try_start_chatgpt_operation("metadata"):
+        return {"success": False, "error": CHATGPT_BUSY_ERROR}
+
+    try:
+        loop = asyncio.get_event_loop()
+        metadata = await loop.run_in_executor(
+            None,
+            lambda: generate_metadata_only(
+                video.get("chat_url", ""),
+                video.get("prompt_version", ""),
+            ),
+        )
+        updated_script = replace_metadata_section(
+            video["generated_script"],
+            metadata,
+        )
+        if not db.update_script(req.video_id, updated_script):
+            raise RuntimeError("Video not found")
+        return {
+            "success": True,
+            "video_id": req.video_id,
+            "metadata": metadata,
+            "script": updated_script,
+        }
+    except Exception as exc:
+        print(f"Error in generate_metadata_endpoint: {exc}", file=sys.stderr)
+        return {"success": False, "error": str(exc)}
+    finally:
+        _finish_chatgpt_operation()
+
+
 @app.post("/api/generate-chapters")
 async def generate_chapters_endpoint(req: GenerateChaptersRequest):
     from auto_yt.services.chatgpt_worker import generate_chapters_only
@@ -433,15 +555,21 @@ async def generate_chapters_endpoint(req: GenerateChaptersRequest):
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
+    if not _try_start_chatgpt_operation("chapters"):
+        return {"success": False, "error": CHATGPT_BUSY_ERROR}
+
     loop = asyncio.get_event_loop()
-    chapters = await loop.run_in_executor(
-        None,
-        lambda: generate_chapters_only(
-            video["generated_script"],
-            video.get("chat_url", ""),
-            video.get("prompt_version", ""),
-        ),
-    )
+    try:
+        chapters = await loop.run_in_executor(
+            None,
+            lambda: generate_chapters_only(
+                video["generated_script"],
+                video.get("chat_url", ""),
+                video.get("prompt_version", ""),
+            ),
+        )
+    finally:
+        _finish_chatgpt_operation()
 
     script = video["generated_script"]
     chapter_section = f"### [CHAPTERS]\n{chapters}"
@@ -469,7 +597,10 @@ async def generate_chapters_endpoint(req: GenerateChaptersRequest):
 async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, background_tasks: BackgroundTasks):
     from auto_yt.services.chatgpt_worker import generate_thumbnails_only
     import concurrent.futures
-    
+
+    if not _try_start_chatgpt_operation("thumbnails"):
+        return {"success": False, "error": CHATGPT_BUSY_ERROR}
+
     try:
         # Look up chat_url from DB if video_id provided
         resolved_chat_url = ""
@@ -569,6 +700,8 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
         import traceback
         traceback.print_exc()
         return {"success": False, "error": str(e)}
+    finally:
+        _finish_chatgpt_operation()
 
 
 @app.post("/api/videos/{video_id}/generate-audio")
@@ -770,10 +903,15 @@ async def trigger_login():
     from auto_yt.services.chatgpt_login import login_gpt_auto, restore_session
     from playwright.async_api import async_playwright
 
+    profile_reserved = False
     try:
         if not ACCOUNT_PATH.exists():
             return {"success": False, "error": "Chưa có thông tin tài khoản"}
-            
+
+        if not _try_start_chatgpt_operation("login"):
+            return {"success": False, "error": CHATGPT_BUSY_ERROR}
+        profile_reserved = True
+
         data = json.loads(ACCOUNT_PATH.read_text(encoding="utf-8"))
         account = _extract_gpt_account(data)
         
@@ -822,33 +960,45 @@ async def trigger_login():
         return {"success": True, "message": "Login successful"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+    finally:
+        if profile_reserved:
+            _finish_chatgpt_operation()
 
 @app.post("/api/open-profile")
 async def open_profile():
     from playwright.async_api import async_playwright
     import asyncio
-    
+
+    if not _try_start_chatgpt_operation("profile"):
+        return {"success": False, "error": CHATGPT_BUSY_ERROR}
+
     async def _launch():
-        async with async_playwright() as p:
-            profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
-            context = await p.chromium.launch_persistent_context(
-                str(profile_dir),
-                headless=False,
-                args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
-                ignore_default_args=["--enable-automation"]
-            )
-            page = await context.new_page()
-            await page.goto("https://chatgpt.com/")
-            # Keep open for a bit or until closed
-            try:
-                await page.wait_for_timeout(600000) # 10 mins
-            except:
-                pass
-            await context.close()
-            
+        try:
+            async with async_playwright() as p:
+                profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+                context = await p.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    headless=False,
+                    args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
+                    ignore_default_args=["--enable-automation"]
+                )
+                try:
+                    page = await context.new_page()
+                    await page.goto("https://chatgpt.com/")
+                    await page.wait_for_timeout(600000) # 10 mins
+                except Exception:
+                    pass
+                finally:
+                    await context.close()
+        finally:
+            _finish_chatgpt_operation()
+
     # Launch as a separate asyncio task so it doesn't block the API
-    import asyncio
-    asyncio.create_task(_launch())
+    try:
+        asyncio.create_task(_launch())
+    except Exception:
+        _finish_chatgpt_operation()
+        raise
     return {"success": True, "message": "Browser profile opened on server."}
 
 if __name__ == "__main__":

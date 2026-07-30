@@ -147,14 +147,18 @@ def is_chatgpt_conversation_url(url: str) -> bool:
     )
 
 
-def get_video_thumbnail_chat_url(chat_url: str) -> str:
+def get_video_chat_url(chat_url: str) -> str:
     normalized_url = chat_url.strip().rstrip("/")
     if not is_chatgpt_conversation_url(normalized_url):
         raise RuntimeError(
             "Video does not have a valid ChatGPT conversation URL. "
-            "No thumbnail prompt was sent."
+            "No prompt was sent."
         )
     return normalized_url
+
+
+def get_video_thumbnail_chat_url(chat_url: str) -> str:
+    return get_video_chat_url(chat_url)
 
 
 def ensure_expected_conversation_page(
@@ -170,7 +174,7 @@ def ensure_expected_conversation_page(
     ):
         raise RuntimeError(
             "ChatGPT did not stay on the video's conversation page. "
-            "No thumbnail prompt was sent."
+            "No prompt was sent."
         )
 
 
@@ -230,6 +234,45 @@ def get_active_prompts():
         print(f"Error loading prompts: {e}", file=sys.stderr)
     
     return DEFAULT_PROMPTS_DATA["versions"]["default"]["prompts"]
+
+
+def build_metadata_generation_prompt(metadata_prompt: str) -> str:
+    if not metadata_prompt.strip():
+        raise RuntimeError("The selected prompt version has no metadata prompt.")
+    return (
+        f"{metadata_prompt.strip()}\n\n"
+        "LƯU Ý QUAN TRỌNG: Hãy tạo lại đầy đủ toàn bộ phần metadata theo "
+        "đúng yêu cầu trên, bao gồm TIÊU ĐỀ, URL SLUG, MÔ TẢ, HASHTAG, "
+        "BÌNH LUẬN GHIM và QUIZ. Trả lời trực tiếp, không chào hỏi, không "
+        "giải thích và không thêm nội dung ngoài metadata."
+    )
+
+
+def validate_metadata_response(response_text: str) -> str:
+    metadata = response_text.strip()
+    required_patterns = {
+        "TIÊU ĐỀ": r"(?im)^\s*(?:[-*]\s*)?(?:\*{1,2})?TIÊU ĐỀ",
+        "URL SLUG": r"(?im)^\s*(?:[-*]\s*)?(?:\*{1,2})?(?:URL\s+SLUG|SLUG)",
+        "MÔ TẢ": r"(?im)^\s*(?:[-*]\s*)?(?:\*{1,2})?MÔ TẢ",
+        "HASHTAG": r"(?i)(?<!\w)#[a-z0-9_]+",
+        "BÌNH LUẬN GHIM": (
+            r"(?im)^\s*(?:[-*]\s*)?(?:\*{1,2})?BÌNH LUẬN GHIM"
+        ),
+        "QUIZ": r"(?im)^\s*(?:[-*]\s*)?(?:\*{1,2})?CÂU HỎI",
+    }
+    missing_sections = [
+        label
+        for label, pattern in required_patterns.items()
+        if not re.search(pattern, metadata)
+    ]
+    if missing_sections:
+        raise RuntimeError(
+            "ChatGPT returned incomplete metadata (missing "
+            + ", ".join(missing_sections)
+            + "). The existing metadata was preserved."
+        )
+    return metadata
+
 
 def clean_text(text: str) -> str:
     """Removes 'Edit' and common AI conversational fillers from the output."""
@@ -610,6 +653,43 @@ def generate_chapters_only(
             if not chapters:
                 raise RuntimeError("ChatGPT did not return chapter content.")
             return chapters
+        finally:
+            context.close()
+
+
+def generate_metadata_only(
+    chat_url: str,
+    prompt_version: str = "",
+) -> str:
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception("Profile directory not found. Please run the auto-login tool first.")
+
+    conversation_url = get_video_chat_url(chat_url)
+    with sync_playwright() as p:
+        context = launch_chatgpt_context(p.chromium, profile_dir)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(conversation_url, wait_until="domcontentloaded")
+            ensure_expected_conversation_page(page.url, conversation_url)
+            time.sleep(2)
+
+            original_prompt_version = os.environ.get("PROMPT_VERSION")
+            if prompt_version:
+                os.environ["PROMPT_VERSION"] = prompt_version
+            try:
+                prompts = get_active_prompts()
+            finally:
+                if original_prompt_version is not None:
+                    os.environ["PROMPT_VERSION"] = original_prompt_version
+                else:
+                    os.environ.pop("PROMPT_VERSION", None)
+
+            generation_prompt = build_metadata_generation_prompt(
+                prompts.get("metadata", "")
+            )
+            response_text = send_prompt(page, generation_prompt).strip()
+            return validate_metadata_response(response_text)
         finally:
             context.close()
 

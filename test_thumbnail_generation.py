@@ -194,6 +194,54 @@ class ThumbnailGenerationTests(unittest.TestCase):
                 "https://chatgpt.com/c/conversation-id",
             )
 
+    def test_thumbnail_is_rejected_while_another_chatgpt_job_is_running(self):
+        request = main.GenerateThumbnailsRequest(
+            script=SCRIPT,
+            video_id=38,
+            thumbnail_type="both",
+        )
+        self.assertTrue(main._try_start_chatgpt_operation("video"))
+        try:
+            with patch(
+                "auto_yt.services.chatgpt_worker.generate_thumbnails_only"
+            ) as generate_thumbnails:
+                response = asyncio.run(
+                    main.generate_thumbnails_endpoint(
+                        request,
+                        BackgroundTasks(),
+                    )
+                )
+
+            self.assertFalse(response["success"])
+            self.assertEqual(response["error"], main.CHATGPT_BUSY_ERROR)
+            self.assertEqual(
+                main.get_chatgpt_status(),
+                {"busy": True, "operation": "video"},
+            )
+            generate_thumbnails.assert_not_called()
+        finally:
+            main._finish_chatgpt_operation()
+
+    def test_video_job_is_rejected_while_thumbnail_generation_is_running(self):
+        self.assertTrue(main._try_start_chatgpt_operation("thumbnails"))
+        try:
+            response = main.process_video(
+                main.VideoRequest(
+                    url="https://www.youtube.com/watch?v=test",
+                    prompt_version="default",
+                )
+            )
+            job = main.get_job(response["job_id"])
+
+            self.assertEqual(job["status"], "error")
+            self.assertEqual(job["error"], main.CHATGPT_BUSY_ERROR)
+            self.assertEqual(
+                main.get_chatgpt_status(),
+                {"busy": True, "operation": "thumbnails"},
+            )
+        finally:
+            main._finish_chatgpt_operation()
+
     def test_thumbnail_selects_only_the_response_after_its_request(self):
         visible_turns = (
             (64, "assistant"),

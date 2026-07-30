@@ -91,3 +91,7 @@ Use Puppeteer to search Official Docs or StackOverflow ONLY when:
 
 ---
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## 9. Auto-YT Project Policy
+- **ALWAYS** use Playwright to interact with ChatGPT for this project. Do not rely on direct API calls or other methods for fetching data or prompting ChatGPT, as the project's core functionality relies on utilizing the authenticated browser session via Playwright.
+- **ALWAYS** implement features and fixes generically for every video. Never hardcode behavior for a specific video ID, YouTube URL, title, ChatGPT conversation, prompt version, or stored record. Video-specific data may only be used to reproduce and verify a general solution.

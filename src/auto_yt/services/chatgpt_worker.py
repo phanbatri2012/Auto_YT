@@ -29,12 +29,12 @@ DEFAULT_CHATGPT_PROJECT_URL = (
 PROFILE_WAIT_TIMEOUT_SECONDS = 20 * 60
 PROFILE_RETRY_INTERVAL_SECONDS = 5
 THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS = 5 * 60
+THUMBNAIL_TURN_WAIT_TIMEOUT_SECONDS = 30
 PROFILE_BUSY_ERROR_MARKERS = (
     "Opening in existing browser session",
     "profile is already in use",
     "ProcessSingleton",
 )
-THUMBNAIL_SOURCE_CONTEXT_LIMIT = 4500
 THUMBNAIL_GENERATION_ERROR_MARKERS = (
     "something went wrong",
     "please try again",
@@ -47,25 +47,6 @@ THUMBNAIL_GENERATION_ERROR_MARKERS = (
     "đã xảy ra lỗi",
     "hãy thử lại",
 )
-THUMBNAIL_SENSITIVE_REPLACEMENTS = (
-    (r'\bquan hệ thể xác\b', "vượt giới hạn hôn nhân"),
-    (r'\bquan hệ tình dục\b', "phản bội hôn nhân"),
-    (r'\bchuyện giường chiếu\b', "đời sống hôn nhân"),
-    (r'\bchuyện chăn gối\b', "đời sống hôn nhân"),
-    (r'\blên giường với\b', "phản bội"),
-    (r'\bqua đêm với\b', "bí mật gặp gỡ"),
-    (r'\bngủ với\b', "phản bội"),
-    (r'\bngủ (?:cùng|chung)\b', "vượt giới hạn"),
-    (r'\blàm tình\b', "phản bội"),
-    (r'\bân ái\b', "phản bội"),
-    (r'\bchuyện ấy\b', "việc vượt giới hạn"),
-    (r'\bgần gũi với\b', "duy trì mối quan hệ mập mờ với"),
-    (r'\bđổi tiền lấy tình\b', "dùng tiền ràng buộc tình cảm"),
-    (r'\bkhỏa thân\b', "trong tình huống nhạy cảm"),
-    (r'\bgợi dục\b', "không phù hợp"),
-    (r'\btình dục\b', "tình cảm"),
-    (r'\bthể xác\b', "giới hạn hôn nhân"),
-)
 
 
 def is_thumbnail_generation_error_response(response_text: str) -> bool:
@@ -76,50 +57,25 @@ def is_thumbnail_generation_error_response(response_text: str) -> bool:
     )
 
 
-def sanitize_thumbnail_source_context(source_context: str) -> str:
-    sanitized_context = source_context
-    for pattern, replacement in THUMBNAIL_SENSITIVE_REPLACEMENTS:
-        sanitized_context = re.sub(
-            pattern,
-            replacement,
-            sanitized_context,
-            flags=re.IGNORECASE,
-        )
-    return sanitized_context
-
-
-def extract_thumbnail_source_context(script_text: str) -> str:
-    body_match = re.search(
-        r'### \[BODY\]\s*(.*?)(?=\n### \[|\Z)',
-        script_text,
-        re.DOTALL | re.IGNORECASE,
-    )
-    source_context = body_match.group(1) if body_match else script_text
-    transition_match = re.search(
-        r'\n\s*(?:Tiếp theo|Câu chuyện tiếp theo|Sau đó là câu chuyện)\b',
-        source_context,
-        re.IGNORECASE,
-    )
-    if transition_match:
-        source_context = source_context[:transition_match.start()]
-    source_context = source_context[:THUMBNAIL_SOURCE_CONTEXT_LIMIT].strip()
-    return sanitize_thumbnail_source_context(source_context)
+def select_thumbnail_response_turn_number(
+    visible_turns: list[tuple[int, str]],
+    request_turn_number: int,
+) -> int | None:
+    response_turns = [
+        turn_number
+        for turn_number, role in visible_turns
+        if role == "assistant" and turn_number > request_turn_number
+    ]
+    return min(response_turns, default=None)
 
 
 def build_thumbnail_generation_prompt(
     base_prompt: str,
-    script_text: str,
     thumbnail_type: str,
 ) -> str:
-    source_context = extract_thumbnail_source_context(script_text)
     generation_prompt = (
         f"{base_prompt}\n\n"
-        "NGUỒN NỘI DUNG BẮT BUỘC CHO LƯỢT TẠO ẢNH NÀY:\n"
-        f"{source_context}\n\n"
-        "Chỉ dùng nguồn nội dung vừa được đính kèm ở trên. Nếu video có nhiều "
-        "câu chuyện, chỉ tạo thumbnail cho câu chuyện đầu tiên. Không lấy chi "
-        "tiết từ câu chuyện sau, ảnh cũ, cuộc trò chuyện khác hoặc bộ nhớ."
-        "\n\nRÀNG BUỘC AN TOÀN: Chuyển mọi chi tiết nhạy cảm thành hình ảnh "
+        "RÀNG BUỘC AN TOÀN: Chuyển mọi chi tiết nhạy cảm thành hình ảnh "
         "tâm lý mang tính biểu tượng. Chỉ dùng khuôn mặt, ánh mắt, điện thoại, "
         "quà tặng hoặc khoảng cách giữa các nhân vật trưởng thành mặc trang "
         "phục đời thường kín đáo. Bối cảnh là phòng khách, quán cà phê hoặc "
@@ -976,34 +932,66 @@ def _generate_single_thumbnail(
                 print(f"    -> Image download failed: {exc}", file=sys.stderr)
                 return ""
 
-        def get_latest_conversation_turn() -> int:
-            turn_ids = page.locator(
-                '[data-testid^="conversation-turn-"]'
-            ).evaluate_all(
-                """
-                elements => elements
-                    .map(element => element.getAttribute('data-testid') || '')
-                    .map(value => Number(value.replace('conversation-turn-', '')))
-                    .filter(Number.isFinite)
-                """
-            )
-            return max(turn_ids, default=-1)
+        def get_visible_conversation_turns() -> list[tuple[int, str]]:
+            visible_turns = []
+            turns = page.locator('[data-testid^="conversation-turn-"]')
+            for index in range(turns.count()):
+                turn = turns.nth(index)
+                test_id = turn.get_attribute("data-testid") or ""
+                try:
+                    turn_number = int(test_id.rsplit("-", 1)[-1])
+                except ValueError:
+                    continue
 
-        def extract_image_from_new_turn(previous_turn: int) -> str:
-            deadline = time.time() + THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS
+                role = turn.get_attribute("data-turn") or ""
+                if not role:
+                    role_nodes = turn.locator("[data-message-author-role]")
+                    if role_nodes.count() > 0:
+                        role = (
+                            role_nodes.first.get_attribute(
+                                "data-message-author-role"
+                            )
+                            or ""
+                        )
+                visible_turns.append((turn_number, role))
+            return visible_turns
+
+        def get_latest_conversation_turn(role: str) -> int:
+            matching_turns = [
+                turn_number
+                for turn_number, turn_role in get_visible_conversation_turns()
+                if turn_role == role
+            ]
+            return max(matching_turns, default=-1)
+
+        def wait_for_new_user_turn(previous_user_turn: int) -> int:
+            deadline = time.time() + THUMBNAIL_TURN_WAIT_TIMEOUT_SECONDS
             while time.time() < deadline:
-                turns = page.locator(
-                    '[data-testid^="conversation-turn-"]'
+                request_turn = get_latest_conversation_turn("user")
+                if request_turn > previous_user_turn:
+                    return request_turn
+                time.sleep(0.25)
+            raise RuntimeError(
+                "ChatGPT did not create a new thumbnail request turn."
+            )
+
+        def extract_image_from_response_turn(request_turn: int) -> str:
+            deadline = time.time() + THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS
+            response_turn = None
+            while time.time() < deadline:
+                if response_turn is None:
+                    response_turn = select_thumbnail_response_turn_number(
+                        get_visible_conversation_turns(),
+                        request_turn,
+                    )
+                if response_turn is None:
+                    time.sleep(1)
+                    continue
+
+                turn = page.locator(
+                    f'[data-testid="conversation-turn-{response_turn}"]'
                 )
-                for index in range(turns.count() - 1, -1, -1):
-                    turn = turns.nth(index)
-                    test_id = turn.get_attribute("data-testid") or ""
-                    try:
-                        turn_number = int(test_id.rsplit("-", 1)[-1])
-                    except ValueError:
-                        continue
-                    if turn_number <= previous_turn:
-                        continue
+                if turn.count() == 1:
                     images = turn.locator('img[src*="backend-api/estuary"]')
                     if images.count() > 0:
                         chatgpt_url = images.last.get_attribute("src")
@@ -1060,7 +1048,6 @@ def _generate_single_thumbnail(
         else:
             generation_prompt = build_thumbnail_generation_prompt(
                 prompts.get(config["prompt_key"], ""),
-                script_text,
                 thumbnail_type,
             )
             generation_prompt += (
@@ -1071,14 +1058,15 @@ def _generate_single_thumbnail(
             text_regenerated = True
 
         print(f">>>> REGENERATE THUMBNAIL ({config['label']})", file=sys.stderr)
-        previous_turn = get_latest_conversation_turn()
+        previous_user_turn = get_latest_conversation_turn("user")
         response_text = send_prompt(page, generation_prompt)
-        image_url = extract_image_from_new_turn(previous_turn)
+        request_turn = wait_for_new_user_turn(previous_user_turn)
+        image_url = extract_image_from_response_turn(request_turn)
 
         if not image_url and not extracted_prompt:
             draw_prompt = extract_draw_prompt(response_text)
             if draw_prompt:
-                previous_turn = get_latest_conversation_turn()
+                previous_user_turn = get_latest_conversation_turn("user")
                 output_constraint = (
                     thumbnail_without_text_constraint()
                     if thumbnail_type == "without_text"
@@ -1091,7 +1079,8 @@ def _generate_single_thumbnail(
                     "LƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN."
                     f"{output_constraint}",
                 )
-                image_url = extract_image_from_new_turn(previous_turn)
+                request_turn = wait_for_new_user_turn(previous_user_turn)
+                image_url = extract_image_from_response_turn(request_turn)
 
         context.close()
 

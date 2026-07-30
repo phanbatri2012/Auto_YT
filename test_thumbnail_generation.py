@@ -8,10 +8,9 @@ from auto_yt import main
 from auto_yt.services.chatgpt_worker import (
     build_thumbnail_generation_prompt,
     ensure_expected_conversation_page,
-    extract_thumbnail_source_context,
     get_video_thumbnail_chat_url,
     is_thumbnail_generation_error_response,
-    sanitize_thumbnail_source_context,
+    select_thumbnail_response_turn_number,
 )
 
 
@@ -99,43 +98,15 @@ class ThumbnailGenerationTests(unittest.TestCase):
         self.assertNotIn("old_with_text.png", updated_script)
         self.assertNotIn("old_without_text.png", updated_script)
 
-    def test_thumbnail_prompt_is_anchored_to_current_video(self):
-        script = """
-### [INTRO]
-Phần mở đầu có nhắc đến nhiều câu chuyện.
-
-### [BODY]
-Câu chuyện đầu tiên: người vợ bắt gặp chồng ở nhà nghỉ.
-
-Tiếp theo là câu chuyện về que thử thai và tiền.
-""".strip()
-
+    def test_thumbnail_prompt_does_not_append_script_source(self):
         prompt = build_thumbnail_generation_prompt(
             "PROMPT GỐC",
-            script,
             "without_text",
         )
 
         self.assertIn("PROMPT GỐC", prompt)
-        self.assertIn("người vợ bắt gặp chồng ở nhà nghỉ", prompt)
-        self.assertNotIn("que thử thai", prompt)
-        self.assertIn("chỉ tạo thumbnail cho câu chuyện đầu tiên", prompt)
+        self.assertNotIn("NGUỒN NỘI DUNG BẮT BUỘC", prompt)
         self.assertIn("ZERO TEXT, NO WORDS, NO LETTERS", prompt)
-
-    def test_thumbnail_source_uses_first_body_story(self):
-        script = """
-### [INTRO]
-Tóm tắt cả câu chuyện đầu tiên và câu chuyện thứ hai.
-
-### [BODY]
-Nội dung câu chuyện đầu tiên.
-
-Câu chuyện tiếp theo nói về tài sản.
-""".strip()
-
-        source_context = extract_thumbnail_source_context(script)
-
-        self.assertEqual(source_context, "Nội dung câu chuyện đầu tiên.")
 
     def test_both_type_keeps_old_images_when_first_image_is_missing(self):
         request = main.GenerateThumbnailsRequest(
@@ -174,25 +145,6 @@ Câu chuyện tiếp theo nói về tài sản.
         self.assertIn("Ảnh cũ được giữ nguyên", response["error"])
         generate_thumbnails.assert_called_once()
         update_script.assert_not_called()
-
-    def test_thumbnail_context_softens_sensitive_language(self):
-        sensitive_cases = (
-            ("ngủ với người cũ", "phản bội"),
-            ("muốn ngủ cùng người ấy", "vượt giới hạn"),
-            ("tiếp tục quan hệ thể xác", "vượt giới hạn hôn nhân"),
-            ("qua đêm với đồng nghiệp", "bí mật gặp gỡ"),
-            ("nhắc đến chuyện giường chiếu", "đời sống hôn nhân"),
-            ("mô tả chuyện ấy", "việc vượt giới hạn"),
-            ("hình ảnh gợi dục", "không phù hợp"),
-        )
-
-        for source_context, expected_text in sensitive_cases:
-            with self.subTest(source_context=source_context):
-                sanitized_context = sanitize_thumbnail_source_context(
-                    source_context
-                )
-                self.assertNotEqual(sanitized_context, source_context)
-                self.assertIn(expected_text, sanitized_context)
 
     def test_content_policy_response_is_not_used_as_draw_prompt(self):
         response = (
@@ -241,6 +193,25 @@ Câu chuyện tiếp theo nói về tài sản.
                 "https://chatgpt.com/",
                 "https://chatgpt.com/c/conversation-id",
             )
+
+    def test_thumbnail_selects_only_the_response_after_its_request(self):
+        visible_turns = (
+            (64, "assistant"),
+            (65, "user"),
+            (66, "assistant"),
+            (67, "user"),
+            (68, "assistant"),
+            (69, "user"),
+            (70, "assistant"),
+        )
+
+        self.assertEqual(
+            select_thumbnail_response_turn_number(visible_turns, 67),
+            68,
+        )
+        self.assertIsNone(
+            select_thumbnail_response_turn_number(visible_turns[:4], 67)
+        )
 
 
 if __name__ == "__main__":

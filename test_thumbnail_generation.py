@@ -6,6 +6,7 @@ from fastapi import BackgroundTasks
 
 from auto_yt import main
 from auto_yt.services.chatgpt_worker import (
+    THUMBNAIL_RETRY_PROMPT,
     build_thumbnail_generation_prompt,
     ensure_expected_conversation_page,
     get_video_thumbnail_chat_url,
@@ -98,15 +99,25 @@ class ThumbnailGenerationTests(unittest.TestCase):
         self.assertNotIn("old_with_text.png", updated_script)
         self.assertNotIn("old_without_text.png", updated_script)
 
-    def test_thumbnail_prompt_does_not_append_script_source(self):
-        prompt = build_thumbnail_generation_prompt(
-            "PROMPT GỐC",
-            "without_text",
-        )
+    def test_thumbnail_prompt_is_sent_without_changes(self):
+        user_prompt = "PROMPT CỦA TÔI\nnegative_prompt tùy chỉnh"
 
-        self.assertIn("PROMPT GỐC", prompt)
-        self.assertNotIn("NGUỒN NỘI DUNG BẮT BUỘC", prompt)
-        self.assertIn("ZERO TEXT, NO WORDS, NO LETTERS", prompt)
+        for thumbnail_type in ("with_text", "without_text"):
+            with self.subTest(thumbnail_type=thumbnail_type):
+                self.assertEqual(
+                    build_thumbnail_generation_prompt(
+                        user_prompt,
+                        thumbnail_type,
+                    ),
+                    user_prompt,
+                )
+
+    def test_thumbnail_retry_prompt_matches_requested_command(self):
+        self.assertEqual(
+            THUMBNAIL_RETRY_PROMPT,
+            "Sửa lại prompt sao cho không vi phạm. sau đó tạo lại thumbanil. "
+            "chỉ cần xuất hình ảnh thumbnail.",
+        )
 
     def test_both_type_keeps_old_images_when_first_image_is_missing(self):
         request = main.GenerateThumbnailsRequest(
@@ -146,7 +157,7 @@ class ThumbnailGenerationTests(unittest.TestCase):
         generate_thumbnails.assert_called_once()
         update_script.assert_not_called()
 
-    def test_content_policy_response_is_not_used_as_draw_prompt(self):
+    def test_content_policy_response_is_detected(self):
         response = (
             "We’re so sorry, but the prompt may violate our content policies. "
             "Please retry or edit your prompt."

@@ -4,7 +4,7 @@ import AutoLogin from './AutoLogin'
 import Settings from './Settings'
 
 function App() {
-  const [activeView, setActiveView] = useState('fetcher') // 'fetcher' or 'dashboard'
+  const [activeView, setActiveView] = useState('dashboard') // 'fetcher' or 'dashboard'
   const [url, setUrl] = useState('')
   const [isFetching, setIsFetching] = useState(false)
   const [showResult, setShowResult] = useState(false)
@@ -29,7 +29,7 @@ function App() {
   
   const [promptVersions, setPromptVersions] = useState([])
   const [selectedPromptVersion, setSelectedPromptVersion] = useState('default')
-  const [publishFilter, setPublishFilter] = useState('all') // 'all' | 'published' | 'unpublished'
+  const [publishFilter, setPublishFilter] = useState('unpublished') // 'all' | 'published' | 'unpublished'
   
   const PAGE_SIZE = 10
   const chatGptControlsDisabled =
@@ -280,7 +280,6 @@ function App() {
   };
 
   const viewSavedVideo = async (id) => {
-    if (chatGptControlsDisabled) return;
     try {
       const response = await fetch(`http://127.0.0.1:8080/api/videos/${id}`);
       const data = await response.json();
@@ -680,18 +679,8 @@ function App() {
           <div className="brand-name">Auto_YT</div>
         </div>
         <ul className="nav-menu">
-          <li
-            className={`nav-item ${activeView === 'dashboard' ? 'active' : ''}`}
-            aria-disabled={chatGptControlsDisabled}
-            onClick={() => !chatGptControlsDisabled && setActiveView('dashboard')}
-            style={chatGptControlsDisabled ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}
-          >Dashboard</li>
-          <li
-            className={`nav-item ${activeView === 'fetcher' ? 'active' : ''}`}
-            aria-disabled={chatGptControlsDisabled}
-            onClick={() => !chatGptControlsDisabled && setActiveView('fetcher')}
-            style={chatGptControlsDisabled ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}
-          >Video Fetcher</li>
+          <li className={`nav-item ${activeView === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveView('dashboard')}>Dashboard</li>
+          <li className={`nav-item ${activeView === 'fetcher' ? 'active' : ''}`} onClick={() => setActiveView('fetcher')}>Video Fetcher</li>
           <li
             className={`nav-item ${activeView === 'autologin' ? 'active' : ''}`}
             aria-disabled={chatGptControlsDisabled}
@@ -819,7 +808,6 @@ function App() {
                           <button
                             className="btn-run"
                             style={{ padding: '8px', flex: 1, fontSize: '0.9em' }}
-                            disabled={chatGptControlsDisabled}
                             onClick={() => viewSavedVideo(video.id)}
                           >📄 Xem Script</button>
                           <button 

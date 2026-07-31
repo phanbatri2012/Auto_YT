@@ -30,6 +30,10 @@ PROFILE_WAIT_TIMEOUT_SECONDS = 20 * 60
 PROFILE_RETRY_INTERVAL_SECONDS = 5
 THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS = 5 * 60
 THUMBNAIL_TURN_WAIT_TIMEOUT_SECONDS = 30
+THUMBNAIL_RETRY_PROMPT = (
+    "Sửa lại prompt sao cho không vi phạm. sau đó tạo lại thumbanil. "
+    "chỉ cần xuất hình ảnh thumbnail."
+)
 PROFILE_BUSY_ERROR_MARKERS = (
     "Opening in existing browser session",
     "profile is already in use",
@@ -73,27 +77,7 @@ def build_thumbnail_generation_prompt(
     base_prompt: str,
     thumbnail_type: str,
 ) -> str:
-    generation_prompt = (
-        f"{base_prompt}\n\n"
-        "RÀNG BUỘC AN TOÀN: Chuyển mọi chi tiết nhạy cảm thành hình ảnh "
-        "tâm lý mang tính biểu tượng. Chỉ dùng khuôn mặt, ánh mắt, điện thoại, "
-        "quà tặng hoặc khoảng cách giữa các nhân vật trưởng thành mặc trang "
-        "phục đời thường kín đáo. Bối cảnh là phòng khách, quán cà phê hoặc "
-        "ngoài trời; các nhân vật chỉ đối diện hoặc đứng cách nhau. Không mô "
-        "tả lại từ ngữ nhạy cảm trong image_prompt."
-    )
-    if thumbnail_type == "without_text":
-        generation_prompt += thumbnail_without_text_constraint()
-    return generation_prompt
-
-
-def thumbnail_without_text_constraint() -> str:
-    return (
-        "\n\nRÀNG BUỘC TUYỆT ĐỐI: Ảnh cuối cùng KHÔNG ĐƯỢC CÓ BẤT KỲ "
-        "headline, caption, chữ lớn, chữ trang trí, ký tự hoặc typography "
-        "nào. Hãy kể chuyện hoàn toàn bằng nhân vật, biểu cảm, hành động, "
-        "vật chứng và bối cảnh. ZERO TEXT, NO WORDS, NO LETTERS."
-    )
+    return base_prompt
 
 
 def get_chatgpt_project_url() -> str:
@@ -329,6 +313,12 @@ def send_prompt(page: Page, prompt_text: str) -> str:
             selection.removeAllRanges();
             selection.addRange(range);
             document.execCommand('insertText', false, text);
+            el.dispatchEvent(new InputEvent('input', {
+                bubbles: true,
+                inputType: 'insertText',
+                data: text
+            }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
         }""", prompt_text)
     except Exception:
         # Fallback to fill() if evaluate fails
@@ -343,10 +333,41 @@ def send_prompt(page: Page, prompt_text: str) -> str:
                 const btn = document.querySelector('[data-testid="send-button"]');
                 return btn && !btn.disabled;
             }""",
-            timeout=10000
+            timeout=30000
         )
     except Exception as e:
-        raise Exception(f"Send button did not appear/enable after typing. Error: {e}")
+        page.evaluate("""() => {
+            const el = document.querySelector('#prompt-textarea');
+            if (!el) return;
+            el.dispatchEvent(new InputEvent('input', {
+                bubbles: true,
+                inputType: 'insertText',
+                data: null
+            }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }""")
+        try:
+            page.wait_for_function(
+                """() => {
+                    const btn = document.querySelector('[data-testid="send-button"]');
+                    return btn && !btn.disabled;
+                }""",
+                timeout=10000
+            )
+        except Exception:
+            diagnostics = page.evaluate("""() => {
+                const editor = document.querySelector('#prompt-textarea');
+                const button = document.querySelector('[data-testid="send-button"]');
+                return {
+                    editorTextLength: editor?.innerText?.length ?? 0,
+                    sendButtonFound: Boolean(button),
+                    sendButtonDisabled: button?.disabled ?? null
+                };
+            }""")
+            raise Exception(
+                "Send button did not appear/enable after typing. "
+                f"Diagnostics: {diagnostics}. Error: {e}"
+            )
 
     send_btn.click()
     
@@ -533,66 +554,32 @@ def run(transcript: str) -> str:
 
         # Step 8: Thumbnail Idea 1 (With Text)
         print(">>> BƯỚC 8: TẠO Ý TƯỞNG THUMBNAIL (CÓ CHỮ)", file=sys.stderr)
-        prompt8 = prompts.get("thumb_text", "") + STRICT_NO_FILLER
+        prompt8 = build_thumbnail_generation_prompt(
+            prompts.get("thumb_text", ""),
+            "with_text",
+        )
         thumb1 = send_prompt(page, prompt8)
         image1_url = extract_latest_image()
-        
-        # Đồng bộ logic: Nếu ChatGPT chỉ trả text mà chưa vẽ ảnh, ta trích xuất nội dung để ép vẽ
         if not image1_url:
-            import re
-            draw_str = None
-            prompt_match1 = re.search(r'Prompt hình ảnh:\s*(.*?)(?=\n\n|\Z)', thumb1, re.IGNORECASE | re.DOTALL)
-            if prompt_match1:
-                draw_str = prompt_match1.group(1).strip()
-            else:
-                json_match = re.search(r'```(?:json)?\n(.*?)```', thumb1, re.IGNORECASE | re.DOTALL)
-                if json_match:
-                    draw_str = json_match.group(1).strip()
-                else:
-                    json_brace_match = re.search(r'(\{.*\})', thumb1, re.DOTALL)
-                    if json_brace_match:
-                        draw_str = json_brace_match.group(1).strip()
-                    elif len(thumb1) > 20 and '👍' not in thumb1:
-                        draw_str = thumb1.strip()
-
-            if draw_str:
-                print(">>> ĐANG VẼ ẢNH THUMBNAIL 1...", file=sys.stderr)
-                draw_prompt1 = f"Vui lòng vẽ chính xác hình ảnh (Tỷ lệ 16:9) bám sát tuyệt đối mô tả sau đây:\n\n{draw_str}\n\nLƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN."
-                send_prompt(page, draw_prompt1)
-                image1_url = extract_latest_image()
+            print(">>> THUMBNAIL CÓ CHỮ LỖI, THỬ LẠI MỘT LẦN...", file=sys.stderr)
+            thumb1 = send_prompt(page, THUMBNAIL_RETRY_PROMPT)
+            image1_url = extract_latest_image()
 
         if image1_url:
             thumb1 += f"\n\n[IMAGE_URL:{image1_url}]"
 
         # Step 9: Thumbnail Idea 2 (No Text)
         print(">>> BƯỚC 9: TẠO Ý TƯỞNG THUMBNAIL (KHÔNG CHỮ)", file=sys.stderr)
-        prompt9 = prompts.get("thumb_notext", "") + STRICT_NO_FILLER
+        prompt9 = build_thumbnail_generation_prompt(
+            prompts.get("thumb_notext", ""),
+            "without_text",
+        )
         thumb2 = send_prompt(page, prompt9)
         image2_url = extract_latest_image()
-        
-        # Đồng bộ logic tương tự cho thumbnail 2
         if not image2_url:
-            import re
-            draw_str2 = None
-            prompt_match2 = re.search(r'Prompt hình ảnh:\s*(.*?)(?=\n\n|\Z)', thumb2, re.IGNORECASE | re.DOTALL)
-            if prompt_match2:
-                draw_str2 = prompt_match2.group(1).strip()
-            else:
-                json_match2 = re.search(r'```(?:json)?\n(.*?)```', thumb2, re.IGNORECASE | re.DOTALL)
-                if json_match2:
-                    draw_str2 = json_match2.group(1).strip()
-                else:
-                    json_brace_match2 = re.search(r'(\{.*\})', thumb2, re.DOTALL)
-                    if json_brace_match2:
-                        draw_str2 = json_brace_match2.group(1).strip()
-                    elif len(thumb2) > 20 and '👍' not in thumb2:
-                        draw_str2 = thumb2.strip()
-
-            if draw_str2:
-                print(">>> ĐANG VẼ ẢNH THUMBNAIL 2...", file=sys.stderr)
-                draw_prompt2 = f"Vui lòng vẽ chính xác hình ảnh (Tỷ lệ 16:9) bám sát tuyệt đối mô tả sau đây:\n\n{draw_str2}\n\nLƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN."
-                send_prompt(page, draw_prompt2)
-                image2_url = extract_latest_image()
+            print(">>> THUMBNAIL KHÔNG CHỮ LỖI, THỬ LẠI MỘT LẦN...", file=sys.stderr)
+            thumb2 = send_prompt(page, THUMBNAIL_RETRY_PROMPT)
+            image2_url = extract_latest_image()
 
         if image2_url:
             thumb2 += f"\n\n[IMAGE_URL:{image2_url}]"
@@ -731,8 +718,6 @@ def generate_thumbnails_only(
             ensure_expected_project_page(page.url, target_url)
         time.sleep(2)  # Let the page settle
 
-        STRICT_NO_FILLER = "\n\nLƯU Ý QUAN TRỌNG: TRẢ LỜI TRỰC TIẾP VÀO NỘI DUNG. TUYỆT ĐỐI KHÔNG CHÀO HỎI, KHÔNG DẠ VÂNG, KHÔNG THÊM BẤT KỲ CÂU DẪN HAY GIẢI THÍCH NÀO (VD: 'Dưới đây là...', 'Trân trọng gửi bạn...'). CHỈ IN RA ĐÚNG NỘI DUNG CẦN VIẾT."
-
         # Temporarily set PROMPT_VERSION env var so get_active_prompts() reads it
         import os
         original_env = os.environ.get("PROMPT_VERSION")
@@ -796,137 +781,35 @@ def generate_thumbnails_only(
                 print(f"    -> Lỗi download ảnh: {e}", file=sys.stderr)
                 return ""
 
-        import re
-        def extract_image_prompt(script: str, section: str) -> str:
-            pattern = re.escape(section) + r'(.*?)(?=### \[|\Z)'
-            match = re.search(pattern, script, re.DOTALL)
-            if match:
-                content = match.group(1)
-                prompt_match = re.search(r'Prompt hình ảnh:\s*(.*?)(?=\n\n|\Z)', content, re.IGNORECASE | re.DOTALL)
-                if prompt_match:
-                    return prompt_match.group(1).strip()
-            return ""
+        print("    -> Dùng trực tiếp prompt thumbnail đã lưu.", file=sys.stderr)
 
-        extracted_thumb1 = extract_image_prompt(script_text, "### [THUMBNAIL CÓ CHỮ]")
-        extracted_thumb2 = extract_image_prompt(script_text, "### [THUMBNAIL KHÔNG CHỮ]")
-        print(f"    -> extracted_thumb1 length: {len(extracted_thumb1)}", file=sys.stderr)
-        print(f"    -> extracted_thumb2 length: {len(extracted_thumb2)}", file=sys.stderr)
-        msg_count = page.locator('[data-message-author-role="assistant"]').count()
-        print(f"    -> Total assistant messages on page: {msg_count}", file=sys.stderr)
-
-        # Nếu là chat mới (không có chat_url), và không trích xuất được prompt hình ảnh trực tiếp -> cần gửi context trước
-        if not is_original_chat:
-            if not extracted_thumb1 and not extracted_thumb2:
-                print("    -> Chat mới, gửi context script trước...", file=sys.stderr)
-                context_prompt = f"Đây là nội dung kịch bản video YouTube tôi cần tạo thumbnail:\n\n{script_text[:3000]}"
-                send_prompt(page, context_prompt)
-            else:
-                print("    -> Chat mới, nhưng đã có sẵn Prompt hình ảnh -> Bỏ qua bước gửi context.", file=sys.stderr)
-        else:
-            print("    -> Dùng lại phiên chat gốc, bỏ qua bước gửi context.", file=sys.stderr)
-
-        # Step 8: Thumbnail Có Chữ
         print(">>>> GEN THUMBNAIL (CÓ CHỮ)", file=sys.stderr)
-        text1_regenerated = False
-        thumb1 = None
-
-        # Kiểm tra ảnh đã có sẵn trong chat trước khi gửi prompt mới
-        images_before = page.locator('div[data-message-author-role="assistant"] img[src*="backend-api/estuary"]')
-        existing_count = images_before.count()
-        print(f"    -> Số ảnh đã có trong chat: {existing_count}", file=sys.stderr)
-
-        if existing_count >= 2:
-            # Đã có đủ 2 ảnh — lấy trực tiếp không cần vẽ lại
-            print("    -> Đã có 2 ảnh sẵn trong chat, lấy trực tiếp...", file=sys.stderr)
-            image1_url = images_before.nth(existing_count - 2).get_attribute("src")
-            image2_url = images_before.nth(existing_count - 1).get_attribute("src")
-            print(f"    -> image1_url: {image1_url}", file=sys.stderr)
-            print(f"    -> image2_url: {image2_url}", file=sys.stderr)
-        else:
-            image2_url = ""
-            if extracted_thumb1:
-                print(f"    -> Using extracted prompt: {extracted_thumb1}", file=sys.stderr)
-                prompt8 = f"Vui lòng vẽ chính xác hình ảnh (Tỷ lệ 16:9) bám sát tuyệt đối mô tả sau đây:\n\n{extracted_thumb1}\n\nLƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN."
-            else:
-                prompt8 = prompts.get("thumb_text", "") + STRICT_NO_FILLER
-                text1_regenerated = True
-
-            count_before = page.locator('[data-message-author-role="assistant"]').count()
-            print(f"    -> Assistant count before sending prompt8: {count_before}", file=sys.stderr)
-            print(f"    -> Sending prompt8 (first 200 chars): {prompt8[:200]}", file=sys.stderr)
-            thumb1 = send_prompt(page, prompt8)
-            print(f"    -> thumb1 response (first 200 chars): {thumb1[:200]}", file=sys.stderr)
+        prompt8 = build_thumbnail_generation_prompt(
+            prompts.get("thumb_text", ""),
+            "with_text",
+        )
+        thumb1 = send_prompt(page, prompt8)
+        image1_url = extract_latest_image()
+        if not image1_url:
+            thumb1 = send_prompt(page, THUMBNAIL_RETRY_PROMPT)
             image1_url = extract_latest_image()
 
-            if not image1_url and not extracted_thumb1:
-                import re
-                draw_str = None
-                prompt_match1 = re.search(r'Prompt hình ảnh:\s*(.*?)(?=\n\n|\Z)', thumb1, re.IGNORECASE | re.DOTALL)
-                if prompt_match1:
-                    draw_str = prompt_match1.group(1).strip()
-                else:
-                    json_match = re.search(r'```(?:json)?\n(.*?)```', thumb1, re.IGNORECASE | re.DOTALL)
-                    if json_match:
-                        draw_str = json_match.group(1).strip()
-                    else:
-                        json_brace_match = re.search(r'(\{.*\})', thumb1, re.DOTALL)
-                        if json_brace_match:
-                            draw_str = json_brace_match.group(1).strip()
-                        elif len(thumb1) > 20 and '👍' not in thumb1:
-                            draw_str = thumb1.strip()
-
-                if draw_str:
-                    print(">>> ĐANG VẼ ẢNH THUMBNAIL 1 (Fallback)...", file=sys.stderr)
-                    draw_prompt1 = f"Vui lòng vẽ chính xác hình ảnh (Tỷ lệ 16:9) bám sát tuyệt đối mô tả sau đây:\n\n{draw_str}\n\nLƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN."
-                    send_prompt(page, draw_prompt1)
-                    image1_url = extract_latest_image()
-
-
-        # Step 9: Thumbnail Không Chữ (bỏ qua nếu đã lấy được ảnh từ chat cũ)
-        if existing_count < 2:
-            print(">>> GEN THUMBNAIL (KHÔNG CHỮ)", file=sys.stderr)
-            text2_regenerated = False
-            if extracted_thumb2:
-                prompt9 = f"Vui lòng vẽ chính xác hình ảnh (Tỷ lệ 16:9) bám sát tuyệt đối mô tả sau đây:\n\n{extracted_thumb2}\n\nLƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN."
-            else:
-                prompt9 = prompts.get("thumb_notext", "") + STRICT_NO_FILLER
-                text2_regenerated = True
-
-            thumb2 = send_prompt(page, prompt9)
+        print(">>> GEN THUMBNAIL (KHÔNG CHỮ)", file=sys.stderr)
+        prompt9 = build_thumbnail_generation_prompt(
+            prompts.get("thumb_notext", ""),
+            "without_text",
+        )
+        thumb2 = send_prompt(page, prompt9)
+        image2_url = extract_latest_image()
+        if not image2_url:
+            thumb2 = send_prompt(page, THUMBNAIL_RETRY_PROMPT)
             image2_url = extract_latest_image()
-
-            if not image2_url and not extracted_thumb2:
-                import re
-                draw_str2 = None
-                prompt_match2 = re.search(r'Prompt hình ảnh:\s*(.*?)(?=\n\n|\Z)', thumb2, re.IGNORECASE | re.DOTALL)
-                if prompt_match2:
-                    draw_str2 = prompt_match2.group(1).strip()
-                else:
-                    json_match2 = re.search(r'```(?:json)?\n(.*?)```', thumb2, re.IGNORECASE | re.DOTALL)
-                    if json_match2:
-                        draw_str2 = json_match2.group(1).strip()
-                    else:
-                        json_brace_match2 = re.search(r'(\{.*\})', thumb2, re.DOTALL)
-                        if json_brace_match2:
-                            draw_str2 = json_brace_match2.group(1).strip()
-                        elif len(thumb2) > 20 and '👍' not in thumb2:
-                            draw_str2 = thumb2.strip()
-
-                if draw_str2:
-                    print(">>> ĐANG VẼ ẢNH THUMBNAIL 2 (Fallback)...", file=sys.stderr)
-                    draw_prompt2 = f"Vui lòng vẽ chính xác hình ảnh (Tỷ lệ 16:9) bám sát tuyệt đối mô tả sau đây:\n\n{draw_str2}\n\nLƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN."
-                    send_prompt(page, draw_prompt2)
-                    image2_url = extract_latest_image()
-        else:
-            print("    -> Bỏ qua Step 9, đã lấy đủ ảnh từ chat.", file=sys.stderr)
-            thumb2 = None
-            text2_regenerated = False
 
         context.close()
 
         return {
-            "thumb_text": thumb1 if text1_regenerated else None,
-            "thumb_notext": thumb2 if text2_regenerated else None,
+            "thumb_text": thumb1,
+            "thumb_notext": thumb2,
             "image1_url": image1_url,
             "image2_url": image2_url,
         }
@@ -940,14 +823,12 @@ def _generate_single_thumbnail(
 ) -> dict:
     thumbnail_configs = {
         "with_text": {
-            "section": "### [THUMBNAIL CÓ CHỮ]",
             "prompt_key": "thumb_text",
             "text_result_key": "thumb_text",
             "image_result_key": "image1_url",
             "label": "CÓ CHỮ",
         },
         "without_text": {
-            "section": "### [THUMBNAIL KHÔNG CHỮ]",
             "prompt_key": "thumb_notext",
             "text_result_key": "thumb_notext",
             "image_result_key": "image2_url",
@@ -1080,87 +961,37 @@ def _generate_single_thumbnail(
                 time.sleep(1)
             return ""
 
-        def extract_section_prompt() -> str:
-            pattern = re.escape(config["section"]) + r'(.*?)(?=### \[|\Z)'
-            section_match = re.search(pattern, script_text, re.DOTALL)
-            if not section_match:
-                return ""
-            prompt_match = re.search(
-                r'Prompt hình ảnh:\s*(.*?)(?=\n\n|\Z)',
-                section_match.group(1),
-                re.IGNORECASE | re.DOTALL,
-            )
-            return prompt_match.group(1).strip() if prompt_match else ""
-
-        def extract_draw_prompt(response_text: str) -> str:
-            if is_thumbnail_generation_error_response(response_text):
-                return ""
-
-            prompt_match = re.search(
-                r'Prompt hình ảnh:\s*(.*?)(?=\n\n|\Z)',
-                response_text,
-                re.IGNORECASE | re.DOTALL,
-            )
-            if prompt_match:
-                return prompt_match.group(1).strip()
-
-            json_match = re.search(r'```(?:json)?\n(.*?)```', response_text, re.IGNORECASE | re.DOTALL)
-            if json_match:
-                return json_match.group(1).strip()
-
-            json_object_match = re.search(r'(\{.*\})', response_text, re.DOTALL)
-            if json_object_match:
-                return json_object_match.group(1).strip()
-
-            return response_text.strip() if len(response_text.strip()) > 20 and '👍' not in response_text else ""
-
-        extracted_prompt = extract_section_prompt()
-
-        if extracted_prompt:
-            generation_prompt = (
-                "Vui lòng vẽ chính xác hình ảnh (Tỷ lệ 16:9) bám sát tuyệt đối "
-                f"mô tả sau đây:\n\n{extracted_prompt}\n\n"
-                "LƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN."
-            )
-            if thumbnail_type == "without_text":
-                generation_prompt += thumbnail_without_text_constraint()
-            text_regenerated = False
-        else:
-            generation_prompt = build_thumbnail_generation_prompt(
-                prompts.get(config["prompt_key"], ""),
-                thumbnail_type,
-            )
-            generation_prompt += (
-                "\n\nLƯU Ý QUAN TRỌNG: TRẢ LỜI TRỰC TIẾP VÀO NỘI DUNG. "
-                "TUYỆT ĐỐI KHÔNG CHÀO HỎI, KHÔNG DẠ VÂNG, KHÔNG THÊM CÂU DẪN. "
-                "CHỈ IN RA ĐÚNG NỘI DUNG CẦN VIẾT."
-            )
-            text_regenerated = True
+        generation_prompt = build_thumbnail_generation_prompt(
+            prompts.get(config["prompt_key"], ""),
+            thumbnail_type,
+        )
 
         print(f">>>> REGENERATE THUMBNAIL ({config['label']})", file=sys.stderr)
         previous_user_turn = get_latest_conversation_turn("user")
         response_text = send_prompt(page, generation_prompt)
         request_turn = wait_for_new_user_turn(previous_user_turn)
-        image_url = extract_image_from_response_turn(request_turn)
-
-        if not image_url and not extracted_prompt:
-            draw_prompt = extract_draw_prompt(response_text)
-            if draw_prompt:
-                previous_user_turn = get_latest_conversation_turn("user")
-                output_constraint = (
-                    thumbnail_without_text_constraint()
-                    if thumbnail_type == "without_text"
-                    else ""
-                )
-                send_prompt(
-                    page,
-                    "Vui lòng vẽ chính xác hình ảnh (Tỷ lệ 16:9) bám sát tuyệt đối "
-                    f"mô tả sau đây:\n\n{draw_prompt}\n\n"
-                    "LƯU Ý: CHỈ VẼ ẢNH, KHÔNG BÌNH LUẬN."
-                    f"{output_constraint}",
-                )
-                request_turn = wait_for_new_user_turn(previous_user_turn)
-                image_url = extract_image_from_response_turn(request_turn)
+        image_url = (
+            ""
+            if response_text.strip()
+            and is_thumbnail_generation_error_response(response_text)
+            else extract_image_from_response_turn(request_turn)
+        )
+        retry_succeeded = False
+        if not image_url:
+            print(
+                f">>>> THUMBNAIL {config['label']} LỖI, THỬ LẠI MỘT LẦN...",
+                file=sys.stderr,
+            )
+            previous_user_turn = get_latest_conversation_turn("user")
+            retry_response_text = send_prompt(page, THUMBNAIL_RETRY_PROMPT)
+            retry_request_turn = wait_for_new_user_turn(previous_user_turn)
+            image_url = (
+                ""
+                if retry_response_text.strip()
+                and is_thumbnail_generation_error_response(retry_response_text)
+                else extract_image_from_response_turn(retry_request_turn)
+            )
+            retry_succeeded = bool(image_url)
 
         context.close()
 
@@ -1170,7 +1001,9 @@ def _generate_single_thumbnail(
             "image1_url": "",
             "image2_url": "",
         }
-        result[config["text_result_key"]] = response_text if text_regenerated else None
+        result[config["text_result_key"]] = (
+            None if retry_succeeded else response_text
+        )
         result[config["image_result_key"]] = image_url
         return result
 

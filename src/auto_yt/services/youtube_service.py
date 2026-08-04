@@ -3,6 +3,15 @@ from youtube_transcript_api.formatters import TextFormatter
 import urllib.parse as urlparse
 import urllib.request
 import re
+import truststore
+
+
+def _configure_system_trust_store() -> None:
+    # Honor managed OS certificate authorities while keeping TLS verification enabled.
+    truststore.inject_into_ssl()
+
+
+_configure_system_trust_store()
 
 def get_video_title(url: str) -> str:
     """Fetches the video title from YouTube URL."""

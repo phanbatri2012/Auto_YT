@@ -3,6 +3,92 @@ import './App.css'
 import AutoLogin from './AutoLogin'
 import Settings from './Settings'
 
+const SECONDS_PER_MINUTE = 60
+const SECONDS_PER_HOUR = 60 * SECONDS_PER_MINUTE
+
+function formatAudioDuration(durationSeconds) {
+  const totalSeconds = Math.floor(durationSeconds)
+  const hours = Math.floor(totalSeconds / SECONDS_PER_HOUR)
+  const minutes = Math.floor((totalSeconds % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE)
+  const seconds = totalSeconds % SECONDS_PER_MINUTE
+  const paddedSeconds = String(seconds).padStart(2, '0')
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${paddedSeconds}`
+  }
+  return `${minutes}:${paddedSeconds}`
+}
+
+async function saveAudioDuration(videoId, durationSeconds) {
+  const response = await fetch(
+    `http://127.0.0.1:8080/api/videos/${videoId}/audio-duration`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ duration_seconds: durationSeconds })
+    }
+  )
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`)
+  }
+}
+
+function AudioDurationBadge({ videoId, audioUrl, savedDurationSeconds }) {
+  const [durationSeconds, setDurationSeconds] = useState(savedDurationSeconds || null)
+  const [loadFailed, setLoadFailed] = useState(false)
+
+  useEffect(() => {
+    setDurationSeconds(savedDurationSeconds || null)
+    setLoadFailed(false)
+    if (!audioUrl || savedDurationSeconds) return undefined
+
+    const audio = new Audio()
+    const handleLoadedMetadata = () => {
+      if (Number.isFinite(audio.duration) && audio.duration > 0) {
+        setDurationSeconds(audio.duration)
+        saveAudioDuration(videoId, audio.duration)
+          .catch(error => console.error('Failed to save audio duration', error))
+      } else {
+        setLoadFailed(true)
+      }
+    }
+    const handleError = () => setLoadFailed(true)
+
+    audio.preload = 'metadata'
+    audio.addEventListener('loadedmetadata', handleLoadedMetadata)
+    audio.addEventListener('error', handleError)
+    audio.src = audioUrl
+
+    return () => {
+      audio.removeEventListener('loadedmetadata', handleLoadedMetadata)
+      audio.removeEventListener('error', handleError)
+      audio.removeAttribute('src')
+      audio.load()
+    }
+  }, [videoId, audioUrl, savedDurationSeconds])
+
+  let label = 'Chưa có audio'
+  if (audioUrl) {
+    label = durationSeconds !== null
+      ? formatAudioDuration(durationSeconds)
+      : loadFailed ? 'Audio không khả dụng' : 'Đang tải...'
+  }
+
+  return (
+    <span
+      title={audioUrl || 'Video chưa có audio'}
+      style={{
+        color: durationSeconds !== null ? '#4dd0e1' : '#888',
+        fontSize: '0.82em',
+        fontWeight: '600',
+        whiteSpace: 'nowrap'
+      }}
+    >
+      🎵 {label}
+    </span>
+  )
+}
+
 function App() {
   const [activeView, setActiveView] = useState('dashboard') // 'fetcher' or 'dashboard'
   const [url, setUrl] = useState('')
@@ -24,12 +110,14 @@ function App() {
   const [currentVideoId, setCurrentVideoId] = useState(null)
   const currentVideoIdRef = useRef(null)
   const [videoTitle, setVideoTitle] = useState('')
+  const [currentVideoPromptVersion, setCurrentVideoPromptVersion] = useState('')
   const [isCurrentVideoPublished, setIsCurrentVideoPublished] = useState(false)
   const [chatGptStatus, setChatGptStatus] = useState({ busy: false, operation: '' })
   
   const [promptVersions, setPromptVersions] = useState([])
   const [selectedPromptVersion, setSelectedPromptVersion] = useState('default')
   const [publishFilter, setPublishFilter] = useState('unpublished') // 'all' | 'published' | 'unpublished'
+  const [promptVersionFilter, setPromptVersionFilter] = useState('all')
   
   const PAGE_SIZE = 10
   const chatGptControlsDisabled =
@@ -38,14 +126,23 @@ function App() {
     generatingThumbnailType !== null ||
     isGeneratingChapters ||
     isGeneratingMetadata
+  const getPromptVersionName = (versionKey) =>
+    promptVersions.find(version => version.key === versionKey)?.name ||
+    versionKey ||
+    'Không xác định'
 
-  const fetchSavedVideos = async (page = currentPage, filter = publishFilter) => {
+  const fetchSavedVideos = async (
+    page = currentPage,
+    filter = publishFilter,
+    versionFilter = promptVersionFilter
+  ) => {
     try {
       const offset = (page - 1) * PAGE_SIZE;
-      let url = `http://127.0.0.1:8080/api/videos?limit=${PAGE_SIZE}&offset=${offset}`;
-      if (filter === 'published') url += '&is_published=1';
-      else if (filter === 'unpublished') url += '&is_published=0';
-      const response = await fetch(url);
+      const params = new URLSearchParams({ limit: PAGE_SIZE, offset });
+      if (filter === 'published') params.set('is_published', '1');
+      else if (filter === 'unpublished') params.set('is_published', '0');
+      if (versionFilter !== 'all') params.set('prompt_version', versionFilter);
+      const response = await fetch(`http://127.0.0.1:8080/api/videos?${params}`);
       const data = await response.json();
       setSavedVideos(data);
     } catch (err) {
@@ -191,6 +288,7 @@ function App() {
     setErrorMsg('')
     setResultText('')
     setVideoTitle('')
+    setCurrentVideoPromptVersion('')
     setAudioStatus('not_started')
     setChatUrl('')
     setProgressMsg('⏳ Đang khởi động...')
@@ -220,6 +318,9 @@ function App() {
               setChatUrl(data.chat_url || '');
               setCurrentVideoId(data.video_id);
               setVideoTitle(data.title || '');
+              setCurrentVideoPromptVersion(
+                data.prompt_version || selectedPromptVersion
+              );
               setIsCurrentVideoPublished(false);
               setAudioStatus(data.audio_task?.status || 'not_started');
               if (data.audio_error) {
@@ -288,6 +389,7 @@ function App() {
       setFullTranscript(data.transcript);
       setChatUrl(data.chat_url || '');
       setVideoTitle(data.title || '');
+      setCurrentVideoPromptVersion(data.prompt_version || '');
       setShowResult(true);
       setActiveView('fetcher');
       setCurrentVideoId(id);  // track which video is loaded
@@ -729,12 +831,38 @@ function App() {
                     ⏳ Chưa đăng: <strong style={{color:'#f39c12'}}>{savedVideos.count_unpublished || 0}</strong>
                   </span>
                 </div>
-                {/* Filter buttons */}
-                <div style={{ display: 'flex', gap: '8px' }}>
+                {/* Version + publication filters */}
+                <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+                  <label
+                    htmlFor="dashboard-version-filter"
+                    style={{ color: '#aaa', fontSize: '0.85em', fontWeight: '600' }}
+                  >
+                    Phiên bản:
+                  </label>
+                  <select
+                    id="dashboard-version-filter"
+                    value={promptVersionFilter}
+                    onChange={(event) => {
+                      const nextVersion = event.target.value;
+                      setPromptVersionFilter(nextVersion);
+                      setCurrentPage(1);
+                      fetchSavedVideos(1, publishFilter, nextVersion);
+                    }}
+                    style={{
+                      minWidth: '190px', padding: '7px 12px', borderRadius: '8px',
+                      border: '1px solid rgba(155, 89, 182, 0.55)',
+                      background: '#17131d', color: '#eee', cursor: 'pointer', fontWeight: '600'
+                    }}
+                  >
+                    <option value="all">🤖 Tất cả phiên bản</option>
+                    {promptVersions.map(version => (
+                      <option key={version.key} value={version.key}>{version.name}</option>
+                    ))}
+                  </select>
                   {[['all', '🗂️ Tất cả'], ['published', '✅ Đã đăng'], ['unpublished', '⏳ Chưa đăng']].map(([val, label]) => (
                     <button
                       key={val}
-                      onClick={() => { setPublishFilter(val); setCurrentPage(1); fetchSavedVideos(1, val); }}
+                      onClick={() => { setPublishFilter(val); setCurrentPage(1); fetchSavedVideos(1, val, promptVersionFilter); }}
                       style={{
                         padding: '6px 14px', borderRadius: '20px', fontSize: '0.85em', cursor: 'pointer', fontWeight: '600',
                         border: publishFilter === val
@@ -779,7 +907,14 @@ function App() {
                             {isPublished ? '✅ Đã đăng' : '⏳ Chưa đăng'}
                           </span>
                         </div>
-                        <p style={{ color: '#888', fontSize: '0.9em', marginBottom: '8px' }}>{new Date(video.created_at).toLocaleString('vi-VN')}</p>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
+                          <p style={{ color: '#888', fontSize: '0.9em', margin: 0 }}>{new Date(video.created_at).toLocaleString('vi-VN')}</p>
+                          <AudioDurationBadge
+                            videoId={video.id}
+                            audioUrl={video.audio_url}
+                            savedDurationSeconds={video.audio_duration_seconds}
+                          />
+                        </div>
                         <div style={{ display: 'flex', gap: '15px', marginBottom: '10px', alignItems: 'center' }}>
                           <a href={video.url} target="_blank" rel="noreferrer" style={{ color: 'var(--accent)', fontSize: '0.9em', textDecoration: 'none' }}>▶ Xem YouTube</a>
                           {video.chat_url && (
@@ -795,7 +930,7 @@ function App() {
                               borderRadius: '4px',
                               border: '1px solid rgba(155, 89, 182, 0.4)'
                             }} title="Bộ Prompt sử dụng">
-                              🤖 {promptVersions.find(p => p.key === video.prompt_version)?.name || video.prompt_version}
+                              🤖 {getPromptVersionName(video.prompt_version)}
                             </span>
                           )}
                         </div>
@@ -970,6 +1105,17 @@ function App() {
                       <h3 title={videoTitle}>
                         {videoTitle || 'Auto_YT Extraction'}
                       </h3>
+                      {currentVideoId && (
+                        <div style={{
+                          display: 'inline-flex', alignItems: 'center', gap: '6px',
+                          marginTop: '6px', padding: '3px 10px', borderRadius: '5px',
+                          border: '1px solid rgba(155, 89, 182, 0.5)',
+                          background: 'rgba(155, 89, 182, 0.15)',
+                          color: '#c39bd3', fontSize: '0.8em', fontWeight: '600'
+                        }} title="Bộ prompt đã được lưu khi tạo video này">
+                          🤖 Bộ prompt của video: {getPromptVersionName(currentVideoPromptVersion)}
+                        </div>
+                      )}
                       <div style={{display: 'flex', gap: '10px', marginTop: '8px', flexWrap: 'wrap', alignItems: 'center'}}>
                         <button 
                           onClick={() => setActiveTab('summary')}
@@ -1116,7 +1262,22 @@ function App() {
                                 📥 Tải Audio MP3
                               </button>
                             </div>
-                            <audio controls src={audioUrl} style={{width: '100%'}} />
+                            <audio
+                              controls
+                              src={audioUrl}
+                              style={{width: '100%'}}
+                              onLoadedMetadata={(event) => {
+                                const durationSeconds = event.currentTarget.duration
+                                if (
+                                  currentVideoId &&
+                                  Number.isFinite(durationSeconds) &&
+                                  durationSeconds > 0
+                                ) {
+                                  saveAudioDuration(currentVideoId, durationSeconds)
+                                    .catch(error => console.error('Failed to save audio duration', error))
+                                }
+                              }}
+                            />
                           </div>
                         )}
                         

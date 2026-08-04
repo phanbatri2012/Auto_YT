@@ -21,7 +21,6 @@ def process_prompt_via_chatgpt(prompt_text: str, prompt_version: str = "") -> di
         [PYTHON_EXE, str(WORKER_SCRIPT)],
         input=prompt_text.encode("utf-8"),
         capture_output=True,
-        timeout=2400,
         env=env,
     )
 

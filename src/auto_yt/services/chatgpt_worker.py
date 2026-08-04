@@ -28,8 +28,15 @@ DEFAULT_CHATGPT_PROJECT_URL = (
 )
 PROFILE_WAIT_TIMEOUT_SECONDS = 20 * 60
 PROFILE_RETRY_INTERVAL_SECONDS = 5
+CHATGPT_RESPONSE_TIMEOUT_SECONDS = 20 * 60
 THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS = 5 * 60
 THUMBNAIL_TURN_WAIT_TIMEOUT_SECONDS = 30
+THUMBNAIL_IMAGE_SELECTOR = (
+    'img[src*="backend-api/estuary"], '
+    'img[alt*="Generated image"], '
+    'img[alt*="DALL"], '
+    'img[src*="files/"]'
+)
 THUMBNAIL_RETRY_PROMPT = (
     "Sửa lại prompt sao cho không vi phạm. sau đó tạo lại thumbanil. "
     "chỉ cần xuất hình ảnh thumbnail."
@@ -55,7 +62,7 @@ THUMBNAIL_GENERATION_ERROR_MARKERS = (
 
 def is_thumbnail_generation_error_response(response_text: str) -> bool:
     normalized_response = response_text.strip().lower()
-    return not normalized_response or any(
+    return any(
         marker in normalized_response
         for marker in THUMBNAIL_GENERATION_ERROR_MARKERS
     )
@@ -71,6 +78,89 @@ def select_thumbnail_response_turn_number(
         if role == "assistant" and turn_number > request_turn_number
     ]
     return min(response_turns, default=None)
+
+
+def get_visible_conversation_turns(page: Page) -> list[tuple[int, str]]:
+    visible_turns = []
+    turns = page.locator('[data-testid^="conversation-turn-"]')
+    for index in range(turns.count()):
+        turn = turns.nth(index)
+        test_id = turn.get_attribute("data-testid") or ""
+        try:
+            turn_number = int(test_id.rsplit("-", 1)[-1])
+        except ValueError:
+            continue
+
+        role = turn.get_attribute("data-turn") or ""
+        if not role:
+            role_nodes = turn.locator("[data-message-author-role]")
+            if role_nodes.count() > 0:
+                role = (
+                    role_nodes.first.get_attribute("data-message-author-role")
+                    or ""
+                )
+        visible_turns.append((turn_number, role))
+    return visible_turns
+
+
+def get_latest_conversation_turn(page: Page, role: str) -> int:
+    matching_turns = [
+        turn_number
+        for turn_number, turn_role in get_visible_conversation_turns(page)
+        if turn_role == role
+    ]
+    return max(matching_turns, default=-1)
+
+
+def wait_for_new_user_turn(page: Page, previous_user_turn: int) -> int:
+    deadline = time.time() + THUMBNAIL_TURN_WAIT_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        request_turn = get_latest_conversation_turn(page, "user")
+        if request_turn > previous_user_turn:
+            return request_turn
+        time.sleep(0.25)
+    raise RuntimeError("ChatGPT did not create a new thumbnail request turn.")
+
+
+def wait_for_thumbnail_image(page: Page, request_turn: int, download_image) -> str:
+    deadline = time.time() + THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS
+    response_turn = None
+    while time.time() < deadline:
+        if response_turn is None:
+            response_turn = select_thumbnail_response_turn_number(
+                get_visible_conversation_turns(page),
+                request_turn,
+            )
+        if response_turn is None:
+            time.sleep(1)
+            continue
+
+        turn = page.locator(f'[data-testid="conversation-turn-{response_turn}"]')
+        if turn.count() == 1:
+            images = turn.locator(THUMBNAIL_IMAGE_SELECTOR)
+            for index in range(images.count() - 1, -1, -1):
+                image = images.nth(index)
+                image_url = image.get_attribute("src") or ""
+                image_ready = image.evaluate(
+                    "image => image.complete && image.naturalWidth > 0"
+                )
+                generation_active = (
+                    page.locator('[data-testid="stop-button"]').count() > 0
+                )
+                if image_url and image_ready and not generation_active:
+                    return download_image(image_url) or image_url
+        time.sleep(1)
+    return ""
+
+
+def send_thumbnail_prompt(page: Page, prompt_text: str, download_image) -> tuple[str, str]:
+    previous_user_turn = get_latest_conversation_turn(page, "user")
+    response_text = send_prompt(page, prompt_text)
+    request_turn = wait_for_new_user_turn(page, previous_user_turn)
+    if is_thumbnail_generation_error_response(response_text):
+        return response_text, ""
+    image_url = wait_for_thumbnail_image(page, request_turn, download_image)
+    return response_text, image_url
 
 
 def build_thumbnail_generation_prompt(
@@ -228,27 +318,44 @@ def build_metadata_generation_prompt(metadata_prompt: str) -> str:
         "LƯU Ý QUAN TRỌNG: Hãy tạo lại đầy đủ toàn bộ phần metadata theo "
         "đúng yêu cầu trên, bao gồm TIÊU ĐỀ, URL SLUG, MÔ TẢ, HASHTAG, "
         "BÌNH LUẬN GHIM và QUIZ. Trả lời trực tiếp, không chào hỏi, không "
-        "giải thích và không thêm nội dung ngoài metadata."
+        "giải thích và không thêm nội dung ngoài metadata.\n\n"
+        "BẮT BUỘC trình bày theo đúng mẫu nhãn sau:\n"
+        "TIÊU ĐỀ: ...\n"
+        "URL SLUG: ...\n"
+        "MÔ TẢ VIDEO: ...\n"
+        "HASHTAG: #... #... #...\n"
+        "BÌNH LUẬN GHIM: ...\n"
+        "CÂU HỎI: ...\n"
+        "A. ...\nB. ...\nC. ...\nD. ...\n"
+        "CÂU TRẢ LỜI ĐÚNG: ...\n"
+        "GIẢI THÍCH: ..."
     )
 
 
-def validate_metadata_response(response_text: str) -> str:
+def find_missing_metadata_sections(response_text: str) -> list[str]:
     metadata = response_text.strip()
+    heading_prefix = r"(?im)^\s*(?:#{1,6}\s*)?(?:[-*]\s*)?(?:\*{1,2})?"
     required_patterns = {
-        "TIÊU ĐỀ": r"(?im)^\s*(?:[-*]\s*)?(?:\*{1,2})?TIÊU ĐỀ",
-        "URL SLUG": r"(?im)^\s*(?:[-*]\s*)?(?:\*{1,2})?(?:URL\s+SLUG|SLUG)",
-        "MÔ TẢ": r"(?im)^\s*(?:[-*]\s*)?(?:\*{1,2})?MÔ TẢ",
+        "TIÊU ĐỀ": heading_prefix + r"TIÊU ĐỀ",
+        "URL SLUG": heading_prefix + r"(?:URL\s+SLUG|SLUG)",
+        "MÔ TẢ": heading_prefix + r"MÔ TẢ",
         "HASHTAG": r"(?i)(?<!\w)#[a-z0-9_]+",
-        "BÌNH LUẬN GHIM": (
-            r"(?im)^\s*(?:[-*]\s*)?(?:\*{1,2})?BÌNH LUẬN GHIM"
+        "BÌNH LUẬN GHIM": heading_prefix + r"BÌNH LUẬN GHIM",
+        "QUIZ": (
+            heading_prefix
+            + r"(?:CÂU HỎI(?:\s+(?:QUIZ|KHÁN GIẢ|TƯƠNG TÁC))?|QUIZ|THEO CÁC BẠN\b)"
         ),
-        "QUIZ": r"(?im)^\s*(?:[-*]\s*)?(?:\*{1,2})?CÂU HỎI",
     }
-    missing_sections = [
+    return [
         label
         for label, pattern in required_patterns.items()
         if not re.search(pattern, metadata)
     ]
+
+
+def validate_metadata_response(response_text: str) -> str:
+    metadata = response_text.strip()
+    missing_sections = find_missing_metadata_sections(metadata)
     if missing_sections:
         raise RuntimeError(
             "ChatGPT returned incomplete metadata (missing "
@@ -256,6 +363,29 @@ def validate_metadata_response(response_text: str) -> str:
             + "). The existing metadata was preserved."
         )
     return metadata
+
+
+def build_metadata_retry_prompt(missing_sections: list[str]) -> str:
+    return (
+        "Phản hồi metadata vừa rồi chưa đầy đủ, còn thiếu: "
+        + ", ".join(missing_sections)
+        + ". Hãy tạo lại TOÀN BỘ metadata, không chỉ bổ sung phần thiếu. "
+        "BẮT BUỘC xuất đủ các nhãn: TIÊU ĐỀ, URL SLUG, MÔ TẢ VIDEO, "
+        "HASHTAG, BÌNH LUẬN GHIM, CÂU HỎI, bốn lựa chọn A/B/C/D, "
+        "CÂU TRẢ LỜI ĐÚNG và GIẢI THÍCH. Trả lời trực tiếp, không chào hỏi "
+        "và không thêm nội dung ngoài metadata."
+    )
+
+
+def request_complete_metadata(page, generation_prompt: str) -> str:
+    response_text = send_prompt(page, generation_prompt).strip()
+    missing_sections = find_missing_metadata_sections(response_text)
+    if not missing_sections:
+        return response_text
+
+    retry_prompt = build_metadata_retry_prompt(missing_sections)
+    retry_response = send_prompt(page, retry_prompt).strip()
+    return validate_metadata_response(retry_response)
 
 
 def clean_text(text: str) -> str:
@@ -292,16 +422,24 @@ def send_prompt(page: Page, prompt_text: str) -> str:
             """() => {
                 return document.querySelector('[data-testid="stop-button"]') === null;
             }""",
-            timeout=180000
+            timeout=CHATGPT_RESPONSE_TIMEOUT_SECONDS * 1000
         )
     except Exception:
-        raise Exception("Previous generation is taking too long (stop button still present).")
+        raise Exception(
+            "Previous ChatGPT generation did not finish after 20 minutes. "
+            "No new prompt was sent."
+        )
 
     # Mark existing messages so we can identify the new one
     page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"]').forEach(el => el.classList.add('my-old-msg'))")
 
-    # Fill text via evaluate to avoid Playwright fill() timeout on very long prompts
+    # Use real editor input events so ChatGPT updates its internal composer state.
     try:
+        prompt_textarea.click()
+        page.keyboard.press("Control+A")
+        page.keyboard.insert_text(prompt_text)
+    except Exception:
+        # Fallback for unusually large prompts or transient keyboard failures.
         page.evaluate("""(text) => {
             const el = document.querySelector('#prompt-textarea');
             if (!el) return;
@@ -320,21 +458,16 @@ def send_prompt(page: Page, prompt_text: str) -> str:
             }));
             el.dispatchEvent(new Event('change', { bubbles: true }));
         }""", prompt_text)
-    except Exception:
-        # Fallback to fill() if evaluate fails
-        prompt_textarea.fill(prompt_text)
     time.sleep(0.5)
 
     # Now wait for the send button to appear and be enabled
     send_btn = page.locator('[data-testid="send-button"]').first
+    send_button_ready_script = """() => {
+        const btn = document.querySelector('[data-testid="send-button"]');
+        return btn && !btn.disabled;
+    }"""
     try:
-        page.wait_for_function(
-            """() => {
-                const btn = document.querySelector('[data-testid="send-button"]');
-                return btn && !btn.disabled;
-            }""",
-            timeout=30000
-        )
+        page.wait_for_function(send_button_ready_script, timeout=30000)
     except Exception as e:
         page.evaluate("""() => {
             const el = document.querySelector('#prompt-textarea');
@@ -347,13 +480,7 @@ def send_prompt(page: Page, prompt_text: str) -> str:
             el.dispatchEvent(new Event('change', { bubbles: true }));
         }""")
         try:
-            page.wait_for_function(
-                """() => {
-                    const btn = document.querySelector('[data-testid="send-button"]');
-                    return btn && !btn.disabled;
-                }""",
-                timeout=10000
-            )
+            page.wait_for_function(send_button_ready_script, timeout=10000)
         except Exception:
             diagnostics = page.evaluate("""() => {
                 const editor = document.querySelector('#prompt-textarea');
@@ -364,10 +491,43 @@ def send_prompt(page: Page, prompt_text: str) -> str:
                     sendButtonDisabled: button?.disabled ?? null
                 };
             }""")
-            raise Exception(
-                "Send button did not appear/enable after typing. "
-                f"Diagnostics: {diagnostics}. Error: {e}"
-            )
+            try:
+                if diagnostics["editorTextLength"] <= 0:
+                    raise Exception("The prompt draft was empty before recovery.")
+
+                # ChatGPT occasionally leaves the composer unmounted after a long
+                # insert. Reloading the same conversation restores its saved draft.
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+                prompt_textarea = page.locator('#prompt-textarea').first
+                prompt_textarea.wait_for(state="visible", timeout=60000)
+
+                restored_draft = prompt_textarea.inner_text().strip()
+                if not restored_draft:
+                    prompt_textarea.click()
+                    page.keyboard.press("Control+A")
+                    page.keyboard.insert_text(prompt_text)
+
+                # Reload removes the marker classes, so mark the existing replies
+                # again before sending to avoid returning an earlier response.
+                page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"]').forEach(el => el.classList.add('my-old-msg'))")
+                page.wait_for_function(send_button_ready_script, timeout=30000)
+                send_btn = page.locator('[data-testid="send-button"]').first
+            except Exception as recovery_error:
+                recovery_diagnostics = page.evaluate("""() => {
+                    const editor = document.querySelector('#prompt-textarea');
+                    const button = document.querySelector('[data-testid="send-button"]');
+                    return {
+                        editorTextLength: editor?.innerText?.length ?? 0,
+                        sendButtonFound: Boolean(button),
+                        sendButtonDisabled: button?.disabled ?? null
+                    };
+                }""")
+                raise Exception(
+                    "Send button did not appear/enable after typing or one same-chat reload. "
+                    f"Initial diagnostics: {diagnostics}. "
+                    f"Recovery diagnostics: {recovery_diagnostics}. "
+                    f"Initial error: {e}. Recovery error: {recovery_error}"
+                ) from recovery_error
 
     send_btn.click()
     
@@ -406,18 +566,20 @@ def send_prompt(page: Page, prompt_text: str) -> str:
     except Exception:
         print("Warning: stop button did not appear. Generation might have finished instantly or failed.", file=sys.stderr)
 
-    # 3. Wait for generation to finish (stop button disappears)
+    # 3. Wait for generation to finish (stop button disappears). Never move to
+    # the next prompt while ChatGPT is still producing the current response.
     try:
-        start_time = time.time()
-        while time.time() - start_time < 300:
-            is_stopped = page.evaluate('() => { return document.querySelector(\'[data-testid="stop-button"]\') === null; }')
-            if is_stopped:
-                break
-            time.sleep(1)
-        else:
-            print("Warning: Generation did not finish after 5 minutes. Might be stalled.", file=sys.stderr)
-    except Exception as e:
-        print(f"Warning checking generation finish: {e}", file=sys.stderr)
+        page.wait_for_function(
+            """() => {
+                return document.querySelector('[data-testid="stop-button"]') === null;
+            }""",
+            timeout=CHATGPT_RESPONSE_TIMEOUT_SECONDS * 1000,
+        )
+    except Exception as exc:
+        raise Exception(
+            "ChatGPT generation did not finish after 20 minutes. "
+            "No next prompt was sent."
+        ) from exc
 
     time.sleep(1) # Extra buffer for DOM to settle
 
@@ -534,36 +696,24 @@ def run(transcript: str) -> str:
                 print(f"    -> Lỗi download ảnh: {e}", file=sys.stderr)
                 return chatgpt_url  # fallback to original URL
 
-        def extract_latest_image():
-            try:
-                time.sleep(3)
-                images = page.locator('img[src*="backend-api/estuary"]')
-                if images.count() == 0:
-                    images = page.locator('img[alt*="Generated image"]')
-                if images.count() == 0:
-                    images = page.locator('img[alt*="DALL"]')
-                if images.count() == 0:
-                    images = page.locator('img[src*="files/"]')
-                if images.count() > 0:
-                    chatgpt_url = images.nth(images.count() - 1).get_attribute("src")
-                    print(f"    -> Found image: {chatgpt_url[:80]}...", file=sys.stderr)
-                    return _download_image_local(chatgpt_url)
-            except Exception as e:
-                print(f"    -> Lỗi lấy ảnh DALL-E: {e}", file=sys.stderr)
-            return ""
-
         # Step 8: Thumbnail Idea 1 (With Text)
         print(">>> BƯỚC 8: TẠO Ý TƯỞNG THUMBNAIL (CÓ CHỮ)", file=sys.stderr)
         prompt8 = build_thumbnail_generation_prompt(
             prompts.get("thumb_text", ""),
             "with_text",
         )
-        thumb1 = send_prompt(page, prompt8)
-        image1_url = extract_latest_image()
+        thumb1, image1_url = send_thumbnail_prompt(
+            page,
+            prompt8,
+            _download_image_local,
+        )
         if not image1_url:
             print(">>> THUMBNAIL CÓ CHỮ LỖI, THỬ LẠI MỘT LẦN...", file=sys.stderr)
-            thumb1 = send_prompt(page, THUMBNAIL_RETRY_PROMPT)
-            image1_url = extract_latest_image()
+            thumb1, image1_url = send_thumbnail_prompt(
+                page,
+                THUMBNAIL_RETRY_PROMPT,
+                _download_image_local,
+            )
 
         if image1_url:
             thumb1 += f"\n\n[IMAGE_URL:{image1_url}]"
@@ -574,12 +724,18 @@ def run(transcript: str) -> str:
             prompts.get("thumb_notext", ""),
             "without_text",
         )
-        thumb2 = send_prompt(page, prompt9)
-        image2_url = extract_latest_image()
+        thumb2, image2_url = send_thumbnail_prompt(
+            page,
+            prompt9,
+            _download_image_local,
+        )
         if not image2_url:
             print(">>> THUMBNAIL KHÔNG CHỮ LỖI, THỬ LẠI MỘT LẦN...", file=sys.stderr)
-            thumb2 = send_prompt(page, THUMBNAIL_RETRY_PROMPT)
-            image2_url = extract_latest_image()
+            thumb2, image2_url = send_thumbnail_prompt(
+                page,
+                THUMBNAIL_RETRY_PROMPT,
+                _download_image_local,
+            )
 
         if image2_url:
             thumb2 += f"\n\n[IMAGE_URL:{image2_url}]"
@@ -675,8 +831,7 @@ def generate_metadata_only(
             generation_prompt = build_metadata_generation_prompt(
                 prompts.get("metadata", "")
             )
-            response_text = send_prompt(page, generation_prompt).strip()
-            return validate_metadata_response(response_text)
+            return request_complete_metadata(page, generation_prompt)
         finally:
             context.close()
 
@@ -732,29 +887,6 @@ def generate_thumbnails_only(
             elif "PROMPT_VERSION" in os.environ:
                 del os.environ["PROMPT_VERSION"]
 
-        def extract_latest_image():
-            """Find the latest DALL-E image in the chat, download it locally, return the local URL."""
-            try:
-                time.sleep(3)
-                images = page.locator('img[src*="backend-api/estuary"]')
-                if images.count() == 0:
-                    images = page.locator('img[alt*="Generated image"]')
-                if images.count() == 0:
-                    images = page.locator('img[alt*="DALL"]')
-                if images.count() == 0:
-                    images = page.locator('img[src*="files/"]')
-                if images.count() > 0:
-                    chatgpt_url = images.nth(images.count() - 1).get_attribute("src")
-                    print(f"    -> Found image URL: {chatgpt_url[:80]}...", file=sys.stderr)
-                    # Download locally via Playwright (uses auth cookies)
-                    local_url = _download_image(page, chatgpt_url)
-                    return local_url if local_url else chatgpt_url
-                else:
-                    print(f"    -> Không tìm thấy ảnh nào với các selector đã thử.", file=sys.stderr)
-            except Exception as e:
-                print(f"    -> Lỗi lấy ảnh DALL-E: {e}", file=sys.stderr)
-            return ""
-
         def _download_image(page, chatgpt_url: str) -> str:
             """Download image via Playwright session (has ChatGPT cookies) and save locally."""
             try:
@@ -788,22 +920,34 @@ def generate_thumbnails_only(
             prompts.get("thumb_text", ""),
             "with_text",
         )
-        thumb1 = send_prompt(page, prompt8)
-        image1_url = extract_latest_image()
+        thumb1, image1_url = send_thumbnail_prompt(
+            page,
+            prompt8,
+            lambda image_url: _download_image(page, image_url),
+        )
         if not image1_url:
-            thumb1 = send_prompt(page, THUMBNAIL_RETRY_PROMPT)
-            image1_url = extract_latest_image()
+            thumb1, image1_url = send_thumbnail_prompt(
+                page,
+                THUMBNAIL_RETRY_PROMPT,
+                lambda image_url: _download_image(page, image_url),
+            )
 
         print(">>> GEN THUMBNAIL (KHÔNG CHỮ)", file=sys.stderr)
         prompt9 = build_thumbnail_generation_prompt(
             prompts.get("thumb_notext", ""),
             "without_text",
         )
-        thumb2 = send_prompt(page, prompt9)
-        image2_url = extract_latest_image()
+        thumb2, image2_url = send_thumbnail_prompt(
+            page,
+            prompt9,
+            lambda image_url: _download_image(page, image_url),
+        )
         if not image2_url:
-            thumb2 = send_prompt(page, THUMBNAIL_RETRY_PROMPT)
-            image2_url = extract_latest_image()
+            thumb2, image2_url = send_thumbnail_prompt(
+                page,
+                THUMBNAIL_RETRY_PROMPT,
+                lambda image_url: _download_image(page, image_url),
+            )
 
         context.close()
 
@@ -893,88 +1037,16 @@ def _generate_single_thumbnail(
                 print(f"    -> Image download failed: {exc}", file=sys.stderr)
                 return ""
 
-        def get_visible_conversation_turns() -> list[tuple[int, str]]:
-            visible_turns = []
-            turns = page.locator('[data-testid^="conversation-turn-"]')
-            for index in range(turns.count()):
-                turn = turns.nth(index)
-                test_id = turn.get_attribute("data-testid") or ""
-                try:
-                    turn_number = int(test_id.rsplit("-", 1)[-1])
-                except ValueError:
-                    continue
-
-                role = turn.get_attribute("data-turn") or ""
-                if not role:
-                    role_nodes = turn.locator("[data-message-author-role]")
-                    if role_nodes.count() > 0:
-                        role = (
-                            role_nodes.first.get_attribute(
-                                "data-message-author-role"
-                            )
-                            or ""
-                        )
-                visible_turns.append((turn_number, role))
-            return visible_turns
-
-        def get_latest_conversation_turn(role: str) -> int:
-            matching_turns = [
-                turn_number
-                for turn_number, turn_role in get_visible_conversation_turns()
-                if turn_role == role
-            ]
-            return max(matching_turns, default=-1)
-
-        def wait_for_new_user_turn(previous_user_turn: int) -> int:
-            deadline = time.time() + THUMBNAIL_TURN_WAIT_TIMEOUT_SECONDS
-            while time.time() < deadline:
-                request_turn = get_latest_conversation_turn("user")
-                if request_turn > previous_user_turn:
-                    return request_turn
-                time.sleep(0.25)
-            raise RuntimeError(
-                "ChatGPT did not create a new thumbnail request turn."
-            )
-
-        def extract_image_from_response_turn(request_turn: int) -> str:
-            deadline = time.time() + THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS
-            response_turn = None
-            while time.time() < deadline:
-                if response_turn is None:
-                    response_turn = select_thumbnail_response_turn_number(
-                        get_visible_conversation_turns(),
-                        request_turn,
-                    )
-                if response_turn is None:
-                    time.sleep(1)
-                    continue
-
-                turn = page.locator(
-                    f'[data-testid="conversation-turn-{response_turn}"]'
-                )
-                if turn.count() == 1:
-                    images = turn.locator('img[src*="backend-api/estuary"]')
-                    if images.count() > 0:
-                        chatgpt_url = images.last.get_attribute("src")
-                        if chatgpt_url:
-                            return download_image(chatgpt_url) or chatgpt_url
-                time.sleep(1)
-            return ""
-
         generation_prompt = build_thumbnail_generation_prompt(
             prompts.get(config["prompt_key"], ""),
             thumbnail_type,
         )
 
         print(f">>>> REGENERATE THUMBNAIL ({config['label']})", file=sys.stderr)
-        previous_user_turn = get_latest_conversation_turn("user")
-        response_text = send_prompt(page, generation_prompt)
-        request_turn = wait_for_new_user_turn(previous_user_turn)
-        image_url = (
-            ""
-            if response_text.strip()
-            and is_thumbnail_generation_error_response(response_text)
-            else extract_image_from_response_turn(request_turn)
+        response_text, image_url = send_thumbnail_prompt(
+            page,
+            generation_prompt,
+            download_image,
         )
         retry_succeeded = False
         if not image_url:
@@ -982,14 +1054,10 @@ def _generate_single_thumbnail(
                 f">>>> THUMBNAIL {config['label']} LỖI, THỬ LẠI MỘT LẦN...",
                 file=sys.stderr,
             )
-            previous_user_turn = get_latest_conversation_turn("user")
-            retry_response_text = send_prompt(page, THUMBNAIL_RETRY_PROMPT)
-            retry_request_turn = wait_for_new_user_turn(previous_user_turn)
-            image_url = (
-                ""
-                if retry_response_text.strip()
-                and is_thumbnail_generation_error_response(retry_response_text)
-                else extract_image_from_response_turn(retry_request_turn)
+            retry_response_text, image_url = send_thumbnail_prompt(
+                page,
+                THUMBNAIL_RETRY_PROMPT,
+                download_image,
             )
             retry_succeeded = bool(image_url)
 

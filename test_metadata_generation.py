@@ -5,6 +5,7 @@ from unittest.mock import patch
 from auto_yt import main
 from auto_yt.services.chatgpt_worker import (
     build_metadata_generation_prompt,
+    request_complete_metadata,
     validate_metadata_response,
 )
 
@@ -74,6 +75,33 @@ class MetadataGenerationTests(unittest.TestCase):
             validate_metadata_response(NEW_METADATA),
             NEW_METADATA,
         )
+
+    def test_response_validation_accepts_quiz_started_with_theo_cac_ban(self):
+        metadata = NEW_METADATA.replace(
+            "CÂU HỎI: Câu hỏi mới?",
+            "Theo các bạn, câu trả lời nào phù hợp?",
+        )
+
+        self.assertEqual(validate_metadata_response(metadata), metadata)
+
+    def test_incomplete_response_is_retried_once_in_the_same_chat(self):
+        incomplete_metadata = NEW_METADATA.replace(
+            "CÂU HỎI: Câu hỏi mới?\nA. Một\nB. Hai\nC. Ba\nD. Bốn",
+            "",
+        )
+        page = object()
+
+        with patch(
+            "auto_yt.services.chatgpt_worker.send_prompt",
+            side_effect=[incomplete_metadata, NEW_METADATA],
+        ) as send_prompt:
+            result = request_complete_metadata(page, "metadata prompt")
+
+        self.assertEqual(result, NEW_METADATA)
+        self.assertEqual(send_prompt.call_count, 2)
+        self.assertIs(send_prompt.call_args_list[0].args[0], page)
+        self.assertIs(send_prompt.call_args_list[1].args[0], page)
+        self.assertIn("còn thiếu: QUIZ", send_prompt.call_args_list[1].args[1])
 
     def test_endpoint_replaces_metadata_and_preserves_other_sections(self):
         video = {

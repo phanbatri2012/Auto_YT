@@ -1,17 +1,21 @@
 import asyncio
 import unittest
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
 
 from fastapi import BackgroundTasks
 
 from auto_yt import main
 from auto_yt.services.chatgpt_worker import (
+    CHATGPT_RESPONSE_TIMEOUT_SECONDS,
     THUMBNAIL_RETRY_PROMPT,
     build_thumbnail_generation_prompt,
     ensure_expected_conversation_page,
     get_video_thumbnail_chat_url,
     is_thumbnail_generation_error_response,
+    send_prompt,
+    send_thumbnail_prompt,
     select_thumbnail_response_turn_number,
+    wait_for_thumbnail_image,
 )
 
 
@@ -164,6 +168,107 @@ class ThumbnailGenerationTests(unittest.TestCase):
         )
 
         self.assertTrue(is_thumbnail_generation_error_response(response))
+
+    def test_empty_thumbnail_response_waits_for_rendered_image(self):
+        page = MagicMock()
+        download_image = MagicMock()
+
+        with (
+            patch(
+                "auto_yt.services.chatgpt_worker.get_latest_conversation_turn",
+                return_value=67,
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.send_prompt",
+                return_value="",
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.wait_for_new_user_turn",
+                return_value=68,
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.wait_for_thumbnail_image",
+                return_value="/api/thumbnails/rendered.png",
+            ) as wait_for_image,
+        ):
+            response_text, image_url = send_thumbnail_prompt(
+                page,
+                "thumbnail prompt",
+                download_image,
+            )
+
+        self.assertEqual(response_text, "")
+        self.assertEqual(image_url, "/api/thumbnails/rendered.png")
+        wait_for_image.assert_called_once_with(page, 68, download_image)
+
+    def test_thumbnail_image_waits_until_generation_stops(self):
+        page = MagicMock()
+        turn = MagicMock()
+        images = MagicMock()
+        image = MagicMock()
+        stop_button = MagicMock()
+        download_image = MagicMock(return_value="/api/thumbnails/new.png")
+
+        turn.count.return_value = 1
+        turn.locator.return_value = images
+        images.count.return_value = 1
+        images.nth.return_value = image
+        image.get_attribute.return_value = "https://chatgpt.com/backend-api/estuary/image"
+        image.evaluate.return_value = True
+        stop_button.count.side_effect = (1, 0)
+        page.locator.side_effect = lambda selector: (
+            stop_button if selector == '[data-testid="stop-button"]' else turn
+        )
+
+        with (
+            patch(
+                "auto_yt.services.chatgpt_worker.get_visible_conversation_turns",
+                return_value=[(67, "user"), (68, "assistant")],
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.time.time",
+                side_effect=(0, 1, 2),
+            ),
+            patch("auto_yt.services.chatgpt_worker.time.sleep"),
+        ):
+            image_url = wait_for_thumbnail_image(page, 67, download_image)
+
+        self.assertEqual(image_url, "/api/thumbnails/new.png")
+        self.assertEqual(stop_button.count.call_count, 2)
+        download_image.assert_called_once_with(
+            "https://chatgpt.com/backend-api/estuary/image"
+        )
+
+    def test_next_prompt_is_blocked_while_generation_is_still_running(self):
+        page = MagicMock()
+        prompt_locator = MagicMock()
+        prompt_textarea = MagicMock()
+        send_locator = MagicMock()
+        send_button = MagicMock()
+        prompt_locator.first = prompt_textarea
+        send_locator.first = send_button
+        page.locator.side_effect = lambda selector: (
+            prompt_locator if selector == "#prompt-textarea" else send_locator
+        )
+        page.wait_for_function.side_effect = (
+            None,
+            None,
+            None,
+            None,
+            TimeoutError("generation is still running"),
+        )
+
+        with (
+            patch("auto_yt.services.chatgpt_worker.time.sleep"),
+            self.assertRaisesRegex(Exception, "No next prompt was sent"),
+        ):
+            send_prompt(page, "next prompt")
+
+        finish_wait = page.wait_for_function.call_args_list[4]
+        self.assertEqual(
+            finish_wait.kwargs["timeout"],
+            CHATGPT_RESPONSE_TIMEOUT_SECONDS * 1000,
+        )
 
     def test_thumbnail_reuses_video_conversation_url(self):
         chat_urls = (

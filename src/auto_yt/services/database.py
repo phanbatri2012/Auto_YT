@@ -22,7 +22,8 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             is_published INTEGER DEFAULT 0,
             chat_url TEXT DEFAULT '',
-            prompt_version TEXT DEFAULT ''
+            prompt_version TEXT DEFAULT '',
+            audio_duration_seconds REAL
         )
     ''')
     # Try adding the column if upgrading from older version
@@ -36,6 +37,10 @@ def init_db():
         pass
     try:
         c.execute("ALTER TABLE videos ADD COLUMN prompt_version TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE videos ADD COLUMN audio_duration_seconds REAL")
     except sqlite3.OperationalError:
         pass
     c.execute('''
@@ -70,27 +75,63 @@ def save_video(url: str, title: str, transcript: str, generated_script: str, cha
     conn.close()
     return video_id
 
-def get_all_videos(limit: int = 10, offset: int = 0, is_published: int = None) -> dict:
+def get_all_videos(
+    limit: int = 10,
+    offset: int = 0,
+    is_published: int = None,
+    prompt_version: str = None,
+) -> dict:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    
-    # Get counts for all statuses
-    c.execute('SELECT COUNT(*) FROM videos WHERE is_published = 1')
+
+    version_clause = ''
+    version_params = []
+    if prompt_version is not None:
+        version_clause = ' AND prompt_version = ?'
+        version_params.append(prompt_version)
+
+    # Counts follow the selected prompt version while remaining independent of
+    # the publication-status filter.
+    c.execute(
+        f'SELECT COUNT(*) FROM videos WHERE is_published = 1{version_clause}',
+        version_params,
+    )
     count_published = c.fetchone()[0]
-    c.execute('SELECT COUNT(*) FROM videos WHERE is_published = 0')
+    c.execute(
+        f'SELECT COUNT(*) FROM videos WHERE is_published = 0{version_clause}',
+        version_params,
+    )
     count_unpublished = c.fetchone()[0]
-    
-    # Apply filter
+
+    filters = []
+    params = []
     if is_published is not None:
-        c.execute('SELECT COUNT(*) FROM videos WHERE is_published = ?', (is_published,))
-        total = c.fetchone()[0]
-        c.execute('SELECT id, url, title, created_at, is_published, chat_url, prompt_version, SUBSTR(generated_script, 1, 300) as snippet FROM videos WHERE is_published = ? ORDER BY id DESC LIMIT ? OFFSET ?', (is_published, limit, offset))
-    else:
-        c.execute('SELECT COUNT(*) FROM videos')
-        total = c.fetchone()[0]
-        c.execute('SELECT id, url, title, created_at, is_published, chat_url, prompt_version, SUBSTR(generated_script, 1, 300) as snippet FROM videos ORDER BY id DESC LIMIT ? OFFSET ?', (limit, offset))
-    
+        filters.append('is_published = ?')
+        params.append(is_published)
+    if prompt_version is not None:
+        filters.append('prompt_version = ?')
+        params.append(prompt_version)
+
+    where_clause = f" WHERE {' AND '.join(filters)}" if filters else ''
+    c.execute(f'SELECT COUNT(*) FROM videos{where_clause}', params)
+    total = c.fetchone()[0]
+    c.execute(
+        'SELECT id, url, title, created_at, is_published, chat_url, '
+        'prompt_version, audio_duration_seconds, '
+        'SUBSTR(generated_script, 1, 300) as snippet, '
+        'COALESCE('
+        'NULLIF((SELECT audio_url FROM audio_tasks WHERE video_id = videos.id), \'\'), '
+        'CASE WHEN INSTR(generated_script, \'### [AUDIO]\') > 0 '
+        'THEN TRIM(SUBSTR('
+        'generated_script, '
+        'INSTR(generated_script, \'### [AUDIO]\') + LENGTH(\'### [AUDIO]\')'
+        ')) ELSE \'\' END'
+        ') AS audio_url '
+        f'FROM videos{where_clause} ORDER BY id DESC LIMIT ? OFFSET ?',
+        (*params, limit, offset),
+    )
+
     rows = c.fetchall()
     conn.close()
     
@@ -133,6 +174,18 @@ def update_script(video_id: int, new_script: str) -> bool:
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
     c.execute('UPDATE videos SET generated_script = ? WHERE id = ?', (new_script, video_id))
+    success = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return success
+
+def update_audio_duration(video_id: int, duration_seconds: float) -> bool:
+    conn = sqlite3.connect(str(DB_PATH))
+    c = conn.cursor()
+    c.execute(
+        'UPDATE videos SET audio_duration_seconds = ? WHERE id = ?',
+        (duration_seconds, video_id),
+    )
     success = c.rowcount > 0
     conn.commit()
     conn.close()

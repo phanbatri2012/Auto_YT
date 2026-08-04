@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import List, Literal, Optional
 import asyncio
 import json
+import math
 import threading
 import time
 import uuid
@@ -141,6 +142,10 @@ class VideoResponse(BaseModel):
 
 class RetryAudioRequest(BaseModel):
     confirm_credit_charge: bool
+
+
+class AudioDurationRequest(BaseModel):
+    duration_seconds: float
 
 def apply_tts_filters(text: str) -> str:
     """
@@ -418,6 +423,7 @@ def process_video(request: VideoRequest):
                         "full_transcript": full_transcript,
                         "summary": summary_text,
                         "title": title,
+                        "prompt_version": request.prompt_version or "default",
                         "chat_url": chat_url,
                         "video_id": video_id,
                         "audio_task": (
@@ -471,8 +477,18 @@ def get_chatgpt_status():
 
 
 @app.get("/api/videos")
-def get_videos(limit: int = 10, offset: int = 0, is_published: Optional[int] = None):
-    return db.get_all_videos(limit=limit, offset=offset, is_published=is_published)
+def get_videos(
+    limit: int = 10,
+    offset: int = 0,
+    is_published: Optional[int] = None,
+    prompt_version: Optional[str] = None,
+):
+    return db.get_all_videos(
+        limit=limit,
+        offset=offset,
+        is_published=is_published,
+        prompt_version=prompt_version,
+    )
 
 class GenerateThumbnailsRequest(BaseModel):
     script: str
@@ -815,6 +831,16 @@ def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
 @app.put("/api/videos/{video_id}/publish")
 def publish_video(video_id: int, is_published: int):
     success = db.toggle_published(video_id, is_published)
+    if not success:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return {"success": True}
+
+
+@app.put("/api/videos/{video_id}/audio-duration")
+def save_audio_duration(video_id: int, request: AudioDurationRequest):
+    if not math.isfinite(request.duration_seconds) or request.duration_seconds <= 0:
+        raise HTTPException(status_code=400, detail="Audio duration must be positive")
+    success = db.update_audio_duration(video_id, request.duration_seconds)
     if not success:
         raise HTTPException(status_code=404, detail="Video not found")
     return {"success": True}

@@ -15,6 +15,7 @@ PROMPTS_PATH = DATA_DIR / "prompts.json"
 ACCOUNT_EXAMPLE_PATH = CONFIG_DIR / "account.example.json"
 SESSION_PATH = DATA_DIR / "session_chatgpt.json"
 THUMBNAILS_DIR = DATA_DIR / "thumbnails"
+AUDIO_DIR = DATA_DIR / "audio"
 
 
 def gpt_profile_dir(profile_name: str = "PROFILE_GPT_1") -> Path:

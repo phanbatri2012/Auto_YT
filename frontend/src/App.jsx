@@ -106,6 +106,7 @@ function App() {
   const [isGeneratingMetadata, setIsGeneratingMetadata] = useState(false)
   const [isGenAudio, setIsGenAudio] = useState(false)
   const [audioStatus, setAudioStatus] = useState('not_started')
+  const [audioMissingSegments, setAudioMissingSegments] = useState(0)
   const [progressMsg, setProgressMsg] = useState('')
   const [currentVideoId, setCurrentVideoId] = useState(null)
   const currentVideoIdRef = useRef(null)
@@ -116,8 +117,17 @@ function App() {
   
   const [promptVersions, setPromptVersions] = useState([])
   const [selectedPromptVersion, setSelectedPromptVersion] = useState('default')
+  const [voiceOptions, setVoiceOptions] = useState([])
+  const [selectedVoiceId, setSelectedVoiceId] = useState('')
+  const [currentVideoVoiceId, setCurrentVideoVoiceId] = useState('')
+  const [currentVideoVoiceName, setCurrentVideoVoiceName] = useState('')
+  const [audioTaskVoiceName, setAudioTaskVoiceName] = useState('')
+  const [regenerateVoiceId, setRegenerateVoiceId] = useState('')
   const [publishFilter, setPublishFilter] = useState('unpublished') // 'all' | 'published' | 'unpublished'
   const [promptVersionFilter, setPromptVersionFilter] = useState('all')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('')
+  const dashboardFetchRequestRef = useRef(0)
   
   const PAGE_SIZE = 10
   const chatGptControlsDisabled =
@@ -130,21 +140,32 @@ function App() {
     promptVersions.find(version => version.key === versionKey)?.name ||
     versionKey ||
     'Không xác định'
+  const getVoiceName = (voiceId, savedName = '') =>
+    savedName ||
+    voiceOptions.find(voice => voice.id === voiceId)?.name ||
+    'Không xác định'
 
   const fetchSavedVideos = async (
     page = currentPage,
     filter = publishFilter,
-    versionFilter = promptVersionFilter
+    versionFilter = promptVersionFilter,
+    search = debouncedSearchQuery
   ) => {
+    const requestId = dashboardFetchRequestRef.current + 1
+    dashboardFetchRequestRef.current = requestId
     try {
       const offset = (page - 1) * PAGE_SIZE;
       const params = new URLSearchParams({ limit: PAGE_SIZE, offset });
       if (filter === 'published') params.set('is_published', '1');
       else if (filter === 'unpublished') params.set('is_published', '0');
       if (versionFilter !== 'all') params.set('prompt_version', versionFilter);
+      if (search) params.set('search', search);
       const response = await fetch(`http://127.0.0.1:8080/api/videos?${params}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
-      setSavedVideos(data);
+      if (dashboardFetchRequestRef.current === requestId) {
+        setSavedVideos(data);
+      }
     } catch (err) {
       console.error("Failed to fetch videos", err);
     }
@@ -152,7 +173,6 @@ function App() {
 
   const handlePageChange = (newPage) => {
     setCurrentPage(newPage);
-    fetchSavedVideos(newPage);
   }
 
   const toggleCurrentVideoPublish = async () => {
@@ -186,14 +206,33 @@ function App() {
 
   useEffect(() => {
     fetchPromptVersions(); // Load mapping unconditionally for Dashboard
+    fetchVoices();
   }, [])
 
   useEffect(() => {
+    const timeoutId = setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery.trim())
+      setCurrentPage(1)
+    }, 300)
+    return () => clearTimeout(timeoutId)
+  }, [searchQuery])
+
+  useEffect(() => {
     if (activeView === 'dashboard') {
-      fetchSavedVideos(1);
-      setCurrentPage(1);
+      fetchSavedVideos(
+        currentPage,
+        publishFilter,
+        promptVersionFilter,
+        debouncedSearchQuery
+      )
     }
-  }, [activeView])
+  }, [
+    activeView,
+    currentPage,
+    publishFilter,
+    promptVersionFilter,
+    debouncedSearchQuery
+  ])
 
   useEffect(() => {
     currentVideoIdRef.current = currentVideoId
@@ -239,6 +278,8 @@ function App() {
 
         const status = data.audio_task?.status || 'not_started';
         setAudioStatus(status);
+        setAudioMissingSegments(data.audio_task?.missing_segments || 0);
+        setAudioTaskVoiceName(data.audio_task?.voice_name || '');
         setIsGenAudio(status === 'pending' || status === 'processing');
 
         if (status === 'completed') {
@@ -246,9 +287,16 @@ function App() {
             `http://127.0.0.1:8080/api/videos/${currentVideoId}`
           );
           const video = await videoResponse.json();
-          if (!stopped) setResultText(video.generated_script);
+          if (!stopped) {
+            setResultText(video.generated_script);
+            setCurrentVideoVoiceId(video.voice_id || '');
+            setCurrentVideoVoiceName(video.voice_name || '');
+            setRegenerateVoiceId(previousVoiceId =>
+              video.voice_id || previousVoiceId
+            );
+          }
           if (intervalId) clearInterval(intervalId);
-        } else if (status === 'failed' && intervalId) {
+        } else if ((status === 'failed' || status === 'interrupted') && intervalId) {
           clearInterval(intervalId);
         }
       } catch (error) {
@@ -281,15 +329,40 @@ function App() {
     }
   }
 
+  const fetchVoices = async () => {
+    try {
+      const response = await fetch('http://127.0.0.1:8080/api/voices')
+      const data = await response.json()
+      if (!response.ok || !Array.isArray(data.voices)) {
+        throw new Error(data.detail || 'Invalid voice configuration')
+      }
+      setVoiceOptions(data.voices)
+      setSelectedVoiceId(data.active_voice_id || data.voices[0]?.id || '')
+      setRegenerateVoiceId(previousVoiceId =>
+        previousVoiceId || data.active_voice_id || data.voices[0]?.id || ''
+      )
+    } catch (error) {
+      console.error('Failed to fetch voices', error)
+    }
+  }
+
   const handleRun = async () => {
     if (!url.trim() || chatGptControlsDisabled) return
+    const selectedVoice = voiceOptions.find(
+      voice => voice.id === selectedVoiceId
+    )
     setIsFetching(true)
     setShowResult(false)
     setErrorMsg('')
     setResultText('')
     setVideoTitle('')
-    setCurrentVideoPromptVersion('')
+    setCurrentVideoPromptVersion(selectedPromptVersion)
+    setCurrentVideoVoiceId(selectedVoiceId)
+    setCurrentVideoVoiceName(selectedVoice?.name || '')
+    setAudioTaskVoiceName(selectedVoice?.name || '')
+    setRegenerateVoiceId(selectedVoiceId)
     setAudioStatus('not_started')
+    setAudioMissingSegments(0)
     setChatUrl('')
     setProgressMsg('⏳ Đang khởi động...')
     
@@ -298,7 +371,11 @@ function App() {
       const response = await fetch('http://127.0.0.1:8080/api/process-video', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, prompt_version: selectedPromptVersion })
+        body: JSON.stringify({
+          url,
+          prompt_version: selectedPromptVersion,
+          voice_id: selectedVoiceId || null
+        })
       });
       const { job_id } = await response.json();
       if (!job_id) throw new Error('Backend did not return a job_id');
@@ -321,8 +398,21 @@ function App() {
               setCurrentVideoPromptVersion(
                 data.prompt_version || selectedPromptVersion
               );
+              setCurrentVideoVoiceId(data.voice_id || selectedVoiceId);
+              setCurrentVideoVoiceName(data.voice_name || selectedVoice?.name || '');
+              setAudioTaskVoiceName(
+                data.audio_task?.voice_name || data.voice_name || ''
+              );
+              setRegenerateVoiceId(data.voice_id || selectedVoiceId);
               setIsCurrentVideoPublished(false);
               setAudioStatus(data.audio_task?.status || 'not_started');
+              setAudioMissingSegments(data.audio_task?.missing_segments || 0);
+              if (data.generation_warning) {
+                setErrorMsg(
+                  'Đã lưu phần nội dung hoàn tất. Bước cần tạo lại: ' +
+                  data.generation_warning
+                );
+              }
               if (data.audio_error) {
                 alert('Audio chưa được gửi: ' + data.audio_error);
               }
@@ -390,11 +480,18 @@ function App() {
       setChatUrl(data.chat_url || '');
       setVideoTitle(data.title || '');
       setCurrentVideoPromptVersion(data.prompt_version || '');
+      setCurrentVideoVoiceId(data.voice_id || '');
+      setCurrentVideoVoiceName(data.voice_name || '');
+      setAudioTaskVoiceName('');
+      setRegenerateVoiceId(data.voice_id || selectedVoiceId);
       setShowResult(true);
       setActiveView('fetcher');
       setCurrentVideoId(id);  // track which video is loaded
       setIsCurrentVideoPublished(Boolean(data.is_published));
       setAudioStatus('not_started');
+      setAudioMissingSegments(0);
+      setErrorMsg('');
+      setProgressMsg('');
     } catch (err) {
       console.error("Failed to load video", err);
       alert("Failed to load video from database.");
@@ -494,20 +591,34 @@ function App() {
       });
       const data = await res.json();
       if (data.success) {
-        // Patch resultText with new image URLs
+        const normalizeThumbnailUrls = (urls, fallbackUrl) => {
+          const candidates = Array.isArray(urls) && urls.length > 0
+            ? urls
+            : (fallbackUrl ? [fallbackUrl] : []);
+          return [...new Set(candidates.filter(Boolean))].slice(0, 2);
+        };
+        const patchThumbnailImages = (script, sectionTitle, imageUrls) => {
+          if (imageUrls.length === 0) return script;
+          const imageMarkers = imageUrls
+            .map((imageUrl) => `[IMAGE_URL:${imageUrl}]`)
+            .join('\n\n');
+          return script.replace(
+            new RegExp(`(### \\[${sectionTitle}\\][\\s\\S]*?)(?=\\n### |$)`),
+            (section) => section.replace(/\[IMAGE_URL:.*?\]/g, '').trimEnd() + `\n\n${imageMarkers}`
+          );
+        };
+
         let newScript = resultText;
-        if (data.image1_url) {
-          newScript = newScript.replace(
-            /(### \[THUMBNAIL CÓ CHỮ\][\s\S]*?)(?=\n### |$)/,
-            (m) => m.replace(/\[IMAGE_URL:.*?\]/g, '').trimEnd() + `\n\n[IMAGE_URL:${data.image1_url}]`
-          );
-        }
-        if (data.image2_url) {
-          newScript = newScript.replace(
-            /(### \[THUMBNAIL KHÔNG CHỮ\][\s\S]*?)(?=\n### |$)/,
-            (m) => m.replace(/\[IMAGE_URL:.*?\]/g, '').trimEnd() + `\n\n[IMAGE_URL:${data.image2_url}]`
-          );
-        }
+        newScript = patchThumbnailImages(
+          newScript,
+          'THUMBNAIL CÓ CHỮ',
+          normalizeThumbnailUrls(data.image1_urls, data.image1_url)
+        );
+        newScript = patchThumbnailImages(
+          newScript,
+          'THUMBNAIL KHÔNG CHỮ',
+          normalizeThumbnailUrls(data.image2_urls, data.image2_url)
+        );
         setResultText(newScript);
       } else {
         alert('Lỗi tạo thumbnail: ' + (data.error || 'Unknown error'));
@@ -521,18 +632,32 @@ function App() {
 
   const handleGenerateChapters = async () => {
     if (!currentVideoId || chatGptControlsDisabled) return;
+    const requestedVideoId = currentVideoId;
     setIsGeneratingChapters(true);
     try {
       const response = await fetch('http://127.0.0.1:8080/api/generate-chapters', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ video_id: currentVideoId })
+        body: JSON.stringify({ video_id: requestedVideoId })
       });
       const data = await response.json();
       if (!response.ok || !data.success) {
         throw new Error(data.detail || data.error || 'Không thể tạo lại chapter.');
       }
-      setResultText(data.script);
+      if (data.video_id !== requestedVideoId) {
+        throw new Error('Backend trả về sai video. Giao diện chưa được cập nhật.');
+      }
+      if (currentVideoIdRef.current === requestedVideoId) {
+        setResultText(data.script);
+        setErrorMsg(previousError =>
+          previousError.toLowerCase().includes('chapters:')
+            ? ''
+            : previousError
+        );
+      } else {
+        alert('Chapter đã được cập nhật. Hãy mở lại đúng video để xem kết quả.');
+      }
+      await fetchSavedVideos(currentPage, publishFilter);
     } catch (error) {
       alert('Lỗi tạo chapter: ' + error.message);
     } finally {
@@ -590,12 +715,15 @@ function App() {
       const data = await res.json();
       if (!data.success) {
         setAudioStatus(data.audio_task?.status || 'failed');
+        setAudioMissingSegments(data.audio_task?.missing_segments || 0);
         alert('Lỗi: ' + (data.error || 'Không thể tạo audio.'));
         return;
       }
 
       const status = data.audio_task?.status || 'pending';
       setAudioStatus(status);
+      setAudioMissingSegments(data.audio_task?.missing_segments || 0);
+      setAudioTaskVoiceName(data.audio_task?.voice_name || '');
       keepPolling = status === 'pending' || status === 'processing';
       if (status === 'completed') {
         const videoResponse = await fetch(
@@ -603,6 +731,8 @@ function App() {
         );
         const video = await videoResponse.json();
         setResultText(video.generated_script);
+        setCurrentVideoVoiceId(video.voice_id || '');
+        setCurrentVideoVoiceName(video.voice_name || '');
       }
     } catch (err) {
       alert('Không thể kết nối Backend.');
@@ -633,6 +763,54 @@ function App() {
         throw new Error(data.detail || data.error || 'Không thể retry audio.');
       }
       setAudioStatus(data.audio_task?.status || 'pending');
+      setAudioMissingSegments(data.audio_task?.missing_segments || 0);
+      setAudioTaskVoiceName(data.audio_task?.voice_name || '');
+    } catch (error) {
+      setIsGenAudio(false);
+      alert('Lỗi: ' + error.message);
+    }
+  };
+
+  const handleRegenerateAudio = async () => {
+    if (!currentVideoId || !regenerateVoiceId || isGenAudio) return;
+    const voiceName = getVoiceName(regenerateVoiceId);
+    const confirmed = window.confirm(
+      `Tạo lại toàn bộ audio bằng giọng "${voiceName}" sẽ tốn credit Genmax. ` +
+      'Audio cũ được giữ cho đến khi audio mới hoàn thành. Bạn có tiếp tục không?'
+    );
+    if (!confirmed) return;
+
+    setIsGenAudio(true);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/regenerate-audio`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            voice_id: regenerateVoiceId,
+            confirm_credit_charge: true
+          })
+        }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể tạo lại audio.');
+      }
+      const status = data.audio_task?.status || 'pending';
+      setAudioStatus(status);
+      setAudioMissingSegments(data.audio_task?.missing_segments || 0);
+      setAudioTaskVoiceName(data.audio_task?.voice_name || voiceName);
+      setIsGenAudio(status === 'pending' || status === 'processing');
+      if (status === 'completed') {
+        const videoResponse = await fetch(
+          `http://127.0.0.1:8080/api/videos/${currentVideoId}`
+        );
+        const video = await videoResponse.json();
+        setResultText(video.generated_script);
+        setCurrentVideoVoiceId(video.voice_id || '');
+        setCurrentVideoVoiceName(video.voice_name || '');
+      }
     } catch (error) {
       setIsGenAudio(false);
       alert('Lỗi: ' + error.message);
@@ -816,6 +994,26 @@ function App() {
             <>
               <h1 className="hero-title">Video Library</h1>
               <p className="hero-subtitle">All your automatically saved video scripts are here.</p>
+
+              <div style={{ marginTop: '20px' }}>
+                <input
+                  type="search"
+                  value={searchQuery}
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                  placeholder="🔎 Tìm theo link gốc, tiêu đề gốc, tiêu đề video hoặc mô tả..."
+                  aria-label="Tìm kiếm video"
+                  style={{
+                    width: '100%',
+                    padding: '12px 16px',
+                    borderRadius: '10px',
+                    border: '1px solid rgba(155, 89, 182, 0.55)',
+                    background: '#17131d',
+                    color: '#eee',
+                    fontSize: '0.95em',
+                    outline: 'none'
+                  }}
+                />
+              </div>
               
               {/* Filter bar + stats */}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '20px', marginBottom: '20px', flexWrap: 'wrap', gap: '12px' }}>
@@ -846,7 +1044,6 @@ function App() {
                       const nextVersion = event.target.value;
                       setPromptVersionFilter(nextVersion);
                       setCurrentPage(1);
-                      fetchSavedVideos(1, publishFilter, nextVersion);
                     }}
                     style={{
                       minWidth: '190px', padding: '7px 12px', borderRadius: '8px',
@@ -862,7 +1059,7 @@ function App() {
                   {[['all', '🗂️ Tất cả'], ['published', '✅ Đã đăng'], ['unpublished', '⏳ Chưa đăng']].map(([val, label]) => (
                     <button
                       key={val}
-                      onClick={() => { setPublishFilter(val); setCurrentPage(1); fetchSavedVideos(1, val, promptVersionFilter); }}
+                      onClick={() => { setPublishFilter(val); setCurrentPage(1); }}
                       style={{
                         padding: '6px 14px', borderRadius: '20px', fontSize: '0.85em', cursor: 'pointer', fontWeight: '600',
                         border: publishFilter === val
@@ -885,7 +1082,11 @@ function App() {
 
               <div className="video-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '20px' }}>
                 {savedVideos.items.length === 0 ? (
-                  <p style={{ color: '#888' }}>No saved videos yet. Fetch a video first!</p>
+                  <p style={{ color: '#888' }}>
+                    {debouncedSearchQuery
+                      ? 'Không tìm thấy video phù hợp.'
+                      : 'No saved videos yet. Fetch a video first!'}
+                  </p>
                 ) : (
                   savedVideos.items.map(video => {
                     let cleanSnippet = "";
@@ -933,6 +1134,17 @@ function App() {
                               🤖 {getPromptVersionName(video.prompt_version)}
                             </span>
                           )}
+                          <span style={{
+                            marginLeft: video.prompt_version ? 0 : 'auto',
+                            fontSize: '0.75em',
+                            backgroundColor: 'rgba(26, 188, 156, 0.12)',
+                            color: '#76d7c4', padding: '2px 8px',
+                            borderRadius: '4px',
+                            border: '1px solid rgba(26,188,156,0.4)',
+                            whiteSpace: 'nowrap'
+                          }} title={video.voice_id || 'Video cũ chưa lưu Voice ID'}>
+                            🎙️ {getVoiceName(video.voice_id, video.voice_name)}
+                          </span>
                         </div>
                         
                         <div style={{ backgroundColor: '#1a1a1a', padding: '10px', borderRadius: '6px', marginBottom: '15px', fontSize: '0.85em', color: '#ccc', fontStyle: 'italic' }}>
@@ -999,7 +1211,10 @@ function App() {
               <h1 className="hero-title">Video Content Fetcher</h1>
               <p className="hero-subtitle">Paste any YouTube URL to extract its core content and transcripts automatically.</p>
 
-              <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '24px' }}>
+              <div style={{
+                display: 'flex', justifyContent: 'center', marginBottom: '24px',
+                gap: '12px', flexWrap: 'wrap'
+              }}>
                 <div style={{ 
                   display: 'flex', alignItems: 'center', gap: '12px', 
                   background: 'rgba(255, 255, 255, 0.03)', 
@@ -1058,6 +1273,40 @@ function App() {
                     }}>▼</div>
                   </div>
                 </div>
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: '12px',
+                  background: 'rgba(255, 255, 255, 0.03)',
+                  padding: '12px 24px', borderRadius: '12px',
+                  border: '1px solid rgba(255, 255, 255, 0.1)'
+                }}>
+                  <label htmlFor="voice-select" style={{
+                    color: '#e0e0e0', fontSize: '15px', fontWeight: '500'
+                  }}>
+                    🎙️ Giọng đọc:
+                  </label>
+                  <select
+                    id="voice-select"
+                    value={selectedVoiceId}
+                    onChange={(event) => setSelectedVoiceId(event.target.value)}
+                    disabled={voiceOptions.length === 0}
+                    style={{
+                      background: 'rgba(26, 188, 156, 0.15)', color: 'white',
+                      border: '1px solid rgba(26, 188, 156, 0.5)',
+                      padding: '8px 14px', borderRadius: '8px', outline: 'none',
+                      fontSize: '15px', fontWeight: '600', cursor: 'pointer'
+                    }}
+                  >
+                    {voiceOptions.map(voice => (
+                      <option
+                        key={voice.id}
+                        value={voice.id}
+                        style={{ background: '#1a1a1a', color: 'white' }}
+                      >
+                        {voice.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
 
               <div className="input-group">
@@ -1114,6 +1363,20 @@ function App() {
                           color: '#c39bd3', fontSize: '0.8em', fontWeight: '600'
                         }} title="Bộ prompt đã được lưu khi tạo video này">
                           🤖 Bộ prompt của video: {getPromptVersionName(currentVideoPromptVersion)}
+                        </div>
+                      )}
+                      {currentVideoId && (
+                        <div style={{
+                          display: 'inline-flex', alignItems: 'center', gap: '6px',
+                          marginTop: '6px', marginLeft: '8px', padding: '3px 10px',
+                          borderRadius: '5px', border: '1px solid rgba(26,188,156,0.5)',
+                          background: 'rgba(26,188,156,0.12)', color: '#76d7c4',
+                          fontSize: '0.8em', fontWeight: '600'
+                        }} title={currentVideoVoiceId || 'Video cũ chưa lưu Voice ID'}>
+                          🎙️ Giọng đọc: {getVoiceName(
+                            currentVideoVoiceId,
+                            currentVideoVoiceName
+                          )}
                         </div>
                       )}
                       <div style={{display: 'flex', gap: '10px', marginTop: '8px', flexWrap: 'wrap', alignItems: 'center'}}>
@@ -1204,7 +1467,7 @@ function App() {
                             {isCurrentVideoPublished ? '✅ Đã đăng' : '⏳ Chưa đăng'}
                           </button>
                         )}
-                        {currentVideoId && !audioUrl && (
+                        {currentVideoId && (!audioUrl || audioStatus === 'failed') && (
                           <button
                             onClick={
                               audioStatus === 'failed'
@@ -1222,7 +1485,11 @@ function App() {
                             }}
                           >
                             {isGenAudio
-                              ? '⏳ Đang chờ Genmax...'
+                              ? audioStatus === 'interrupted'
+                                ? '⏳ Đang tiếp tục Audio...'
+                                : '⏳ Đang chờ Genmax...'
+                              : audioStatus === 'interrupted'
+                                ? `🔄 Tiếp tục Audio${audioMissingSegments ? ` (còn ${audioMissingSegments} phần)` : ''}`
                               : audioStatus === 'failed'
                                 ? '⚠️ Retry Audio (sẽ tốn credit)'
                                 : '🎵 Tạo Audio'}
@@ -1252,15 +1519,59 @@ function App() {
                       <>
                         {activeTab === 'summary' && audioUrl && (
                           <div className="result-panel" style={{ padding: '20px' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
-                              <h4 style={{color: 'var(--accent)', margin: 0}}>🔊 AI Voice-over:</h4>
-                              <button 
-                                className="btn-secondary" 
-                                style={{ padding: '4px 12px', fontSize: '0.8em', display: 'flex', alignItems: 'center', gap: '5px' }}
-                                onClick={handleDownloadAudio}
-                              >
-                                📥 Tải Audio MP3
-                              </button>
+                            <div style={{
+                              display: 'flex', justifyContent: 'space-between',
+                              alignItems: 'center', marginBottom: '10px',
+                              gap: '12px', flexWrap: 'wrap'
+                            }}>
+                              <div>
+                                <h4 style={{color: 'var(--accent)', margin: 0}}>🔊 AI Voice-over:</h4>
+                                <div style={{ color: '#76d7c4', fontSize: '0.8em', marginTop: '5px' }}>
+                                  🎙️ Đang sử dụng: {getVoiceName(
+                                    currentVideoVoiceId,
+                                    currentVideoVoiceName
+                                  )}
+                                </div>
+                                {audioTaskVoiceName &&
+                                  ['pending', 'processing', 'interrupted', 'failed'].includes(audioStatus) &&
+                                  audioTaskVoiceName !== currentVideoVoiceName && (
+                                    <div style={{ color: '#f5b041', fontSize: '0.78em', marginTop: '3px' }}>
+                                      ⏳ Audio mới: {audioTaskVoiceName} ({audioStatus})
+                                    </div>
+                                  )}
+                              </div>
+                              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                                <select
+                                  value={regenerateVoiceId}
+                                  onChange={(event) => setRegenerateVoiceId(event.target.value)}
+                                  disabled={isGenAudio || voiceOptions.length === 0}
+                                  aria-label="Giọng tạo lại audio"
+                                  style={{
+                                    background: '#17131d', color: '#eee',
+                                    border: '1px solid rgba(26,188,156,0.5)',
+                                    borderRadius: '6px', padding: '5px 9px'
+                                  }}
+                                >
+                                  {voiceOptions.map(voice => (
+                                    <option key={voice.id} value={voice.id}>{voice.name}</option>
+                                  ))}
+                                </select>
+                                <button
+                                  className="btn-secondary"
+                                  style={{ padding: '4px 12px', fontSize: '0.8em' }}
+                                  onClick={handleRegenerateAudio}
+                                  disabled={isGenAudio || !regenerateVoiceId}
+                                >
+                                  {isGenAudio ? '⏳ Audio đang chạy...' : '🎙️ Tạo lại toàn bộ'}
+                                </button>
+                                <button
+                                  className="btn-secondary"
+                                  style={{ padding: '4px 12px', fontSize: '0.8em', display: 'flex', alignItems: 'center', gap: '5px' }}
+                                  onClick={handleDownloadAudio}
+                                >
+                                  📥 Tải Audio MP3
+                                </button>
+                              </div>
                             </div>
                             <audio
                               controls
@@ -1313,11 +1624,18 @@ function App() {
                                     <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '15px' }}>
                                       {extractedImages.map((img, i) => {
                                         const imgSrc = img.startsWith('/api/') ? `http://127.0.0.1:8080${img}` : img;
+                                        const isWithoutText = section.title.toUpperCase().includes('KHÔNG CHỮ');
+                                        const fileName = `${isWithoutText ? 'thumbnail-khong-chu' : 'thumbnail-co-chu'}-${i + 1}.png`;
                                         return (
                                         <div key={i} style={{ position: 'relative' }}>
+                                          {extractedImages.length > 1 && (
+                                            <div style={{ color: '#bbb', fontWeight: 600, marginBottom: '7px' }}>
+                                              Phương án {i + 1}
+                                            </div>
+                                          )}
                                           <img
                                             src={imgSrc}
-                                            alt={section.title}
+                                            alt={`${section.title} - Phương án ${i + 1}`}
                                             crossOrigin="anonymous"
                                             style={{ width: '100%', borderRadius: '10px', border: '2px solid var(--accent)', display: 'block' }}
                                           />
@@ -1334,7 +1652,6 @@ function App() {
                                           >↗ Mở ảnh gốc</a>
                                           <button
                                             onClick={(e) => {
-                                              const fileName = section.title.toUpperCase().includes('KHÔNG CHỮ') ? 'thumbnail 1.png' : 'thumbnail.png';
                                               handleDownloadImage(imgSrc, fileName, e);
                                             }}
                                             style={{

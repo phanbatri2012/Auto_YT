@@ -14,6 +14,8 @@ POLL_INTERVAL_SECONDS = 5
 MAX_WAIT_SECONDS = 40 * 60
 HISTORY_PAGE_SIZE = 100
 HISTORY_PAGES_TO_CHECK = 3
+MAX_TTS_CHARS_PER_TASK = 9_000
+BATCH_REQUEST_VERSION = 1
 PROVIDER = "minimax"
 MODEL_ID = "speech-2.8-hd"
 LANGUAGE_CODE = "Vietnamese"
@@ -57,6 +59,55 @@ def get_request_hash(text: str, voice_id: str) -> str:
     }
     canonical_data = json.dumps(
         request_data,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical_data.encode("utf-8")).hexdigest()
+
+
+def split_text_for_tts(
+    text: str,
+    max_chars: int = MAX_TTS_CHARS_PER_TASK,
+) -> list[str]:
+    """Split long TTS input at natural boundaries below the provider limit."""
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
+
+    remaining = text.strip()
+    chunks = []
+    preferred_minimum = int(max_chars * 0.6)
+    while len(remaining) > max_chars:
+        window = remaining[:max_chars + 1]
+        cut_at = -1
+        for boundary in ("\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " "):
+            candidate = window.rfind(boundary)
+            if candidate >= preferred_minimum:
+                cut_at = candidate + len(boundary)
+                break
+        if cut_at <= 0:
+            cut_at = max_chars
+        chunks.append(remaining[:cut_at].strip())
+        remaining = remaining[cut_at:].lstrip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def get_generation_request_hash(text: str, voice_id: str) -> str:
+    chunks = split_text_for_tts(text)
+    if len(chunks) == 1:
+        return get_request_hash(text, voice_id)
+    batch_payload = {
+        "batch_version": BATCH_REQUEST_VERSION,
+        "chunk_limit": MAX_TTS_CHARS_PER_TASK,
+        "voice_id": voice_id,
+        "chunks": chunks,
+        **_build_payload(""),
+    }
+    canonical_data = json.dumps(
+        batch_payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -112,26 +163,30 @@ def retry_tts_task(task_id: str) -> dict:
     return response
 
 
-def find_matching_task(text: str, voice_id: str) -> dict | None:
-    matches = []
+def get_recent_tasks() -> list[dict]:
+    tasks = []
     for page in range(HISTORY_PAGES_TO_CHECK):
         history = _request_json(
             f"{BASE_URL}/history?page_size={HISTORY_PAGE_SIZE}&page={page}"
         )
-        tasks = history.get("tasks", [])
-        matches.extend(
-            task
-            for task in tasks
-            if task.get("text") == text
+        tasks.extend(history.get("tasks", []))
+        if not history.get("has_more"):
+            break
+    return tasks
+
+
+def find_matching_tasks(texts: list[str], voice_id: str) -> dict[str, dict]:
+    requested_texts = set(texts)
+    matches_by_text: dict[str, list[dict]] = {}
+    for task in get_recent_tasks():
+        task_text = task.get("text")
+        if (
+            task_text in requested_texts
             and task.get("voice_id") == voice_id
             and task.get("provider") == PROVIDER
             and task.get("model_id") == MODEL_ID
-        )
-        if not history.get("has_more"):
-            break
-
-    if not matches:
-        return None
+        ):
+            matches_by_text.setdefault(task_text, []).append(task)
 
     status_priority = {
         "completed": 0,
@@ -139,13 +194,21 @@ def find_matching_task(text: str, voice_id: str) -> dict | None:
         "pending": 2,
         "failed": 3,
     }
-    return min(
-        matches,
-        key=lambda task: (
-            status_priority.get(task.get("status"), 4),
-            task.get("created_at", ""),
-        ),
-    )
+    return {
+        text: min(
+            matches,
+            key=lambda task: (
+                status_priority.get(task.get("status"), 4),
+                task.get("created_at", ""),
+            ),
+        )
+        for text, matches in matches_by_text.items()
+    }
+
+
+def find_matching_task(text: str, voice_id: str) -> dict | None:
+    matches = find_matching_tasks([text], voice_id)
+    return matches.get(text)
 
 
 def generate_tts(text: str, voice_id: str) -> str:

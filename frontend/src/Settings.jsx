@@ -3,6 +3,7 @@ import './Settings.css';
 
 export default function Settings() {
   const [promptsData, setPromptsData] = useState(null);
+  const [voicesData, setVoicesData] = useState(null);
   const [activeVersion, setActiveVersion] = useState('');
   const [loadingMsg, setLoadingMsg] = useState('');
   const [resultMsg, setResultMsg] = useState('');
@@ -13,13 +14,61 @@ export default function Settings() {
 
   const fetchData = async () => {
     try {
-      const res = await fetch('http://127.0.0.1:8080/api/prompts');
-      const data = await res.json();
-      setPromptsData(data);
-      setActiveVersion(data.active_version);
+      const [promptsResponse, voicesResponse] = await Promise.all([
+        fetch('http://127.0.0.1:8080/api/prompts'),
+        fetch('http://127.0.0.1:8080/api/voices')
+      ]);
+      const prompts = await promptsResponse.json();
+      const voices = await voicesResponse.json();
+      setPromptsData(prompts);
+      setVoicesData(voices);
+      setActiveVersion(prompts.active_version);
     } catch (err) {
       console.error("Lỗi khi lấy prompts:", err);
     }
+  };
+
+  const handleVoiceChange = (index, field, value) => {
+    setVoicesData(prev => {
+      const previousVoice = prev.voices[index];
+      return {
+        ...prev,
+        active_voice_id:
+          field === 'id' && prev.active_voice_id === previousVoice.id
+            ? value
+            : prev.active_voice_id,
+        voices: prev.voices.map((voice, voiceIndex) =>
+          voiceIndex === index ? { ...voice, [field]: value } : voice
+        )
+      };
+    });
+  };
+
+  const handleAddVoice = () => {
+    setVoicesData(prev => ({
+      ...prev,
+      voices: [...prev.voices, { id: '', name: '' }]
+    }));
+  };
+
+  const handleRemoveVoice = (index) => {
+    setVoicesData(prev => {
+      if (prev.voices.length <= 1) {
+        alert('Phải giữ lại ít nhất một giọng đọc.');
+        return prev;
+      }
+      const voices = prev.voices.filter((_, voiceIndex) => voiceIndex !== index);
+      const activeVoiceExists = voices.some(
+        voice => voice.id === prev.active_voice_id
+      );
+      return {
+        ...prev,
+        voices,
+        active_voice_id: activeVoiceExists
+          ? prev.active_voice_id
+          : voices[0].id
+      };
+    });
   };
 
   const handlePromptChange = (key, value) => {
@@ -82,20 +131,34 @@ export default function Settings() {
     try {
       setLoadingMsg('Đang lưu thiết lập...');
       setResultMsg('');
-      await fetch('http://127.0.0.1:8080/api/prompts', {
+      const voicesResponse = await fetch('http://127.0.0.1:8080/api/voices', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(voicesData)
+      });
+      const voicesResult = await voicesResponse.json();
+      if (!voicesResponse.ok) {
+        throw new Error(voicesResult.detail || 'Không thể lưu danh sách giọng.');
+      }
+      setVoicesData(voicesResult);
+
+      const promptsResponse = await fetch('http://127.0.0.1:8080/api/prompts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(promptsData)
       });
-      setResultMsg('✅ Đã lưu cấu hình Prompts thành công!');
+      if (!promptsResponse.ok) {
+        throw new Error('Không thể lưu cấu hình prompt.');
+      }
+      setResultMsg('✅ Đã lưu cấu hình Prompt và giọng đọc thành công!');
     } catch (err) {
-      setResultMsg('❌ Lỗi khi lưu cấu hình.');
+      setResultMsg('❌ ' + err.message);
     } finally {
       setLoadingMsg('');
     }
   };
 
-  if (!promptsData || !promptsData.versions[activeVersion]) {
+  if (!promptsData || !voicesData || !promptsData.versions[activeVersion]) {
     return <div style={{padding: '20px', color: 'white'}}>Loading Settings...</div>;
   }
 
@@ -135,6 +198,79 @@ export default function Settings() {
         <div style={{display: 'flex', gap: '10px'}}>
           <button className="btn-secondary" onClick={handleDuplicateVersion}>➕ Tạo Bản Sao</button>
           <button className="btn-danger" onClick={handleDeleteVersion}>🗑️ Xóa Bản Này</button>
+        </div>
+      </div>
+
+      <div className="prompt-item" style={{ marginBottom: '20px' }}>
+        <div className="prompt-header" style={{ alignItems: 'center' }}>
+          <div>
+            <label>🎙️ Quản lý giọng đọc Genmax</label>
+            <div className="help-text" style={{ marginTop: '5px' }}>
+              Đặt tên dễ nhớ và nhập đúng Voice ID từ Genmax.
+            </div>
+          </div>
+          <button className="btn-secondary" onClick={handleAddVoice}>
+            ➕ Thêm giọng
+          </button>
+        </div>
+
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: '10px',
+          margin: '15px 0', flexWrap: 'wrap'
+        }}>
+          <label style={{ color: '#fff', fontWeight: 'bold' }}>
+            Giọng mặc định:
+          </label>
+          <select
+            value={voicesData.active_voice_id}
+            onChange={(event) => setVoicesData(prev => ({
+              ...prev,
+              active_voice_id: event.target.value
+            }))}
+            className="version-select"
+          >
+            {voicesData.voices.map((voice, index) => (
+              <option key={`${voice.id}-${index}`} value={voice.id}>
+                {voice.name || `Giọng ${index + 1}`}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+          {voicesData.voices.map((voice, index) => (
+            <div
+              key={index}
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'minmax(180px, 0.8fr) minmax(300px, 1.5fr) auto',
+                gap: '10px',
+                alignItems: 'center'
+              }}
+            >
+              <input
+                value={voice.name}
+                onChange={(event) => handleVoiceChange(index, 'name', event.target.value)}
+                placeholder="Tên giọng"
+                className="version-select"
+                style={{ width: '100%' }}
+              />
+              <input
+                value={voice.id}
+                onChange={(event) => handleVoiceChange(index, 'id', event.target.value)}
+                placeholder="Voice ID (UUID)"
+                className="version-select"
+                style={{ width: '100%' }}
+              />
+              <button
+                className="btn-danger"
+                onClick={() => handleRemoveVoice(index)}
+                title="Xóa giọng đọc"
+              >
+                🗑️
+              </button>
+            </div>
+          ))}
         </div>
       </div>
 

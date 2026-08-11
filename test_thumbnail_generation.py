@@ -3,19 +3,26 @@ import unittest
 from unittest.mock import MagicMock, call, patch
 
 from fastapi import BackgroundTasks
+from playwright.sync_api import Error as PlaywrightError
 
 from auto_yt import main
 from auto_yt.services.chatgpt_worker import (
     CHATGPT_RESPONSE_TIMEOUT_SECONDS,
-    THUMBNAIL_RETRY_PROMPT,
+    THUMBNAIL_REGENERATE_PROMPT,
+    THUMBNAIL_REPAIR_PROMPT,
     build_thumbnail_generation_prompt,
+    ensure_prompt_editor_integrity,
     ensure_expected_conversation_page,
     get_video_thumbnail_chat_url,
     is_thumbnail_generation_error_response,
+    prompt_text_matches,
+    retry_thumbnail_generation,
     send_prompt,
     send_thumbnail_prompt,
     select_thumbnail_response_turn_number,
+    validate_prompt_text,
     wait_for_thumbnail_image,
+    wait_for_thumbnail_images,
 )
 
 
@@ -33,11 +40,89 @@ Prompt cũ không chữ.
 
 
 class ThumbnailGenerationTests(unittest.TestCase):
+    def test_unicode_prompt_validation_accepts_vietnamese_text(self):
+        prompt = "Hãy viết lại nội dung đầy đủ. Vì sao nhân vật rời đi?"
+
+        validate_prompt_text(prompt)
+        self.assertTrue(
+            prompt_text_matches(
+                prompt,
+                "Hãy viết lại nội dung đầy đủ.\nVì sao nhân vật rời đi?",
+            )
+        )
+
+    def test_unicode_prompt_validation_rejects_corrupted_words(self):
+        for prompt in (
+            "H?y vi?t l?i ph?n BODY.",
+            "??y l? b?n BODY thay th?.",
+            "Nội dung bị lỗi \ufffd trong prompt.",
+        ):
+            with self.subTest(prompt=prompt), self.assertRaisesRegex(
+                ValueError,
+                "corrupted Unicode",
+            ):
+                validate_prompt_text(prompt)
+
+    def test_corrupted_prompt_is_blocked_before_browser_input(self):
+        page = MagicMock()
+
+        with self.assertRaisesRegex(ValueError, "No prompt was sent"):
+            send_prompt(page, "H?y vi?t l?i ph?n BODY.")
+
+        page.locator.assert_not_called()
+
+    def test_corrupted_editor_text_is_reinserted_before_send(self):
+        page = MagicMock()
+        prompt_textarea = MagicMock()
+        prompt_textarea.inner_text.side_effect = (
+            "H?y vi?t l?i ph?n BODY.",
+            "Hãy viết lại phần BODY.",
+        )
+
+        with (
+            patch(
+                "auto_yt.services.chatgpt_worker.replace_prompt_text_with_javascript"
+            ) as replace_prompt,
+            patch("auto_yt.services.chatgpt_worker.time.sleep"),
+        ):
+            ensure_prompt_editor_integrity(
+                page,
+                prompt_textarea,
+                "Hãy viết lại phần BODY.",
+            )
+
+        replace_prompt.assert_called_once_with(
+            page,
+            "Hãy viết lại phần BODY.",
+        )
+
+    def test_prompt_is_not_sent_if_editor_remains_corrupted(self):
+        page = MagicMock()
+        prompt_textarea = MagicMock()
+        prompt_textarea.inner_text.return_value = "H?y vi?t l?i ph?n BODY."
+
+        with (
+            patch(
+                "auto_yt.services.chatgpt_worker.replace_prompt_text_with_javascript"
+            ),
+            patch("auto_yt.services.chatgpt_worker.time.sleep"),
+            self.assertRaisesRegex(RuntimeError, "No prompt was sent"),
+        ):
+            ensure_prompt_editor_integrity(
+                page,
+                prompt_textarea,
+                "Hãy viết lại phần BODY.",
+            )
+
     def test_both_type_generates_and_updates_both_thumbnails(self):
         generated_with_text = {
             "thumb_text": "Prompt mới có chữ.",
             "thumb_notext": None,
             "image1_url": "/api/thumbnails/new_with_text.png",
+            "image1_urls": [
+                "/api/thumbnails/new_with_text.png",
+                "/api/thumbnails/new_with_text_2.png",
+            ],
             "image2_url": "",
         }
         generated_without_text = {
@@ -45,6 +130,10 @@ class ThumbnailGenerationTests(unittest.TestCase):
             "thumb_notext": "Prompt mới không chữ.",
             "image1_url": "",
             "image2_url": "/api/thumbnails/new_without_text.png",
+            "image2_urls": [
+                "/api/thumbnails/new_without_text.png",
+                "/api/thumbnails/new_without_text_2.png",
+            ],
         }
         request = main.GenerateThumbnailsRequest(
             script=SCRIPT,
@@ -97,7 +186,15 @@ class ThumbnailGenerationTests(unittest.TestCase):
             updated_script,
         )
         self.assertIn(
+            "[IMAGE_URL:/api/thumbnails/new_with_text_2.png]",
+            updated_script,
+        )
+        self.assertIn(
             "[IMAGE_URL:/api/thumbnails/new_without_text.png]",
+            updated_script,
+        )
+        self.assertIn(
+            "[IMAGE_URL:/api/thumbnails/new_without_text_2.png]",
             updated_script,
         )
         self.assertNotIn("old_with_text.png", updated_script)
@@ -116,12 +213,64 @@ class ThumbnailGenerationTests(unittest.TestCase):
                     user_prompt,
                 )
 
-    def test_thumbnail_retry_prompt_matches_requested_command(self):
+    def test_thumbnail_retry_prompts_match_requested_commands(self):
         self.assertEqual(
-            THUMBNAIL_RETRY_PROMPT,
-            "Sửa lại prompt sao cho không vi phạm. sau đó tạo lại thumbanil. "
-            "chỉ cần xuất hình ảnh thumbnail.",
+            THUMBNAIL_REPAIR_PROMPT,
+            "hãy chỉ ra điểm vi phạm prompt của tôi. sau đó sửa prompt  sao cho không vi phạm nữa.",
         )
+        self.assertEqual(
+            THUMBNAIL_REGENERATE_PROMPT,
+            "Tạo ảnh theo prompt vừa được sửa ở ngay trên. Lưu ý: chỉ cần xuất ảnh của prompt mới sửa",
+        )
+
+    def test_thumbnail_retry_waits_for_repair_then_requests_image(self):
+        page = MagicMock()
+        download_image = MagicMock()
+        call_order = []
+
+        with (
+            patch(
+                "auto_yt.services.chatgpt_worker.send_prompt",
+                side_effect=lambda *args: call_order.append(("repair", args[1])),
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.send_thumbnail_prompt",
+                side_effect=lambda *args: (
+                    call_order.append(("generate", args[1]))
+                    or ("", ["/api/thumbnails/repaired.png"])
+                ),
+            ),
+        ):
+            response_text, image_urls = retry_thumbnail_generation(
+                page,
+                download_image,
+            )
+
+        self.assertEqual(response_text, "")
+        self.assertEqual(image_urls, ["/api/thumbnails/repaired.png"])
+        self.assertEqual(
+            call_order,
+            [
+                ("repair", THUMBNAIL_REPAIR_PROMPT),
+                ("generate", THUMBNAIL_REGENERATE_PROMPT),
+            ],
+        )
+
+    def test_thumbnail_image_command_is_not_sent_if_repair_fails(self):
+        page = MagicMock()
+        with (
+            patch(
+                "auto_yt.services.chatgpt_worker.send_prompt",
+                side_effect=RuntimeError("repair failed"),
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.send_thumbnail_prompt",
+            ) as generate_image,
+            self.assertRaisesRegex(RuntimeError, "repair failed"),
+        ):
+            retry_thumbnail_generation(page, MagicMock())
+
+        generate_image.assert_not_called()
 
     def test_both_type_keeps_old_images_when_first_image_is_missing(self):
         request = main.GenerateThumbnailsRequest(
@@ -187,34 +336,84 @@ class ThumbnailGenerationTests(unittest.TestCase):
                 return_value=68,
             ),
             patch(
-                "auto_yt.services.chatgpt_worker.wait_for_thumbnail_image",
-                return_value="/api/thumbnails/rendered.png",
-            ) as wait_for_image,
+                "auto_yt.services.chatgpt_worker.wait_for_thumbnail_images",
+                return_value=["/api/thumbnails/rendered.png"],
+            ) as wait_for_images,
         ):
-            response_text, image_url = send_thumbnail_prompt(
+            response_text, image_urls = send_thumbnail_prompt(
                 page,
                 "thumbnail prompt",
                 download_image,
             )
 
         self.assertEqual(response_text, "")
-        self.assertEqual(image_url, "/api/thumbnails/rendered.png")
-        wait_for_image.assert_called_once_with(page, 68, download_image)
+        self.assertEqual(image_urls, ["/api/thumbnails/rendered.png"])
+        wait_for_images.assert_called_once_with(page, 68, download_image)
+
+    def test_two_unique_thumbnail_images_are_downloaded_from_same_response(self):
+        page = MagicMock()
+        turn = MagicMock()
+        images = MagicMock()
+        stop_button = MagicMock()
+        source_urls = [
+            "https://chatgpt.com/backend-api/estuary/content?id=file_first&sig=large",
+            "https://chatgpt.com/backend-api/estuary/content?id=file_first&sig=small",
+            "https://chatgpt.com/backend-api/estuary/content?id=file_second&sig=small",
+        ]
+        turn.count.return_value = 1
+        turn.locator.return_value = images
+        images.evaluate_all.return_value = [
+            {"src": source_url, "ready": True}
+            for source_url in source_urls
+        ]
+        stop_button.count.return_value = 0
+        page.locator.side_effect = lambda selector: (
+            stop_button if selector == '[data-testid="stop-button"]' else turn
+        )
+        download_image = MagicMock(
+            side_effect=(
+                "/api/thumbnails/first.png",
+                "/api/thumbnails/second.png",
+            )
+        )
+
+        with (
+            patch(
+                "auto_yt.services.chatgpt_worker.get_visible_conversation_turns",
+                return_value=[(67, "user"), (68, "assistant")],
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.time.time",
+                side_effect=(0, 1),
+            ),
+        ):
+            image_urls = wait_for_thumbnail_images(page, 67, download_image)
+
+        self.assertEqual(
+            image_urls,
+            [
+                "/api/thumbnails/first.png",
+                "/api/thumbnails/second.png",
+            ],
+        )
+        self.assertEqual(
+            download_image.call_args_list,
+            [call(source_urls[0]), call(source_urls[2])],
+        )
 
     def test_thumbnail_image_waits_until_generation_stops(self):
         page = MagicMock()
         turn = MagicMock()
         images = MagicMock()
-        image = MagicMock()
         stop_button = MagicMock()
         download_image = MagicMock(return_value="/api/thumbnails/new.png")
 
         turn.count.return_value = 1
         turn.locator.return_value = images
-        images.count.return_value = 1
-        images.nth.return_value = image
-        image.get_attribute.return_value = "https://chatgpt.com/backend-api/estuary/image"
-        image.evaluate.return_value = True
+        images.evaluate_all.return_value = [{
+            "src": "https://chatgpt.com/backend-api/estuary/image",
+            "ready": True,
+        }]
         stop_button.count.side_effect = (1, 0)
         page.locator.side_effect = lambda selector: (
             stop_button if selector == '[data-testid="stop-button"]' else turn
@@ -239,8 +438,45 @@ class ThumbnailGenerationTests(unittest.TestCase):
             "https://chatgpt.com/backend-api/estuary/image"
         )
 
+    def test_thumbnail_image_snapshot_retries_after_dom_rerender(self):
+        page = MagicMock()
+        turn = MagicMock()
+        images = MagicMock()
+        stop_button = MagicMock()
+        source_url = "https://chatgpt.com/backend-api/estuary/content?id=file_new"
+        download_image = MagicMock(return_value="/api/thumbnails/new.png")
+
+        turn.count.return_value = 1
+        turn.locator.return_value = images
+        images.evaluate_all.side_effect = (
+            PlaywrightError("execution context changed"),
+            [{"src": source_url, "ready": True}],
+        )
+        stop_button.count.return_value = 0
+        page.locator.side_effect = lambda selector: (
+            stop_button if selector == '[data-testid="stop-button"]' else turn
+        )
+
+        with (
+            patch(
+                "auto_yt.services.chatgpt_worker.get_visible_conversation_turns",
+                return_value=[(67, "user"), (68, "assistant")],
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.time.time",
+                side_effect=(0, 1, 2),
+            ),
+            patch("auto_yt.services.chatgpt_worker.time.sleep"),
+        ):
+            image_urls = wait_for_thumbnail_images(page, 67, download_image)
+
+        self.assertEqual(image_urls, ["/api/thumbnails/new.png"])
+        self.assertEqual(images.evaluate_all.call_count, 2)
+        download_image.assert_called_once_with(source_url)
+
     def test_next_prompt_is_blocked_while_generation_is_still_running(self):
         page = MagicMock()
+        page.url = "https://chatgpt.com/c/test-conversation"
         prompt_locator = MagicMock()
         prompt_textarea = MagicMock()
         send_locator = MagicMock()
@@ -260,15 +496,92 @@ class ThumbnailGenerationTests(unittest.TestCase):
 
         with (
             patch("auto_yt.services.chatgpt_worker.time.sleep"),
+            patch(
+                "auto_yt.services.chatgpt_worker.get_latest_conversation_turn",
+                return_value=42,
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.wait_for_conversation_history"
+            ) as wait_for_history,
             self.assertRaisesRegex(Exception, "No next prompt was sent"),
         ):
             send_prompt(page, "next prompt")
 
+        wait_for_history.assert_called_once_with(page)
         finish_wait = page.wait_for_function.call_args_list[4]
         self.assertEqual(
             finish_wait.kwargs["timeout"],
             CHATGPT_RESPONSE_TIMEOUT_SECONDS * 1000,
         )
+
+    def test_empty_text_response_stops_the_workflow(self):
+        page = MagicMock()
+        page.url = "https://chatgpt.com/c/test-conversation"
+        prompt_locator = MagicMock()
+        prompt_textarea = MagicMock()
+        send_locator = MagicMock()
+        send_button = MagicMock()
+        prompt_locator.first = prompt_textarea
+        send_locator.first = send_button
+        page.locator.side_effect = lambda selector: (
+            prompt_locator if selector == "#prompt-textarea" else send_locator
+        )
+
+        with (
+            patch("auto_yt.services.chatgpt_worker.time.sleep"),
+            patch(
+                "auto_yt.services.chatgpt_worker.time.time",
+                side_effect=(0, 31),
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.get_latest_conversation_turn",
+                return_value=10,
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.get_new_assistant_response",
+                return_value="",
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.wait_for_conversation_history"
+            ),
+            self.assertRaisesRegex(RuntimeError, "no readable text"),
+        ):
+            send_prompt(page, "text prompt")
+
+    def test_image_prompt_allows_an_empty_text_response(self):
+        page = MagicMock()
+        page.url = "https://chatgpt.com/c/test-conversation"
+        prompt_locator = MagicMock()
+        prompt_textarea = MagicMock()
+        send_locator = MagicMock()
+        send_button = MagicMock()
+        prompt_locator.first = prompt_textarea
+        send_locator.first = send_button
+        page.locator.side_effect = lambda selector: (
+            prompt_locator if selector == "#prompt-textarea" else send_locator
+        )
+
+        with (
+            patch("auto_yt.services.chatgpt_worker.time.sleep"),
+            patch(
+                "auto_yt.services.chatgpt_worker.get_latest_conversation_turn",
+                return_value=10,
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.get_new_assistant_response",
+                return_value="",
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.wait_for_conversation_history"
+            ),
+        ):
+            response = send_prompt(
+                page,
+                "image prompt",
+                allow_empty_response=True,
+            )
+
+        self.assertEqual(response, "")
 
     def test_thumbnail_reuses_video_conversation_url(self):
         chat_urls = (

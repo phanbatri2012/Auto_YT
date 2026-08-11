@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -6,6 +7,8 @@ WORKER_SCRIPT = Path(__file__).parent / "chatgpt_worker.py"
 PYTHON_EXE = sys.executable
 
 CHAT_URL_MARKER = "###CHAT_URL###"
+WORKER_META_MARKER = "###WORKER_META###"
+
 
 def process_prompt_via_chatgpt(prompt_text: str, prompt_version: str = "") -> dict:
     """
@@ -34,6 +37,21 @@ def process_prompt_via_chatgpt(prompt_text: str, prompt_version: str = "") -> di
 
     output = result.stdout.decode("utf-8", errors="replace")
     
+    worker_meta = {
+        "warning": "",
+        "failed_step": "",
+        "complete_for_audio": True,
+    }
+    if WORKER_META_MARKER in output:
+        output, raw_meta = output.rsplit(WORKER_META_MARKER, 1)
+        output = output.rstrip()
+        try:
+            parsed_meta = json.loads(raw_meta.strip())
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Playwright worker returned invalid metadata.") from exc
+        if isinstance(parsed_meta, dict):
+            worker_meta.update(parsed_meta)
+
     # Parse out chat_url if worker appended it
     chat_url = ""
     if CHAT_URL_MARKER in output:
@@ -41,4 +59,8 @@ def process_prompt_via_chatgpt(prompt_text: str, prompt_version: str = "") -> di
         output = parts[0].rstrip()
         chat_url = parts[1].strip()
     
-    return {"script": output, "chat_url": chat_url}
+    return {
+        "script": output,
+        "chat_url": chat_url,
+        **worker_meta,
+    }

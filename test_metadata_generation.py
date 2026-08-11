@@ -1,8 +1,11 @@
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from auto_yt import main
+from auto_yt.services import database
 from auto_yt.services.chatgpt_worker import (
     build_metadata_generation_prompt,
     request_complete_metadata,
@@ -50,6 +53,55 @@ D. Bốn
 
 
 class MetadataGenerationTests(unittest.TestCase):
+    def test_extracts_inline_and_multiline_generated_titles(self):
+        self.assertEqual(
+            database.extract_generated_video_title(SCRIPT),
+            "Tiêu đề cũ",
+        )
+        multiline_script = SCRIPT.replace(
+            "TIÊU ĐỀ: Tiêu đề cũ",
+            "## TIÊU ĐỀ VIDEO\nTIÊU ĐỀ HAI DÒNG",
+        )
+        self.assertEqual(
+            database.extract_generated_video_title(multiline_script),
+            "TIÊU ĐỀ HAI DÒNG",
+        )
+
+    def test_dashboard_title_tracks_generated_metadata_for_all_videos(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "database.db"
+            with patch.object(database, "DB_PATH", database_path):
+                database.init_db()
+                video_id = database.save_video(
+                    "https://www.youtube.com/watch?v=generic",
+                    "Tiêu đề YouTube gốc",
+                    "Transcript",
+                    "### [INTRO]\nBản nháp",
+                )
+
+                draft_item = database.get_all_videos()["items"][0]
+                self.assertEqual(draft_item["title"], "Tiêu đề YouTube gốc")
+
+                database.update_video_generation(
+                    video_id,
+                    SCRIPT,
+                    "https://chatgpt.com/c/video-chat",
+                )
+                generated_item = database.get_all_videos()["items"][0]
+                self.assertEqual(generated_item["title"], "Tiêu đề cũ")
+                self.assertEqual(
+                    database.get_video(video_id)["title"],
+                    "Tiêu đề YouTube gốc",
+                )
+
+                updated_script = main.replace_metadata_section(
+                    SCRIPT,
+                    NEW_METADATA,
+                )
+                database.update_script(video_id, updated_script)
+                regenerated_item = database.get_all_videos()["items"][0]
+                self.assertEqual(regenerated_item["title"], "TIÊU ĐỀ MỚI")
+
     def test_prompt_reuses_the_full_configured_metadata_prompt(self):
         metadata_prompt = (
             "Tạo tiêu đề, URL slug, mô tả, hashtag, bình luận ghim và quiz."

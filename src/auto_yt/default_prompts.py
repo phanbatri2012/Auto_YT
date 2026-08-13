@@ -5,6 +5,8 @@ DEFAULT_PROMPTS_DATA = {
     "versions": {
         "default": {
             "name": "Bản gốc Đinh Đoàn",
+            "project_url": "https://chatgpt.com/g/g-p-6a1f9204f2d88191b39b64eb7f2dbb97-dd-vn2-phan-tich/project",
+            "default_voice_id": "",
             "prompts": {
                 "outline": "Bạn là biên tập viên nội dung cho kênh YouTube Đinh Đoàn Phân Tích. Dưới đây là một kịch bản dài đã có sẵn. Dưới góc nhìn của tiến sĩ, Chuyên gia tâm lý Đinh Đoàn Đinh Đoàn phân tích Hãy chia nội dung này thành các phần lớn hợp lý theo dòng chảy tự nhiên của câu chuyện để dễ viết lại thành lời dẫn video. Không cần đặt tiêu đề cho từng phần. Hãy gộp thành các phần lớn, KHÔNG tách nhỏ quá nhiều. Mỗi phần lớn chỉ cần trình bày dưới dạng gạch đầu dòng các ý chính cơ bản, nhưng phải bao quát đủ thông tin quan trọng như bản gốc, không cắt gọn mất ý chính, không viết tắt. Kiểm tra các Tên riêng, mốc thời gian, địa điểm, số liệu để sửa lại cho đúng.\n\nLưu ý CỰC KỲ QUAN TRỌNG: Khi lập dàn ý, CHỈ LẤY phần nội dung câu chuyện bám sát theo đúng TIÊU ĐỀ KỊCH BẢN. Tuyệt đối bỏ qua tất cả các nội dung khác (ví dụ như đoạn quảng cáo, giới thiệu đầu video, hoặc các câu chuyện phụ không liên quan đến tiêu đề).\n\nQuan trọng: Định dạng mỗi phần bằng chuỗi [PHAN] ở đầu, ví dụ:\n[PHAN]\nNội dung phần 1...\n[PHAN]\nNội dung phần 2...\n\nDưới đây là kịch bản (Bao gồm Tiêu đề và Nội dung):\n{transcript}",
                 

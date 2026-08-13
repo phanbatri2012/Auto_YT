@@ -1,4 +1,5 @@
 import json
+import re
 import uuid
 
 from auto_yt.paths import DATA_DIR
@@ -8,6 +9,26 @@ DEFAULT_VOICE_ID = "e1d9617c-045c-4072-8d17-9be0ec113723"
 DEFAULT_VOICE_NAME = "Giọng mặc định hiện tại"
 VOICE_CONFIG_PATH = DATA_DIR / "voices.json"
 MAX_VOICE_OPTIONS = 50
+MAX_VOICE_ID_LENGTH = 128
+SYSTEM_VOICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def _normalize_voice_id(value: object) -> str:
+    voice_id = str(value or "").strip()
+    try:
+        return str(uuid.UUID(voice_id))
+    except (ValueError, AttributeError):
+        pass
+
+    if (
+        not voice_id
+        or len(voice_id) > MAX_VOICE_ID_LENGTH
+        or not SYSTEM_VOICE_ID_PATTERN.fullmatch(voice_id)
+    ):
+        raise ValueError(
+            "Voice ID phải là UUID hoặc mã giọng hệ thống chỉ gồm chữ, số, '_' và '-'."
+        )
+    return voice_id
 
 
 def _default_config() -> dict:
@@ -38,15 +59,15 @@ def validate_voice_config(data: dict) -> dict:
     for raw_voice in raw_voices:
         if not isinstance(raw_voice, dict):
             raise ValueError("Thông tin giọng đọc không hợp lệ.")
-        voice_id = str(raw_voice.get("id", "")).strip()
+        raw_voice_id = raw_voice.get("id", "")
         voice_name = str(raw_voice.get("name", "")).strip()
         if not voice_name:
             raise ValueError("Tên giọng đọc không được để trống.")
         try:
-            voice_id = str(uuid.UUID(voice_id))
-        except (ValueError, AttributeError) as exc:
+            voice_id = _normalize_voice_id(raw_voice_id)
+        except ValueError as exc:
             raise ValueError(
-                f"Voice ID của '{voice_name}' không đúng định dạng UUID."
+                f"Voice ID của '{voice_name}' không hợp lệ. {exc}"
             ) from exc
         normalized_name = voice_name.casefold()
         if voice_id in seen_ids:
@@ -57,7 +78,7 @@ def validate_voice_config(data: dict) -> dict:
         seen_names.add(normalized_name)
         voices.append({"id": voice_id, "name": voice_name})
 
-    active_voice_id = str(data.get("active_voice_id", "")).strip()
+    active_voice_id = _normalize_voice_id(data.get("active_voice_id", ""))
     if active_voice_id not in seen_ids:
         raise ValueError("Giọng mặc định phải nằm trong danh sách giọng đọc.")
     return {

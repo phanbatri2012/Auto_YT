@@ -9,6 +9,7 @@ from auto_yt.services import database, voice_config
 
 VOICE_ID = "2559f15a-b9bc-4f39-b7cb-82b21d45e51e"
 SECOND_VOICE_ID = "a39e4493-3a8a-4be8-bd13-b96f2f5c4906"
+SYSTEM_VOICE_ID = "Vietnamese_crisp_announcer_v2"
 SCRIPT = """
 ### [INTRO]
 Nội dung kiểm tra giọng đọc.
@@ -25,6 +26,27 @@ TIÊU ĐỀ: Video kiểm tra
 
 
 class VoiceSelectionTests(unittest.TestCase):
+    def test_system_voice_id_is_accepted(self):
+        config = voice_config.validate_voice_config({
+            "active_voice_id": SYSTEM_VOICE_ID,
+            "voices": [
+                {"id": VOICE_ID, "name": "Giọng tùy chỉnh"},
+                {"id": SYSTEM_VOICE_ID, "name": "Giọng phát thanh"},
+            ],
+        })
+
+        self.assertEqual(config["active_voice_id"], SYSTEM_VOICE_ID)
+        self.assertEqual(config["voices"][1]["id"], SYSTEM_VOICE_ID)
+
+    def test_unsafe_system_voice_id_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Voice ID"):
+            voice_config.validate_voice_config({
+                "active_voice_id": "../invalid-voice",
+                "voices": [
+                    {"id": "../invalid-voice", "name": "Giọng không hợp lệ"},
+                ],
+            })
+
     def test_voice_configuration_is_validated_and_persisted(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             config_path = Path(temporary_directory) / "voices.json"

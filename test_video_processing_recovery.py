@@ -27,7 +27,7 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
                 "name": "Giọng kiểm thử",
             },
         )
-        self.voice_patch.start()
+        self.get_voice = self.voice_patch.start()
 
     def tearDown(self):
         self.voice_patch.stop()
@@ -62,6 +62,29 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
 
         state["body_parts"] = ["b" * 5500]
         self.assertTrue(is_core_script_complete(transcript, state))
+
+    def test_video_without_voice_uses_prompt_default_voice(self):
+        prompt_voice_id = "a39e4493-3a8a-4be8-bd13-b96f2f5c4906"
+        with (
+            patch.object(
+                main,
+                "_get_prompt_default_voice_id",
+                return_value=prompt_voice_id,
+            ),
+            patch.object(
+                main,
+                "_try_start_chatgpt_operation",
+                return_value=False,
+            ),
+        ):
+            main.process_video(
+                main.VideoRequest(
+                    url="https://www.youtube.com/watch?v=generic",
+                    prompt_version="version-key",
+                )
+            )
+
+        self.get_voice.assert_called_once_with(prompt_voice_id)
 
     def test_body_target_scales_with_transcript_and_number_of_parts(self):
         minimum_chars = get_minimum_body_part_chars(

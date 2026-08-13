@@ -645,7 +645,11 @@ class ThumbnailGenerationTests(unittest.TestCase):
             self.assertEqual(response["error"], main.CHATGPT_BUSY_ERROR)
             self.assertEqual(
                 main.get_chatgpt_status(),
-                {"busy": True, "operation": "video"},
+                {
+                    "busy": True,
+                    "operation": "video",
+                    "prompt_version": "",
+                },
             )
             generate_thumbnails.assert_not_called()
         finally:
@@ -666,7 +670,11 @@ class ThumbnailGenerationTests(unittest.TestCase):
             self.assertEqual(job["error"], main.CHATGPT_BUSY_ERROR)
             self.assertEqual(
                 main.get_chatgpt_status(),
-                {"busy": True, "operation": "thumbnails"},
+                {
+                    "busy": True,
+                    "operation": "thumbnails",
+                    "prompt_version": "",
+                },
             )
         finally:
             main._finish_chatgpt_operation()

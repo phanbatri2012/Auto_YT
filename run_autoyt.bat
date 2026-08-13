@@ -16,7 +16,7 @@ start "Auto_YT Backend" cmd /k "call .venv\Scripts\activate.bat && uvicorn auto_
 
 echo 2. Starting Frontend (Vite - Port 5173)...
 cd frontend
-start "Auto_YT Frontend" cmd /k "npm run dev"
+start "Auto_YT Frontend" cmd /k "npm run dev -- --host 127.0.0.1"
 
 echo All done! Opening browser...
 timeout /t 3 /nobreak >nul

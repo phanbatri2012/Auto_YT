@@ -31,14 +31,17 @@ import auto_yt.services.database as db
 import auto_yt.services.audio_utils as audio_utils
 import auto_yt.services.tts_service as tts
 from auto_yt.services import voice_config
+from auto_yt.services import chatgpt_projects
 import re
 
 # In-memory job store: job_id -> {status, progress, result, error}
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
+_prompts_config_lock = threading.Lock()
 _chatgpt_profile_lock = threading.Lock()
 _chatgpt_state_lock = threading.Lock()
 _chatgpt_operation = ""
+_chatgpt_prompt_version = ""
 CHATGPT_BUSY_ERROR = (
     "ChatGPT đang bận với tác vụ khác. Hãy đợi tác vụ hiện tại hoàn tất."
 )
@@ -63,25 +66,35 @@ def _normalize_thumbnail_urls(value, fallback_url: str = "") -> list[str]:
     ]
 
 
-def _try_start_chatgpt_operation(operation: str) -> bool:
-    global _chatgpt_operation
+def _try_start_chatgpt_operation(
+    operation: str,
+    prompt_version: str = "",
+) -> bool:
+    global _chatgpt_operation, _chatgpt_prompt_version
     if not _chatgpt_profile_lock.acquire(blocking=False):
         return False
     with _chatgpt_state_lock:
         _chatgpt_operation = operation
+        _chatgpt_prompt_version = str(prompt_version or "").strip()
     return True
 
 
 def _finish_chatgpt_operation() -> None:
-    global _chatgpt_operation
+    global _chatgpt_operation, _chatgpt_prompt_version
     with _chatgpt_state_lock:
         _chatgpt_operation = ""
+        _chatgpt_prompt_version = ""
     _chatgpt_profile_lock.release()
 
 
 def _get_chatgpt_operation() -> str:
     with _chatgpt_state_lock:
         return _chatgpt_operation
+
+
+def _get_chatgpt_state() -> tuple[str, str]:
+    with _chatgpt_state_lock:
+        return _chatgpt_operation, _chatgpt_prompt_version
 
 class AccountData(BaseModel):
     email: str = ""
@@ -92,10 +105,28 @@ class AccountData(BaseModel):
 class PromptVersion(BaseModel):
     name: str
     prompts: dict
+    project_url: str = chatgpt_projects.DEFAULT_CHATGPT_PROJECT_URL
+    default_voice_id: str = ""
 
 class PromptsData(BaseModel):
     active_version: str
     versions: dict[str, PromptVersion]
+
+
+class PromptVersionNameData(BaseModel):
+    name: str
+
+
+class PromptProjectData(BaseModel):
+    project_url: str
+
+
+class PromptDefaultVoiceData(BaseModel):
+    voice_id: str = ""
+
+
+class PromptFieldData(BaseModel):
+    value: str
 
 
 class VoiceOptionData(BaseModel):
@@ -794,16 +825,28 @@ def resume_audio_watchers() -> None:
 
 @app.post("/api/process-video")
 def process_video(request: VideoRequest):
+    resolved_prompt_version = request.prompt_version or _get_active_prompt_version_id()
+    requested_voice_id = request.voice_id or _get_prompt_default_voice_id(
+        resolved_prompt_version
+    )
     try:
-        selected_voice = voice_config.get_voice(request.voice_id or "")
+        selected_voice = voice_config.get_voice(requested_voice_id)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not request.voice_id:
+            # A voice may have been removed after it was assigned to this
+            # prompt version. Fall back safely to the global default.
+            selected_voice = voice_config.get_voice()
+        else:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     job_id = uuid.uuid4().hex[:12]
     with _jobs_lock:
         _jobs[job_id] = {"status": "running", "progress": "⏳ Đang khởi động...", "result": None, "error": None}
 
-    if not _try_start_chatgpt_operation("video"):
+    if not _try_start_chatgpt_operation(
+        "video",
+        resolved_prompt_version,
+    ):
         with _jobs_lock:
             _jobs[job_id].update({
                 "status": "error",
@@ -832,7 +875,7 @@ def process_video(request: VideoRequest):
                 full_transcript,
                 INITIAL_GENERATED_SCRIPT,
                 "",
-                request.prompt_version or "default",
+                resolved_prompt_version,
                 selected_voice["id"],
                 selected_voice["name"],
             )
@@ -842,7 +885,7 @@ def process_video(request: VideoRequest):
             update("🤖 ChatGPT đang viết kịch bản (5-15 phút)...")
             worker_result = process_prompt_via_chatgpt(
                 combined_text,
-                request.prompt_version,
+                resolved_prompt_version,
             )
             _finish_chatgpt_operation()
             profile_reserved = False
@@ -885,7 +928,7 @@ def process_video(request: VideoRequest):
                         "full_transcript": full_transcript,
                         "summary": summary_text,
                         "title": title,
-                        "prompt_version": request.prompt_version or "default",
+                        "prompt_version": resolved_prompt_version,
                         "voice_id": selected_voice["id"],
                         "voice_name": selected_voice["name"],
                         "chat_url": chat_url,
@@ -939,10 +982,11 @@ def get_job(job_id: str):
 
 @app.get("/api/chatgpt-status")
 def get_chatgpt_status():
-    operation = _get_chatgpt_operation()
+    operation, prompt_version = _get_chatgpt_state()
     return {
         "busy": _chatgpt_profile_lock.locked(),
         "operation": operation,
+        "prompt_version": prompt_version,
     }
 
 
@@ -1004,7 +1048,10 @@ async def generate_metadata_endpoint(req: GenerateMetadataRequest):
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    if not _try_start_chatgpt_operation("metadata"):
+    if not _try_start_chatgpt_operation(
+        "metadata",
+        video.get("prompt_version", ""),
+    ):
         return {"success": False, "error": CHATGPT_BUSY_ERROR}
 
     try:
@@ -1043,7 +1090,10 @@ async def generate_chapters_endpoint(req: GenerateChaptersRequest):
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    if not _try_start_chatgpt_operation("chapters"):
+    if not _try_start_chatgpt_operation(
+        "chapters",
+        video.get("prompt_version", ""),
+    ):
         return {"success": False, "error": CHATGPT_BUSY_ERROR}
 
     loop = asyncio.get_event_loop()
@@ -1097,20 +1147,30 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
     from auto_yt.services.chatgpt_worker import generate_thumbnails_only
     import concurrent.futures
 
-    if not _try_start_chatgpt_operation("thumbnails"):
+    # Resolve the prompt version before reserving the ChatGPT profile so
+    # Settings can lock only the version used by this thumbnail job.
+    resolved_chat_url = ""
+    resolved_prompt_version = ""
+    if req.video_id:
+        video = db.get_video(req.video_id)
+        if video:
+            resolved_chat_url = video.get("chat_url", "")
+            resolved_prompt_version = video.get("prompt_version", "")
+            print(f"Using chat_url from DB: {resolved_chat_url}")
+    if not resolved_prompt_version:
+        with _prompts_config_lock:
+            resolved_prompt_version = _read_prompts_config().get(
+                "active_version",
+                "default",
+            )
+
+    if not _try_start_chatgpt_operation(
+        "thumbnails",
+        resolved_prompt_version,
+    ):
         return {"success": False, "error": CHATGPT_BUSY_ERROR}
 
     try:
-        # Look up chat_url from DB if video_id provided
-        resolved_chat_url = ""
-        resolved_prompt_version = ""
-        if req.video_id:
-            video = db.get_video(req.video_id)
-            if video:
-                resolved_chat_url = video.get("chat_url", "")
-                resolved_prompt_version = video.get("prompt_version", "")
-                print(f"Using chat_url from DB: {resolved_chat_url}")
-
         loop = asyncio.get_event_loop()
         def generate_requested_thumbnails():
             requested_types = (
@@ -1552,19 +1612,86 @@ def clear_account():
 
 @app.get("/api/prompts")
 def get_prompts():
-    if not PROMPTS_PATH.exists():
-        # Initialize with default if missing
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        PROMPTS_PATH.write_text(json.dumps(DEFAULT_PROMPTS_DATA, ensure_ascii=False, indent=2), encoding="utf-8")
-        return DEFAULT_PROMPTS_DATA
+    with _prompts_config_lock:
+        if not PROMPTS_PATH.exists():
+            # Initialize with default if missing
+            default_data = chatgpt_projects.add_project_defaults(DEFAULT_PROMPTS_DATA)
+            _write_prompts_config(default_data)
+            return default_data
+        return _read_prompts_config()
+
+
+PROMPT_FIELD_KEYS = frozenset(
+    DEFAULT_PROMPTS_DATA["versions"]["default"]["prompts"].keys()
+)
+
+
+def _read_prompts_config() -> dict:
     try:
         data = json.loads(PROMPTS_PATH.read_text(encoding="utf-8"))
-        # Validate structure roughly
-        if "active_version" not in data or "versions" not in data:
-            return DEFAULT_PROMPTS_DATA
-        return data
-    except Exception:
-        return DEFAULT_PROMPTS_DATA
+        if (
+            "active_version" not in data
+            or not isinstance(data.get("versions"), dict)
+            or not data["versions"]
+        ):
+            return chatgpt_projects.add_project_defaults(DEFAULT_PROMPTS_DATA)
+        return chatgpt_projects.add_project_defaults(data)
+    except (OSError, json.JSONDecodeError):
+        return chatgpt_projects.add_project_defaults(DEFAULT_PROMPTS_DATA)
+
+
+def _write_prompts_config(data: dict) -> dict:
+    try:
+        normalized_data = chatgpt_projects.validate_prompt_projects(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PROMPTS_PATH.write_text(
+        json.dumps(normalized_data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return normalized_data
+
+
+def _get_prompt_version(data: dict, version_id: str) -> dict:
+    version = data.get("versions", {}).get(version_id)
+    if not isinstance(version, dict):
+        raise HTTPException(status_code=404, detail="Không tìm thấy bộ prompt.")
+    return version
+
+
+def _get_prompt_default_voice_id(version_id: str = "") -> str:
+    with _prompts_config_lock:
+        data = _read_prompts_config()
+        resolved_version_id = version_id.strip() or data.get(
+            "active_version",
+            "default",
+        )
+        version = data.get("versions", {}).get(resolved_version_id, {})
+        return str(version.get("default_voice_id", "") or "").strip()
+
+
+def _get_active_prompt_version_id() -> str:
+    with _prompts_config_lock:
+        data = _read_prompts_config()
+        active_version = str(data.get("active_version", "default") or "").strip()
+        return active_version or "default"
+
+
+def _get_locked_prompt_version() -> str:
+    _, prompt_version = _get_chatgpt_state()
+    return prompt_version if _chatgpt_profile_lock.locked() else ""
+
+
+def _assert_prompt_version_editable(version_id: str) -> None:
+    if version_id and version_id == _get_locked_prompt_version():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Bộ prompt này đang được một job sử dụng. "
+                "Hãy đợi job hoàn tất hoặc chọn bộ prompt khác để chỉnh sửa."
+            ),
+        )
 
 
 @app.get("/api/voices")
@@ -1575,18 +1702,115 @@ def get_voices():
 @app.post("/api/voices")
 def save_voices(data: VoiceConfigData):
     try:
-        return voice_config.save_voice_config(data.dict())
+        return voice_config.save_voice_config(data.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @app.post("/api/prompts")
 def save_prompts(data: PromptsData):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PROMPTS_PATH.write_text(
-        json.dumps(data.dict(), ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-    return {"success": True}
+    with _prompts_config_lock:
+        incoming_data = data.model_dump()
+        locked_version = _get_locked_prompt_version()
+        if locked_version:
+            saved_data = _read_prompts_config()
+            saved_locked_version = saved_data.get("versions", {}).get(
+                locked_version
+            )
+            if saved_locked_version is not None:
+                # Save additions, deletions and edits to every other version,
+                # while preserving the exact configuration used by the job.
+                incoming_data.setdefault("versions", {})[
+                    locked_version
+                ] = saved_locked_version
+        return _write_prompts_config(incoming_data)
+
+
+@app.patch("/api/prompts/{version_id}/name")
+def save_prompt_version_name(version_id: str, payload: PromptVersionNameData):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Tên bộ prompt không được để trống.")
+    if len(name) > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="Tên bộ prompt không được dài quá 100 ký tự.",
+        )
+    with _prompts_config_lock:
+        _assert_prompt_version_editable(version_id)
+        data = _read_prompts_config()
+        version = _get_prompt_version(data, version_id)
+        version["name"] = name
+        normalized_data = _write_prompts_config(data)
+    return {
+        "version_id": version_id,
+        "version": normalized_data["versions"][version_id],
+    }
+
+
+@app.patch("/api/prompts/{version_id}/project")
+def save_prompt_project(version_id: str, payload: PromptProjectData):
+    with _prompts_config_lock:
+        _assert_prompt_version_editable(version_id)
+        data = _read_prompts_config()
+        version = _get_prompt_version(data, version_id)
+        try:
+            version["project_url"] = chatgpt_projects.validate_project_url(
+                payload.project_url
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        normalized_data = _write_prompts_config(data)
+    return {
+        "version_id": version_id,
+        "version": normalized_data["versions"][version_id],
+    }
+
+
+@app.patch("/api/prompts/{version_id}/default-voice")
+def save_prompt_default_voice(
+    version_id: str,
+    payload: PromptDefaultVoiceData,
+):
+    selected_voice_id = payload.voice_id.strip()
+    if selected_voice_id:
+        try:
+            selected_voice_id = voice_config.get_voice(selected_voice_id)["id"]
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    with _prompts_config_lock:
+        _assert_prompt_version_editable(version_id)
+        data = _read_prompts_config()
+        version = _get_prompt_version(data, version_id)
+        version["default_voice_id"] = selected_voice_id
+        normalized_data = _write_prompts_config(data)
+    return {
+        "version_id": version_id,
+        "version": normalized_data["versions"][version_id],
+    }
+
+
+@app.patch("/api/prompts/{version_id}/fields/{prompt_key}")
+def save_prompt_field(
+    version_id: str,
+    prompt_key: str,
+    payload: PromptFieldData,
+):
+    if prompt_key not in PROMPT_FIELD_KEYS:
+        raise HTTPException(status_code=404, detail="Không tìm thấy menu prompt.")
+    with _prompts_config_lock:
+        _assert_prompt_version_editable(version_id)
+        data = _read_prompts_config()
+        version = _get_prompt_version(data, version_id)
+        prompts = version.get("prompts")
+        if not isinstance(prompts, dict):
+            raise HTTPException(status_code=400, detail="Bộ prompt không hợp lệ.")
+        prompts[prompt_key] = payload.value
+        normalized_data = _write_prompts_config(data)
+    return {
+        "version_id": version_id,
+        "prompt_key": prompt_key,
+        "value": normalized_data["versions"][version_id]["prompts"][prompt_key],
+    }
 
 @app.post("/api/login-chatgpt")
 async def trigger_login():

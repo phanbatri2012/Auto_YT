@@ -11,6 +11,11 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright, Page
 from auto_yt.paths import gpt_profile_dir, PROMPTS_PATH, THUMBNAILS_DIR
 from auto_yt.default_prompts import DEFAULT_PROMPTS_DATA
+from auto_yt.services.chatgpt_projects import (
+    CHATGPT_PROJECT_URL_ENV,
+    DEFAULT_CHATGPT_PROJECT_URL,
+    get_project_url,
+)
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -23,11 +28,6 @@ _HERE = __import__('pathlib').Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parent.parent.parent))
 
 DEFAULT_GPT_PROFILE = "PROFILE_GPT_1"
-CHATGPT_PROJECT_URL_ENV = "CHATGPT_PROJECT_URL"
-DEFAULT_CHATGPT_PROJECT_URL = (
-    "https://chatgpt.com/g/"
-    "g-p-6a1f9204f2d88191b39b64eb7f2dbb97-dd-vn2-phan-tich/project"
-)
 PROFILE_WAIT_TIMEOUT_SECONDS = 20 * 60
 PROFILE_RETRY_INTERVAL_SECONDS = 5
 CHATGPT_RESPONSE_TIMEOUT_SECONDS = 20 * 60
@@ -457,26 +457,8 @@ def append_thumbnail_image_markers(
     return f"{response_text}\n\n{markers}".strip() if markers else response_text
 
 
-def get_chatgpt_project_url() -> str:
-    project_url = os.environ.get(
-        CHATGPT_PROJECT_URL_ENV,
-        DEFAULT_CHATGPT_PROJECT_URL,
-    ).strip()
-    parsed_url = urlparse(project_url)
-    path_parts = parsed_url.path.strip("/").split("/")
-    is_project_url = (
-        parsed_url.scheme == "https"
-        and parsed_url.netloc == "chatgpt.com"
-        and len(path_parts) == 3
-        and path_parts[0] == "g"
-        and path_parts[1].startswith("g-p-")
-        and path_parts[2] == "project"
-    )
-    if not is_project_url:
-        raise ValueError(
-            f"{CHATGPT_PROJECT_URL_ENV} must be a ChatGPT Project URL."
-        )
-    return project_url.rstrip("/")
+def get_chatgpt_project_url(prompt_version: str = "") -> str:
+    return get_project_url(prompt_version)
 
 
 def ensure_expected_project_page(actual_url: str, project_url: str) -> None:
@@ -1338,7 +1320,11 @@ def generate_chapters_only(
         try:
             page = context.pages[0] if context.pages else context.new_page()
             is_original_chat = is_chatgpt_conversation_url(chat_url)
-            target_url = chat_url if is_original_chat else get_chatgpt_project_url()
+            target_url = (
+                chat_url
+                if is_original_chat
+                else get_chatgpt_project_url(prompt_version)
+            )
             page.goto(target_url, wait_until="domcontentloaded")
             if not is_original_chat:
                 ensure_expected_project_page(page.url, target_url)
@@ -1466,7 +1452,11 @@ def generate_thumbnails_only(
         
         # Navigate to the original chat session if URL provided, otherwise open new chat
         is_original_chat = is_chatgpt_conversation_url(chat_url)
-        target_url = chat_url if is_original_chat else get_chatgpt_project_url()
+        target_url = (
+            chat_url
+            if is_original_chat
+            else get_chatgpt_project_url(prompt_version)
+        )
         print(f"    -> Navigating to: {target_url}", file=sys.stderr)
         page.goto(target_url, wait_until="domcontentloaded")
         if not is_original_chat:

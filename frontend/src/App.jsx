@@ -113,11 +113,16 @@ function App() {
   const [videoTitle, setVideoTitle] = useState('')
   const [currentVideoPromptVersion, setCurrentVideoPromptVersion] = useState('')
   const [isCurrentVideoPublished, setIsCurrentVideoPublished] = useState(false)
-  const [chatGptStatus, setChatGptStatus] = useState({ busy: false, operation: '' })
+  const [chatGptStatus, setChatGptStatus] = useState({
+    busy: false,
+    operation: '',
+    promptVersion: ''
+  })
   
   const [promptVersions, setPromptVersions] = useState([])
   const [selectedPromptVersion, setSelectedPromptVersion] = useState('default')
   const [voiceOptions, setVoiceOptions] = useState([])
+  const [globalDefaultVoiceId, setGlobalDefaultVoiceId] = useState('')
   const [selectedVoiceId, setSelectedVoiceId] = useState('')
   const [currentVideoVoiceId, setCurrentVideoVoiceId] = useState('')
   const [currentVideoVoiceName, setCurrentVideoVoiceName] = useState('')
@@ -210,6 +215,40 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (activeView === 'fetcher') {
+      // Settings may have changed the prompt-specific default voice.
+      fetchPromptVersions()
+      fetchVoices()
+    }
+  }, [activeView])
+
+  useEffect(() => {
+    if (!promptVersions.length || !voiceOptions.length) return
+    const selectedVersion = promptVersions.find(
+      version => version.key === selectedPromptVersion
+    )
+    const promptVoiceId = selectedVersion?.defaultVoiceId || ''
+    const promptVoiceExists = voiceOptions.some(
+      voice => voice.id === promptVoiceId
+    )
+    const globalVoiceExists = voiceOptions.some(
+      voice => voice.id === globalDefaultVoiceId
+    )
+    setSelectedVoiceId(
+      promptVoiceExists
+        ? promptVoiceId
+        : globalVoiceExists
+          ? globalDefaultVoiceId
+          : voiceOptions[0].id
+    )
+  }, [
+    selectedPromptVersion,
+    promptVersions,
+    voiceOptions,
+    globalDefaultVoiceId
+  ])
+
+  useEffect(() => {
     const timeoutId = setTimeout(() => {
       setDebouncedSearchQuery(searchQuery.trim())
       setCurrentPage(1)
@@ -247,7 +286,8 @@ function App() {
         if (!stopped) {
           setChatGptStatus({
             busy: Boolean(data.busy),
-            operation: data.operation || ''
+            operation: data.operation || '',
+            promptVersion: data.prompt_version || ''
           })
         }
       } catch {
@@ -319,7 +359,8 @@ function App() {
       if (data.versions) {
         const versionsList = Object.entries(data.versions).map(([key, version]) => ({
           key: key,
-          name: version.name
+          name: version.name,
+          defaultVoiceId: version.default_voice_id || ''
         }));
         setPromptVersions(versionsList);
         setSelectedPromptVersion(data.active_version || 'default');
@@ -337,6 +378,7 @@ function App() {
         throw new Error(data.detail || 'Invalid voice configuration')
       }
       setVoiceOptions(data.voices)
+      setGlobalDefaultVoiceId(data.active_voice_id || data.voices[0]?.id || '')
       setSelectedVoiceId(data.active_voice_id || data.voices[0]?.id || '')
       setRegenerateVoiceId(previousVoiceId =>
         previousVoiceId || data.active_voice_id || data.voices[0]?.id || ''
@@ -969,9 +1011,7 @@ function App() {
           >Auto Login</li>
           <li
             className={`nav-item ${activeView === 'settings' ? 'active' : ''}`}
-            aria-disabled={chatGptControlsDisabled}
-            onClick={() => !chatGptControlsDisabled && setActiveView('settings')}
-            style={chatGptControlsDisabled ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}
+            onClick={() => setActiveView('settings')}
           >Settings</li>
         </ul>
       </aside>
@@ -989,7 +1029,10 @@ function App() {
           {activeView === 'autologin' ? (
             <AutoLogin />
           ) : activeView === 'settings' ? (
-            <Settings />
+            <Settings
+              lockedPromptVersion={chatGptStatus.promptVersion}
+              chatGptOperation={chatGptStatus.operation}
+            />
           ) : activeView === 'dashboard' ? (
             <>
               <h1 className="hero-title">Video Library</h1>

@@ -1,12 +1,16 @@
 import { useState, useEffect } from 'react';
 import './Settings.css';
 
-export default function Settings() {
+export default function Settings({
+  lockedPromptVersion = '',
+  chatGptOperation = ''
+}) {
   const [promptsData, setPromptsData] = useState(null);
   const [voicesData, setVoicesData] = useState(null);
   const [activeVersion, setActiveVersion] = useState('');
   const [loadingMsg, setLoadingMsg] = useState('');
   const [resultMsg, setResultMsg] = useState('');
+  const [savingSection, setSavingSection] = useState('');
 
   useEffect(() => {
     fetchData();
@@ -72,11 +76,58 @@ export default function Settings() {
   };
 
   const handlePromptChange = (key, value) => {
-    setPromptsData(prev => {
-      const newData = { ...prev };
-      newData.versions[activeVersion].prompts[key] = value;
-      return newData;
-    });
+    setPromptsData(prev => ({
+      ...prev,
+      versions: {
+        ...prev.versions,
+        [activeVersion]: {
+          ...prev.versions[activeVersion],
+          prompts: {
+            ...prev.versions[activeVersion].prompts,
+            [key]: value
+          }
+        }
+      }
+    }));
+  };
+
+  const handleVersionNameChange = (value) => {
+    setPromptsData(prev => ({
+      ...prev,
+      versions: {
+        ...prev.versions,
+        [activeVersion]: {
+          ...prev.versions[activeVersion],
+          name: value
+        }
+      }
+    }));
+  };
+
+  const handleProjectUrlChange = (value) => {
+    setPromptsData(prev => ({
+      ...prev,
+      versions: {
+        ...prev.versions,
+        [activeVersion]: {
+          ...prev.versions[activeVersion],
+          project_url: value
+        }
+      }
+    }));
+  };
+
+  const handlePromptDefaultVoiceChange = (voiceId) => {
+    setPromptsData(prev => ({
+      ...prev,
+      versions: {
+        ...prev.versions,
+        [activeVersion]: {
+          ...prev.versions[activeVersion],
+          default_voice_id: voiceId
+        }
+      }
+    }));
   };
 
   const handleVersionChange = (e) => {
@@ -97,6 +148,9 @@ export default function Settings() {
       
       newData.versions[versionId] = {
         name: newName,
+        project_url: newData.versions[activeVersion].project_url,
+        default_voice_id:
+          newData.versions[activeVersion].default_voice_id || '',
         prompts: currentPrompts
       };
       
@@ -107,6 +161,10 @@ export default function Settings() {
   };
 
   const handleDeleteVersion = () => {
+    if (activeVersion === lockedPromptVersion) {
+      alert('Bộ prompt này đang được job sử dụng nên chưa thể xóa.');
+      return;
+    }
     if (Object.keys(promptsData.versions).length <= 1) {
       alert("Không thể xóa phiên bản duy nhất!");
       return;
@@ -127,8 +185,122 @@ export default function Settings() {
     });
   };
 
+  const saveSection = async (sectionKey, loadingText, successText, request) => {
+    try {
+      setSavingSection(sectionKey);
+      setLoadingMsg(loadingText);
+      setResultMsg('');
+      const response = await request();
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.detail || 'Không thể lưu thiết lập.');
+      }
+      setResultMsg(`✅ ${successText}`);
+      return result;
+    } catch (err) {
+      setResultMsg('❌ ' + err.message);
+      return null;
+    } finally {
+      setSavingSection('');
+      setLoadingMsg('');
+    }
+  };
+
+  const handleSaveVersionName = async () => {
+    const versionId = activeVersion;
+    const name = promptsData.versions[versionId].name;
+    const result = await saveSection(
+      'version-name',
+      'Đang lưu tên bộ prompt...',
+      'Đã lưu tên bộ prompt.',
+      () => fetch(`http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/name`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+      })
+    );
+    if (result && activeVersion === versionId) {
+      setPromptsData(prev => ({
+        ...prev,
+        versions: {
+          ...prev.versions,
+          [versionId]: {
+            ...prev.versions[versionId],
+            name: result.version.name
+          }
+        }
+      }));
+    }
+  };
+
+  const handleSaveProject = () => {
+    const versionId = activeVersion;
+    const projectUrl = promptsData.versions[versionId].project_url;
+    return saveSection(
+      'project',
+      'Đang lưu ChatGPT Project...',
+      'Đã lưu ChatGPT Project cho bộ prompt này.',
+      () => fetch(`http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/project`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_url: projectUrl })
+      })
+    );
+  };
+
+  const handleSavePromptDefaultVoice = () => {
+    const versionId = activeVersion;
+    const voiceId = promptsData.versions[versionId].default_voice_id || '';
+    return saveSection(
+      'prompt-default-voice',
+      'Đang lưu giọng mặc định của bộ prompt...',
+      'Đã lưu giọng mặc định của bộ prompt.',
+      () => fetch(
+        `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/default-voice`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ voice_id: voiceId })
+        }
+      )
+    );
+  };
+
+  const handleSaveVoices = async () => {
+    const result = await saveSection(
+      'voices',
+      'Đang lưu danh sách giọng...',
+      'Đã lưu danh sách và giọng mặc định.',
+      () => fetch('http://127.0.0.1:8080/api/voices', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(voicesData)
+      })
+    );
+    if (result) setVoicesData(result);
+  };
+
+  const handleSavePrompt = (promptKey, promptLabel) => {
+    const versionId = activeVersion;
+    const value = promptsData.versions[versionId].prompts[promptKey] || '';
+    return saveSection(
+      `prompt-${promptKey}`,
+      `Đang lưu ${promptLabel}...`,
+      `Đã lưu ${promptLabel}.`,
+      () => fetch(
+        `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/fields/${encodeURIComponent(promptKey)}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value })
+        }
+      )
+    );
+  };
+
   const handleSave = async () => {
     try {
+      setSavingSection('all');
       setLoadingMsg('Đang lưu thiết lập...');
       setResultMsg('');
       const voicesResponse = await fetch('http://127.0.0.1:8080/api/voices', {
@@ -148,12 +320,18 @@ export default function Settings() {
         body: JSON.stringify(promptsData)
       });
       if (!promptsResponse.ok) {
-        throw new Error('Không thể lưu cấu hình prompt.');
+        const promptsResult = await promptsResponse.json();
+        throw new Error(promptsResult.detail || 'Không thể lưu cấu hình prompt.');
       }
-      setResultMsg('✅ Đã lưu cấu hình Prompt và giọng đọc thành công!');
+      setResultMsg(
+        lockedPromptVersion
+          ? '✅ Đã lưu các thiết lập khác. Bộ prompt đang chạy được giữ nguyên.'
+          : '✅ Đã lưu cấu hình Prompt và giọng đọc thành công!'
+      );
     } catch (err) {
       setResultMsg('❌ ' + err.message);
     } finally {
+      setSavingSection('');
       setLoadingMsg('');
     }
   };
@@ -163,6 +341,20 @@ export default function Settings() {
   }
 
   const currentVersion = promptsData.versions[activeVersion];
+  const activeVersionLocked = Boolean(
+    lockedPromptVersion && activeVersion === lockedPromptVersion
+  );
+  const lockedVersionName = lockedPromptVersion
+    ? promptsData.versions[lockedPromptVersion]?.name || lockedPromptVersion
+    : '';
+  const globalDefaultVoice = voicesData.voices.find(
+    voice => voice.id === voicesData.active_voice_id
+  );
+  const promptDefaultVoiceId = currentVersion.default_voice_id || '';
+  const promptDefaultVoiceMissing = Boolean(
+    promptDefaultVoiceId &&
+    !voicesData.voices.some(voice => voice.id === promptDefaultVoiceId)
+  );
 
   const promptFields = [
     { key: 'outline', label: '1. Dàn ý (Outline)', help: 'Biến có sẵn: {transcript}' },
@@ -182,23 +374,131 @@ export default function Settings() {
           <h1 className="hero-title">Prompt Management</h1>
           <p className="hero-subtitle">Quản lý và chỉnh sửa các lệnh AI hệ thống sử dụng.</p>
         </div>
-        <button className="btn-save btn-large" onClick={handleSave} style={{padding: '15px 30px', fontSize: '1.1em'}}>💾 Lưu Tất Cả</button>
+        <button
+          className="btn-save btn-large"
+          onClick={handleSave}
+          disabled={Boolean(savingSection)}
+          style={{padding: '15px 30px', fontSize: '1.1em'}}
+        >
+          💾 Lưu Tất Cả
+        </button>
       </div>
+
+      {lockedPromptVersion && (
+        <div className="prompt-lock-notice" role="status">
+          🔒 Job {chatGptOperation || 'ChatGPT'} đang dùng bộ prompt
+          <strong> {lockedVersionName}</strong>. Chỉ bộ này tạm khóa; bạn vẫn có
+          thể quản lý các bộ prompt khác và danh sách giọng đọc.
+        </div>
+      )}
       
       <div className="version-control">
-        <div style={{display: 'flex', alignItems: 'center', gap: '10px'}}>
+        <div className="version-editor">
           <label style={{color: '#fff', fontWeight: 'bold'}}>Phiên bản hiện tại:</label>
           <select value={activeVersion} onChange={handleVersionChange} className="version-select">
             {Object.entries(promptsData.versions).map(([key, version]) => (
               <option key={key} value={key}>{version.name}</option>
             ))}
           </select>
+          <input
+            value={currentVersion.name}
+            onChange={(event) => handleVersionNameChange(event.target.value)}
+            placeholder="Tên bộ prompt"
+            className="version-select version-name-input"
+            maxLength={100}
+            disabled={activeVersionLocked}
+          />
+          <button
+            className="btn-save section-save-button"
+            onClick={handleSaveVersionName}
+            disabled={Boolean(savingSection) || activeVersionLocked}
+          >
+            💾 Lưu tên
+          </button>
         </div>
         
         <div style={{display: 'flex', gap: '10px'}}>
           <button className="btn-secondary" onClick={handleDuplicateVersion}>➕ Tạo Bản Sao</button>
-          <button className="btn-danger" onClick={handleDeleteVersion}>🗑️ Xóa Bản Này</button>
+          <button
+            className="btn-danger"
+            onClick={handleDeleteVersion}
+            disabled={activeVersionLocked}
+            title={
+              activeVersionLocked
+                ? 'Bộ prompt này đang được job sử dụng'
+                : 'Xóa bộ prompt hiện tại'
+            }
+          >
+            🗑️ Xóa Bản Này
+          </button>
         </div>
+      </div>
+
+      <div className="prompt-item" style={{ marginBottom: '20px' }}>
+        <div className="prompt-header">
+          <div>
+            <label>🎙️ Giọng mặc định của bộ prompt</label>
+            <div className="help-text" style={{ marginTop: '5px' }}>
+              Video Fetcher sẽ tự chọn giọng này khi bạn chọn bộ prompt.
+              Bạn vẫn có thể đổi giọng thủ công trước khi tạo từng video.
+            </div>
+          </div>
+          <button
+            className="btn-save section-save-button"
+            onClick={handleSavePromptDefaultVoice}
+            disabled={Boolean(savingSection) || activeVersionLocked}
+          >
+            💾 Lưu
+          </button>
+        </div>
+        <select
+          value={promptDefaultVoiceId}
+          onChange={(event) => handlePromptDefaultVoiceChange(event.target.value)}
+          className="version-select"
+          style={{ width: '100%', marginTop: '12px' }}
+          disabled={activeVersionLocked}
+        >
+          <option value="">
+            Dùng giọng mặc định chung
+            {globalDefaultVoice ? ` — ${globalDefaultVoice.name}` : ''}
+          </option>
+          {promptDefaultVoiceMissing && (
+            <option value={promptDefaultVoiceId}>
+              ⚠️ Giọng đã bị xóa — sẽ dùng giọng mặc định chung
+            </option>
+          )}
+          {voicesData.voices.map(voice => (
+            <option key={voice.id} value={voice.id}>
+              {voice.name}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div className="prompt-item" style={{ marginBottom: '20px' }}>
+        <div className="prompt-header">
+          <div>
+            <label>🌐 ChatGPT Project viết kịch bản</label>
+            <div className="help-text" style={{ marginTop: '5px' }}>
+              Mỗi bộ prompt có thể lưu kịch bản vào một ChatGPT Project riêng.
+            </div>
+          </div>
+          <button
+            className="btn-save section-save-button"
+            onClick={handleSaveProject}
+            disabled={Boolean(savingSection) || activeVersionLocked}
+          >
+            💾 Lưu
+          </button>
+        </div>
+        <input
+          value={currentVersion.project_url || ''}
+          onChange={(event) => handleProjectUrlChange(event.target.value)}
+          placeholder="https://chatgpt.com/g/g-p-.../project"
+          className="version-select"
+          style={{ width: '100%', marginTop: '12px' }}
+          disabled={activeVersionLocked}
+        />
       </div>
 
       <div className="prompt-item" style={{ marginBottom: '20px' }}>
@@ -206,12 +506,21 @@ export default function Settings() {
           <div>
             <label>🎙️ Quản lý giọng đọc Genmax</label>
             <div className="help-text" style={{ marginTop: '5px' }}>
-              Đặt tên dễ nhớ và nhập đúng Voice ID từ Genmax.
+              Nhập UUID của giọng tùy chỉnh hoặc mã giọng hệ thống từ Genmax.
             </div>
           </div>
-          <button className="btn-secondary" onClick={handleAddVoice}>
-            ➕ Thêm giọng
-          </button>
+          <div className="prompt-header-actions">
+            <button
+              className="btn-save section-save-button"
+              onClick={handleSaveVoices}
+              disabled={Boolean(savingSection)}
+            >
+              💾 Lưu
+            </button>
+            <button className="btn-secondary" onClick={handleAddVoice}>
+              ➕ Thêm giọng
+            </button>
+          </div>
         </div>
 
         <div style={{
@@ -219,7 +528,7 @@ export default function Settings() {
           margin: '15px 0', flexWrap: 'wrap'
         }}>
           <label style={{ color: '#fff', fontWeight: 'bold' }}>
-            Giọng mặc định:
+            Giọng mặc định chung (dự phòng):
           </label>
           <select
             value={voicesData.active_voice_id}
@@ -258,7 +567,7 @@ export default function Settings() {
               <input
                 value={voice.id}
                 onChange={(event) => handleVoiceChange(index, 'id', event.target.value)}
-                placeholder="Voice ID (UUID)"
+                placeholder="Voice ID (UUID hoặc mã giọng hệ thống)"
                 className="version-select"
                 style={{ width: '100%' }}
               />
@@ -286,13 +595,23 @@ export default function Settings() {
           <div key={field.key} className="prompt-item">
             <div className="prompt-header">
               <label>{field.label}</label>
-              {field.help && <span className="help-text">{field.help}</span>}
+              <div className="prompt-header-actions">
+                {field.help && <span className="help-text">{field.help}</span>}
+                <button
+                  className="btn-save section-save-button"
+                  onClick={() => handleSavePrompt(field.key, field.label)}
+                  disabled={Boolean(savingSection) || activeVersionLocked}
+                >
+                  💾 Lưu
+                </button>
+              </div>
             </div>
             <textarea
               className="prompt-textarea"
               value={currentVersion.prompts[field.key] || ''}
               onChange={(e) => handlePromptChange(field.key, e.target.value)}
               rows={6}
+              disabled={activeVersionLocked}
             />
           </div>
         ))}

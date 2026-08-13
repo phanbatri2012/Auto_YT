@@ -18,6 +18,20 @@
   gap: 15px;
 }
 
+.prompt-lock-notice {
+  margin-top: 20px;
+  padding: 12px 15px;
+  border: 1px solid #d89b22;
+  border-radius: 10px;
+  background: rgba(216, 155, 34, 0.12);
+  color: #f3cd7a;
+  line-height: 1.5;
+}
+
+.prompt-lock-notice strong {
+  color: #fff;
+}
+
 .version-select {
   background-color: #222;
   color: #fff;
@@ -31,6 +45,17 @@
 .version-select:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+.version-editor {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.version-name-input {
+  min-width: 240px;
 }
 
 .prompts-list {
@@ -51,6 +76,23 @@
   justify-content: space-between;
   align-items: center;
   margin-bottom: 12px;
+}
+
+.prompt-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.section-save-button {
+  white-space: nowrap;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .prompt-header label {
@@ -87,7 +129,27 @@
   box-shadow: 0 0 0 2px rgba(243, 156, 18, 0.2);
 }
 
+.prompt-textarea:disabled,
+.version-select:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
 .btn-large {
   padding: 12px 24px;
   font-size: 1.05rem;
+}
+
+@media (max-width: 720px) {
+  .version-editor,
+  .version-editor .version-select,
+  .version-name-input {
+    width: 100%;
+  }
+
+  .prompt-header {
+    align-items: flex-start;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
 }

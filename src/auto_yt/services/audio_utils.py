@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import os
+import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
 
 DOWNLOAD_TIMEOUT_SECONDS = 90
 MAX_SPEECH_WORDS_PER_SECOND = 6.0
+FILE_REPLACE_RETRY_ATTEMPTS = 20
+FILE_REPLACE_RETRY_DELAY_SECONDS = 0.05
 
 _MPEG1_BITRATES = {
     1: (0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448),
@@ -161,6 +165,17 @@ def validate_spoken_duration(text: str, duration_seconds: float) -> None:
         )
 
 
+def _replace_file_with_retry(source_path: Path, output_path: Path) -> None:
+    for attempt in range(FILE_REPLACE_RETRY_ATTEMPTS):
+        try:
+            os.replace(source_path, output_path)
+            return
+        except PermissionError:
+            if attempt == FILE_REPLACE_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(FILE_REPLACE_RETRY_DELAY_SECONDS)
+
+
 def merge_remote_mp3_files(
     audio_urls: list[str],
     output_path: Path,
@@ -172,12 +187,19 @@ def merge_remote_mp3_files(
         raise ValueError("Each audio URL must have matching expected text.")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    temporary_path = None
     expected_encoding = None
     total_duration = 0.0
 
     try:
-        with temporary_path.open("wb") as output_file:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=output_path.parent,
+            prefix=f"{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output_file:
+            temporary_path = Path(output_file.name)
             for index, audio_url in enumerate(audio_urls):
                 frames, duration_seconds, encoding = extract_mp3_audio_frames(
                     download_audio(audio_url)
@@ -195,9 +217,10 @@ def merge_remote_mp3_files(
                     )
                 output_file.write(frames)
                 total_duration += duration_seconds
-        os.replace(temporary_path, output_path)
+        _replace_file_with_retry(temporary_path, output_path)
     except Exception:
-        temporary_path.unlink(missing_ok=True)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
         raise
 
     return total_duration

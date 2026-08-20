@@ -587,6 +587,11 @@ def upsert_audio_task(
                 ELSE audio_tasks.voice_name
             END,
             updated_at = excluded.updated_at
+        WHERE NOT (
+            audio_tasks.status = 'completed'
+            AND audio_tasks.request_hash = excluded.request_hash
+            AND excluded.status != 'completed'
+        )
         ''',
         (
             video_id,

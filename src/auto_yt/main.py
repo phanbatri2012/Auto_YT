@@ -271,6 +271,8 @@ AUDIO_INTERRUPTED_STATUS = "interrupted"
 _audio_submit_lock = threading.Lock()
 _audio_watchers: dict[int, threading.Thread] = {}
 _audio_watchers_lock = threading.Lock()
+_audio_sync_locks: dict[int, threading.Lock] = {}
+_audio_sync_locks_guard = threading.Lock()
 
 
 def _audio_task_response(task: dict) -> dict:
@@ -335,7 +337,19 @@ def _save_audio_url(
     return updated_script
 
 
+def _get_audio_sync_lock(video_id: int) -> threading.Lock:
+    with _audio_sync_locks_guard:
+        return _audio_sync_locks.setdefault(video_id, threading.Lock())
+
+
 def _sync_audio_task(video_id: int) -> dict:
+    # The background watcher and frontend status polling can run at the same
+    # time. Only one of them may fetch/merge/write a video's audio at once.
+    with _get_audio_sync_lock(video_id):
+        return _sync_audio_task_unlocked(video_id)
+
+
+def _sync_audio_task_unlocked(video_id: int) -> dict:
     stored_task = db.get_audio_task(video_id)
     if not stored_task:
         raise RuntimeError("Không tìm thấy audio task.")
@@ -392,13 +406,21 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
     video_id = stored_task["video_id"]
     task_voice_id = stored_task.get("voice_id") or AUDIO_VOICE_ID
     task_voice_name = stored_task.get("voice_name", "")
+    sync_errors = []
     for segment in segments:
         if segment.get("status") not in {"pending", "processing"}:
             continue
         task_id = segment.get("task_id", "")
         if not task_id:
             continue
-        remote_task = tts.get_tts_task(task_id)
+        try:
+            remote_task = tts.get_tts_task(task_id)
+        except Exception as exc:
+            # Preserve progress from every other segment. A transient failure
+            # must not discard a whole polling cycle and leave the UI stale.
+            sync_errors.append((segment.get("index", 0), str(exc)))
+            segment["error"] = f"Tạm thời chưa đồng bộ được: {exc}"
+            continue
         segment["status"] = remote_task.get("status", segment["status"])
         segment["audio_url"] = (
             (remote_task.get("result") or {}).get("audio_url", "")
@@ -418,7 +440,12 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
         for segment in segments
     )
     status = "processing"
-    error = ""
+    error = (
+        "Tạm thời chưa đồng bộ được đoạn: "
+        + ", ".join(str(index + 1) for index, _ in sync_errors)
+        if sync_errors
+        else ""
+    )
     audio_url = ""
 
     if failed_segments:
@@ -1355,7 +1382,18 @@ def get_audio_status(video_id: int):
     task = db.get_audio_task(video_id)
     if task:
         if task["status"] in {"pending", "processing"}:
-            _start_audio_watcher(video_id)
+            try:
+                # Status polling is also a recovery path. This updates local
+                # state immediately when Genmax has finished, even if a
+                # background watcher previously hit a transient API error.
+                task = _sync_audio_task(video_id)
+            except Exception as exc:
+                print(
+                    f"On-demand audio sync failed for video {video_id}: {exc}",
+                    file=sys.stderr,
+                )
+            if task["status"] in {"pending", "processing"}:
+                _start_audio_watcher(video_id)
         return {"success": True, "audio_task": _audio_task_response(task)}
 
     script = video["generated_script"]

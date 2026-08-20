@@ -3,3 +3,7 @@ playwright>=1.40
 pyotp>=2.9
 asyncpg>=0.29
 truststore>=0.10
+
+fastapi
+uvicorn
+youtube_transcript_api

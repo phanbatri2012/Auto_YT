@@ -1,6 +1,8 @@
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from unittest.mock import patch
 from pathlib import Path
 
@@ -115,6 +117,102 @@ class LongAudioTests(unittest.TestCase):
         self.assertEqual(result["status"], main.AUDIO_INTERRUPTED_STATUS)
         self.assertIn("Còn 1 phần chưa gửi", result["error"])
         self.assertEqual(main._audio_task_response(result)["missing_segments"], 1)
+
+    def test_transient_segment_error_preserves_other_segment_progress(self):
+        segments = [
+            {
+                "index": 0,
+                "task_id": "task-1",
+                "status": "processing",
+                "audio_url": "",
+            },
+            {
+                "index": 1,
+                "task_id": "task-2",
+                "status": "processing",
+                "audio_url": "",
+            },
+        ]
+        stored_task = {
+            "video_id": 70,
+            "request_hash": "request-hash",
+            "task_id": "batch-request-hash",
+            "status": "processing",
+            "audio_url": "",
+            "error": "",
+            "updated_at": "2026-08-08T00:00:00+00:00",
+            "segments_json": json.dumps(segments),
+        }
+
+        def store_task(**kwargs):
+            return {
+                **kwargs,
+                "updated_at": "2026-08-08T00:00:00+00:00",
+            }
+
+        with (
+            patch.object(
+                main.tts,
+                "get_tts_task",
+                side_effect=[
+                    {
+                        "status": "completed",
+                        "result": {"audio_url": "https://audio/1.mp3"},
+                    },
+                    RuntimeError("temporary API timeout"),
+                ],
+            ),
+            patch.object(
+                main.db,
+                "upsert_audio_task",
+                side_effect=store_task,
+            ),
+        ):
+            result = main._sync_batch_audio_task(stored_task, segments)
+
+        saved_segments = json.loads(result["segments_json"])
+        self.assertEqual(result["status"], "processing")
+        self.assertIn("đoạn: 2", result["error"])
+        self.assertEqual(saved_segments[0]["status"], "completed")
+        self.assertEqual(
+            saved_segments[0]["audio_url"],
+            "https://audio/1.mp3",
+        )
+        self.assertEqual(saved_segments[1]["status"], "processing")
+
+    def test_audio_status_poll_synchronizes_pending_task_immediately(self):
+        pending_task = {
+            "video_id": 70,
+            "request_hash": "request-hash",
+            "task_id": "task-1",
+            "status": "pending",
+            "audio_url": "",
+            "error": "",
+            "updated_at": "2026-08-08T00:00:00+00:00",
+            "segments_json": "",
+        }
+        completed_task = {
+            **pending_task,
+            "status": "completed",
+            "audio_url": "http://127.0.0.1:8080/api/audio/video_70.mp3",
+        }
+        with (
+            patch.object(main.db, "get_video", return_value={
+                "generated_script": "### [BODY]\nNội dung",
+            }),
+            patch.object(main.db, "get_audio_task", return_value=pending_task),
+            patch.object(
+                main,
+                "_sync_audio_task",
+                return_value=completed_task,
+            ) as sync_task,
+            patch.object(main, "_start_audio_watcher") as start_watcher,
+        ):
+            result = main.get_audio_status(70)
+
+        sync_task.assert_called_once_with(70)
+        start_watcher.assert_not_called()
+        self.assertEqual(result["audio_task"]["status"], "completed")
 
     def test_interrupted_batch_submits_only_missing_segments(self):
         chunks = ["Đoạn đã hoàn thành.", "Đoạn còn thiếu."]
@@ -267,6 +365,34 @@ class LongAudioTests(unittest.TestCase):
             self.assertEqual(output_path.stat().st_size, frame_length * 10)
             self.assertAlmostEqual(duration_seconds, 10 * 1152 / 44100, places=5)
 
+    def test_concurrent_merges_use_separate_temporary_files(self):
+        data, frame_length = self._build_test_mp3(4)
+        downloads_started = Barrier(2)
+
+        def download_at_same_time(_audio_url):
+            downloads_started.wait(timeout=2)
+            return data
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "merged.mp3"
+            with patch.object(
+                audio_utils,
+                "download_audio",
+                side_effect=download_at_same_time,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    results = list(executor.map(
+                        lambda _: audio_utils.merge_remote_mp3_files(
+                            ["https://audio/segment"],
+                            output_path,
+                        ),
+                        range(2),
+                    ))
+
+            self.assertEqual(output_path.stat().st_size, frame_length * 4)
+            self.assertEqual(len(results), 2)
+            self.assertFalse(list(output_path.parent.glob("*.tmp")))
+
     def test_audio_segment_manifest_round_trips_through_database(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_database = Path(temporary_directory) / "database.db"
@@ -288,6 +414,49 @@ class LongAudioTests(unittest.TestCase):
                 )
 
                 self.assertEqual(task["segments_json"], segments_json)
+
+    def test_stale_sync_cannot_downgrade_completed_audio_task(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_database = Path(temporary_directory) / "database.db"
+            with patch.object(database, "DB_PATH", temporary_database):
+                database.init_db()
+                video_id = database.save_video(
+                    "https://youtube.test/video",
+                    "Title",
+                    "Transcript",
+                    "Script",
+                )
+                database.upsert_audio_task(
+                    video_id,
+                    "request-hash",
+                    "batch-request-hash",
+                    "completed",
+                    audio_url="http://audio/complete.mp3",
+                )
+
+                stale_result = database.upsert_audio_task(
+                    video_id,
+                    "request-hash",
+                    "batch-request-hash",
+                    "processing",
+                    error="temporary timeout",
+                )
+
+                self.assertEqual(stale_result["status"], "completed")
+                self.assertEqual(
+                    stale_result["audio_url"],
+                    "http://audio/complete.mp3",
+                )
+
+                new_request = database.upsert_audio_task(
+                    video_id,
+                    "new-request-hash",
+                    "batch-new-request-hash",
+                    "pending",
+                )
+
+                self.assertEqual(new_request["status"], "pending")
+                self.assertEqual(new_request["request_hash"], "new-request-hash")
 
     def test_implausibly_short_audio_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "incomplete audio"):

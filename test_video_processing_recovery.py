@@ -3,8 +3,8 @@ from unittest.mock import patch
 
 from auto_yt import main
 from auto_yt.services.chatgpt_worker import (
-    get_minimum_body_part_chars,
     is_core_script_complete,
+    select_reusable_outline_response,
     split_outline_parts,
 )
 
@@ -49,19 +49,31 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
             " ".join("\n".join(outline_lines).split()),
         )
 
-    def test_short_core_script_is_not_eligible_for_audio(self):
+    def test_completed_late_outline_is_reused_from_the_same_chat(self):
+        turns = [
+            ("user", "Tạo dàn ý"),
+            ("assistant", ""),
+            ("assistant", "[PHAN]\nPhần một\n\n[PHAN]\nPhần hai"),
+        ]
+
+        response = select_reusable_outline_response(turns)
+
+        self.assertIn("Phần một", response)
+        self.assertEqual(len(split_outline_parts(response)), 2)
+
+    def test_core_completion_depends_on_sections_not_a_length_threshold(self):
         transcript = "x" * 10000
         state = {
-            "intro": "i" * 1000,
-            "body_parts": ["b" * 1000],
-            "outro": "o" * 1000,
+            "intro": "Intro",
+            "body_parts": ["Body"],
+            "outro": "Outro",
             "expected_body_parts": 1,
         }
 
-        self.assertFalse(is_core_script_complete(transcript, state))
-
-        state["body_parts"] = ["b" * 5500]
         self.assertTrue(is_core_script_complete(transcript, state))
+
+        state["body_parts"] = []
+        self.assertFalse(is_core_script_complete(transcript, state))
 
     def test_video_without_voice_uses_prompt_default_voice(self):
         prompt_voice_id = "a39e4493-3a8a-4be8-bd13-b96f2f5c4906"
@@ -86,14 +98,29 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
 
         self.get_voice.assert_called_once_with(prompt_voice_id)
 
-    def test_body_target_scales_with_transcript_and_number_of_parts(self):
-        minimum_chars = get_minimum_body_part_chars(
-            transcript="x" * 72000,
-            intro="i" * 2000,
-            body_part_count=8,
-        )
+    def test_continue_accepts_chat_checkpoint_before_outline_was_saved(self):
+        video = {
+            "id": 80,
+            "title": "Title",
+            "transcript": "Transcript",
+            "prompt_version": "version-key",
+        }
+        with (
+            patch.object(main.db, "get_video", return_value=video),
+            patch.object(
+                main,
+                "load_checkpoint",
+                return_value={
+                    "chat_url": "https://chatgpt.com/c/created-chat",
+                    "outline_parts": [],
+                },
+            ),
+            patch.object(main, "_try_start_chatgpt_operation", return_value=False),
+        ):
+            response = main.continue_video_generation(80)
 
-        self.assertGreaterEqual(minimum_chars, 6100)
+        self.assertIn("job_id", response)
+        self.assertEqual(main._jobs[response["job_id"]]["status"], "error")
 
     def test_partial_body_is_saved_as_draft_without_audio_submission(self):
         partial_script = (

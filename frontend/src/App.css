@@ -253,6 +253,222 @@
   background: rgba(255,255,255,0.1);
 }
 
+/* YouTube Downloader */
+.downloader-input-group {
+  margin-bottom: 24px;
+}
+
+.downloader-input-group button:disabled,
+.downloader-download-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.downloader-error {
+  margin-bottom: 20px;
+  padding: 12px 16px;
+  border: 1px solid rgba(239, 68, 68, 0.45);
+  border-radius: 10px;
+  background: rgba(239, 68, 68, 0.1);
+  color: #fca5a5;
+}
+
+.downloader-panel {
+  padding: 20px;
+}
+
+.downloader-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.downloader-select-all {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.downloader-toolbar input,
+.downloader-video-card > input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+.downloader-download-button {
+  min-height: 42px;
+  margin-left: auto;
+  padding: 10px 20px;
+}
+
+.downloader-destination,
+.downloader-summary {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.downloader-summary {
+  color: #a7f3d0;
+}
+
+.downloader-progress-track {
+  width: 100%;
+  height: 8px;
+  margin-top: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.downloader-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #14b8a6, #8b5cf6);
+  transition: width 0.25s ease;
+}
+
+.downloader-progress-track.item {
+  height: 5px;
+  margin-top: 0;
+}
+
+.downloader-controls {
+  display: flex;
+  gap: 10px;
+  margin: 12px 0 4px;
+}
+
+.downloader-controls button {
+  padding: 9px 16px;
+  border: 1px solid rgba(45, 212, 191, 0.55);
+  border-radius: 8px;
+  background: rgba(13, 148, 136, 0.18);
+  color: #99f6e4;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.downloader-controls button.danger {
+  border-color: rgba(248, 113, 113, 0.6);
+  background: rgba(220, 38, 38, 0.16);
+  color: #fca5a5;
+}
+
+.downloader-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 620px;
+  margin-top: 16px;
+  overflow-y: auto;
+}
+
+.downloader-video-card {
+  display: grid;
+  grid-template-columns: 24px 144px minmax(0, 1fr);
+  align-items: center;
+  gap: 14px;
+  padding: 12px;
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.025);
+  cursor: pointer;
+}
+
+.downloader-video-card:hover {
+  border-color: rgba(139, 92, 246, 0.55);
+  background: rgba(139, 92, 246, 0.06);
+}
+
+.downloader-thumbnail {
+  width: 144px;
+  aspect-ratio: 16 / 9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-secondary);
+}
+
+.downloader-thumbnail img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.downloader-video-info {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.downloader-video-info > strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.downloader-video-info > span {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.downloader-item-status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #fbbf24;
+  font-size: 13px;
+}
+
+.downloader-item-status.completed {
+  color: #34d399;
+}
+
+.downloader-item-status.failed {
+  color: #f87171;
+}
+
+.downloader-item-status.stopped {
+  color: #fbbf24;
+}
+
+.downloader-item-status small {
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+  .downloader-video-card {
+    grid-template-columns: 24px 96px minmax(0, 1fr);
+  }
+
+  .downloader-thumbnail {
+    width: 96px;
+  }
+
+  .downloader-download-button {
+    width: 100%;
+    margin-left: 0;
+    justify-content: center;
+  }
+}
+
 @keyframes slideDown {
   from {
     opacity: 0;

@@ -10,6 +10,14 @@ data/
 *.log
 /temp_*
 /debug_*
+/.cookies.txt
+/cookies.txt
+/page.html
+/job.json
+/check_*.py
+/debug.py
+/find_caps.py
+/*.vtt
 /*.png
 *.zip
 

@@ -8,11 +8,13 @@ from playwright.sync_api import Error as PlaywrightError
 from auto_yt import main
 from auto_yt.services.chatgpt_worker import (
     CHATGPT_RESPONSE_TIMEOUT_SECONDS,
+    ChatGPTGenerationTimeoutError,
     THUMBNAIL_REGENERATE_PROMPT,
     THUMBNAIL_REPAIR_PROMPT,
     build_thumbnail_generation_prompt,
     ensure_prompt_editor_integrity,
     ensure_expected_conversation_page,
+    get_new_assistant_response,
     get_video_thumbnail_chat_url,
     is_thumbnail_generation_error_response,
     prompt_text_matches,
@@ -21,6 +23,7 @@ from auto_yt.services.chatgpt_worker import (
     send_thumbnail_prompt,
     select_thumbnail_response_turn_number,
     validate_prompt_text,
+    wait_for_assistant_response,
     wait_for_thumbnail_image,
     wait_for_thumbnail_images,
 )
@@ -486,13 +489,7 @@ class ThumbnailGenerationTests(unittest.TestCase):
         page.locator.side_effect = lambda selector: (
             prompt_locator if selector == "#prompt-textarea" else send_locator
         )
-        page.wait_for_function.side_effect = (
-            None,
-            None,
-            None,
-            None,
-            TimeoutError("generation is still running"),
-        )
+        page.wait_for_function.side_effect = (None, None, None)
 
         with (
             patch("auto_yt.services.chatgpt_worker.time.sleep"),
@@ -503,16 +500,18 @@ class ThumbnailGenerationTests(unittest.TestCase):
             patch(
                 "auto_yt.services.chatgpt_worker.wait_for_conversation_history"
             ) as wait_for_history,
+            patch(
+                "auto_yt.services.chatgpt_worker.wait_for_assistant_response",
+                side_effect=ChatGPTGenerationTimeoutError(
+                    "generation is still running. No next prompt was sent."
+                ),
+            ) as wait_for_response,
             self.assertRaisesRegex(Exception, "No next prompt was sent"),
         ):
             send_prompt(page, "next prompt")
 
         wait_for_history.assert_called_once_with(page)
-        finish_wait = page.wait_for_function.call_args_list[4]
-        self.assertEqual(
-            finish_wait.kwargs["timeout"],
-            CHATGPT_RESPONSE_TIMEOUT_SECONDS * 1000,
-        )
+        wait_for_response.assert_called_once()
 
     def test_empty_text_response_stops_the_workflow(self):
         page = MagicMock()
@@ -528,18 +527,13 @@ class ThumbnailGenerationTests(unittest.TestCase):
         )
 
         with (
-            patch("auto_yt.services.chatgpt_worker.time.sleep"),
-            patch(
-                "auto_yt.services.chatgpt_worker.time.time",
-                side_effect=(0, 31),
-            ),
             patch(
                 "auto_yt.services.chatgpt_worker.get_latest_conversation_turn",
                 return_value=10,
             ),
             patch(
-                "auto_yt.services.chatgpt_worker.get_new_assistant_response",
-                return_value="",
+                "auto_yt.services.chatgpt_worker.wait_for_assistant_response",
+                side_effect=RuntimeError("ChatGPT returned no readable text"),
             ),
             patch(
                 "auto_yt.services.chatgpt_worker.wait_for_conversation_history"
@@ -562,13 +556,12 @@ class ThumbnailGenerationTests(unittest.TestCase):
         )
 
         with (
-            patch("auto_yt.services.chatgpt_worker.time.sleep"),
             patch(
                 "auto_yt.services.chatgpt_worker.get_latest_conversation_turn",
                 return_value=10,
             ),
             patch(
-                "auto_yt.services.chatgpt_worker.get_new_assistant_response",
+                "auto_yt.services.chatgpt_worker.wait_for_assistant_response",
                 return_value="",
             ),
             patch(
@@ -582,6 +575,97 @@ class ThumbnailGenerationTests(unittest.TestCase):
             )
 
         self.assertEqual(response, "")
+
+    def test_response_wait_handles_a_late_reply_without_a_stop_button(self):
+        page = MagicMock()
+        with (
+            patch(
+                "auto_yt.services.chatgpt_worker.is_chatgpt_generation_active",
+                return_value=False,
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.get_new_assistant_response",
+                side_effect=("", "", "[PHAN]\nDàn ý", "[PHAN]\nDàn ý"),
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.time.monotonic",
+                side_effect=(0, 0.5, 1, 2, 7.1),
+            ),
+            patch("auto_yt.services.chatgpt_worker.time.sleep"),
+        ):
+            response = wait_for_assistant_response(page, 2, timeout=20)
+
+        self.assertEqual(response, "[PHAN]\nDàn ý")
+
+    def test_response_wait_does_not_advance_while_chatgpt_is_busy(self):
+        page = MagicMock()
+        with (
+            patch(
+                "auto_yt.services.chatgpt_worker.is_chatgpt_generation_active",
+                return_value=True,
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.get_new_assistant_response",
+                return_value="Phản hồi chưa hoàn tất",
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker.time.monotonic",
+                side_effect=(0, CHATGPT_RESPONSE_TIMEOUT_SECONDS + 1),
+            ),
+            self.assertRaises(ChatGPTGenerationTimeoutError),
+        ):
+            wait_for_assistant_response(page, 2)
+
+    def test_dom_fallback_does_not_reuse_an_existing_assistant_message(self):
+        page = MagicMock()
+        assistant_messages = MagicMock()
+        assistant_messages.count.return_value = 1
+        page.locator.return_value = assistant_messages
+
+        with (
+            patch(
+                "auto_yt.services.chatgpt_worker.get_visible_conversation_turns",
+                return_value=[],
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker._read_assistant_message"
+            ) as read_message,
+        ):
+            response = get_new_assistant_response(
+                page,
+                previous_assistant_turn=-1,
+                previous_assistant_count=1,
+            )
+
+        self.assertEqual(response, "")
+        read_message.assert_not_called()
+
+    def test_dom_fallback_reads_only_a_new_assistant_message(self):
+        page = MagicMock()
+        assistant_messages = MagicMock()
+        new_message = MagicMock()
+        assistant_messages.count.return_value = 2
+        assistant_messages.last = new_message
+        page.locator.return_value = assistant_messages
+
+        with (
+            patch(
+                "auto_yt.services.chatgpt_worker.get_visible_conversation_turns",
+                return_value=[],
+            ),
+            patch(
+                "auto_yt.services.chatgpt_worker._read_assistant_message",
+                return_value="Phản hồi mới",
+            ) as read_message,
+        ):
+            response = get_new_assistant_response(
+                page,
+                previous_assistant_turn=-1,
+                previous_assistant_count=1,
+            )
+
+        self.assertEqual(response, "Phản hồi mới")
+        read_message.assert_called_once_with(new_message)
 
     def test_thumbnail_reuses_video_conversation_url(self):
         chat_urls = (

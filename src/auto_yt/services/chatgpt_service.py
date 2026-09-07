@@ -10,7 +10,11 @@ CHAT_URL_MARKER = "###CHAT_URL###"
 WORKER_META_MARKER = "###WORKER_META###"
 
 
-def process_prompt_via_chatgpt(prompt_text: str, prompt_version: str = "") -> dict:
+def process_prompt_via_chatgpt(
+    prompt_text: str,
+    prompt_version: str = "",
+    video_id: int | None = None,
+) -> dict:
     """
     Spawns chatgpt_worker.py as a subprocess.
     Returns dict: {"script": str, "chat_url": str}
@@ -19,6 +23,8 @@ def process_prompt_via_chatgpt(prompt_text: str, prompt_version: str = "") -> di
     env = os.environ.copy()
     if prompt_version:
         env["PROMPT_VERSION"] = prompt_version
+    if video_id is not None:
+        env["VIDEO_ID"] = str(video_id)
 
     result = subprocess.run(
         [PYTHON_EXE, str(WORKER_SCRIPT)],

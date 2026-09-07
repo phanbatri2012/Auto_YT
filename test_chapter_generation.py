@@ -237,6 +237,46 @@ noi-dung-video.txt"""
             updated_script,
         )
 
+    def test_regeneration_merges_chapters_into_latest_script(self):
+        initial_script = SCRIPT.rsplit("\n\n### [AUDIO]", 1)[0]
+        initial_video = {
+            "generated_script": initial_script,
+            "chat_url": "https://chatgpt.com/c/test",
+            "prompt_version": "default",
+        }
+        latest_video = {**initial_video, "generated_script": SCRIPT}
+        request = main.GenerateChaptersRequest(video_id=48)
+
+        with (
+            patch.object(
+                main.db,
+                "get_video",
+                side_effect=[initial_video, latest_video],
+            ),
+            patch.object(
+                main.db,
+                "update_script",
+                return_value=True,
+            ) as update_script,
+            patch(
+                "auto_yt.services.chatgpt_worker.generate_chapters_only",
+                return_value=(
+                    "00:00 - Chapter mới\n"
+                    "05:30 - Phân tích\n"
+                    "12:00 - Kết luận"
+                ),
+            ),
+        ):
+            response = asyncio.run(main.generate_chapters_endpoint(request))
+
+        self.assertTrue(response["success"])
+        updated_script = update_script.call_args.args[1]
+        self.assertIn("00:00 - Chapter mới", updated_script)
+        self.assertIn(
+            "https://api.genmax.io/audio/existing.mp3",
+            updated_script,
+        )
+
     def test_missing_chapters_reuses_completed_response_before_resending(self):
         script_without_chapters = re.sub(
             r"(### \[CHAPTERS\]\n).*?(?=\n### \[)",

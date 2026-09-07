@@ -7,3 +7,6 @@ truststore>=0.10
 fastapi
 uvicorn
 youtube_transcript_api
+yt-dlp>=2025.1.15
+imageio-ffmpeg>=0.6
+curl-cffi

@@ -194,6 +194,42 @@ class MetadataGenerationTests(unittest.TestCase):
             updated_script,
         )
 
+    def test_endpoint_merges_metadata_into_latest_script(self):
+        initial_script = SCRIPT.rsplit("\n\n### [AUDIO]", 1)[0]
+        initial_video = {
+            "generated_script": initial_script,
+            "chat_url": "https://chatgpt.com/c/video-chat",
+            "prompt_version": "default",
+        }
+        latest_video = {**initial_video, "generated_script": SCRIPT}
+        request = main.GenerateMetadataRequest(video_id=52)
+
+        with (
+            patch.object(
+                main.db,
+                "get_video",
+                side_effect=[initial_video, latest_video],
+            ),
+            patch.object(
+                main.db,
+                "update_script",
+                return_value=True,
+            ) as update_script,
+            patch(
+                "auto_yt.services.chatgpt_worker.generate_metadata_only",
+                return_value=NEW_METADATA,
+            ),
+        ):
+            response = asyncio.run(main.generate_metadata_endpoint(request))
+
+        self.assertTrue(response["success"])
+        updated_script = update_script.call_args.args[1]
+        self.assertIn(NEW_METADATA, updated_script)
+        self.assertIn(
+            "https://api.genmax.io/audio/existing.mp3",
+            updated_script,
+        )
+
     def test_endpoint_is_rejected_while_chatgpt_is_busy(self):
         request = main.GenerateMetadataRequest(video_id=51)
         video = {

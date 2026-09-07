@@ -287,14 +287,32 @@ export default function Settings({
       `prompt-${promptKey}`,
       `Đang lưu ${promptLabel}...`,
       `Đã lưu ${promptLabel}.`,
-      () => fetch(
-        `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/fields/${encodeURIComponent(promptKey)}`,
-        {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ value })
+      async () => {
+        const res = await fetch(
+          `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/fields/${encodeURIComponent(promptKey)}`,
+          {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value })
+          }
+        );
+        if (!res.ok) throw new Error("Failed to save text");
+
+        if (promptKey === 'thumb_text' || promptKey === 'thumb_notext') {
+          const imageKey = `${promptKey}_image_base64`;
+          const imageVal = promptsData.versions[versionId].prompts[imageKey] || '';
+          const res2 = await fetch(
+            `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/fields/${encodeURIComponent(imageKey)}`,
+            {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ value: imageVal })
+            }
+          );
+          if (!res2.ok) throw new Error("Failed to save image");
         }
-      )
+        return res;
+      }
     );
   };
 
@@ -366,6 +384,128 @@ export default function Settings({
     { key: 'thumb_text', label: '7. Thumbnail (Có chữ)' },
     { key: 'thumb_notext', label: '8. Thumbnail (Không chữ)' },
   ];
+
+
+  const handleImageUpload = (e, imageKey) => {
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+
+    let currentArray = [];
+    try {
+      const existing = currentVersion.prompts[imageKey];
+      if (existing) {
+        if (existing.startsWith('[')) {
+          currentArray = JSON.parse(existing);
+        } else {
+          currentArray = [existing];
+        }
+      }
+    } catch {}
+
+    let processedCount = 0;
+    const newBase64s = [];
+
+    files.forEach(file => {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const base64 = event.target.result.split(',')[1];
+        newBase64s.push(base64);
+        processedCount++;
+
+        if (processedCount === files.length) {
+          const finalArray = [...currentArray, ...newBase64s];
+          handlePromptChange(imageKey, JSON.stringify(finalArray));
+        }
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const handleRemoveImage = (imageKey, indexToRemove) => {
+    let currentArray = [];
+    try {
+      const existing = currentVersion.prompts[imageKey];
+      if (existing) {
+        if (existing.startsWith('[')) {
+          currentArray = JSON.parse(existing);
+        } else {
+          currentArray = [existing];
+        }
+      }
+    } catch {}
+
+    if (indexToRemove === -1) {
+      handlePromptChange(imageKey, '');
+    } else {
+      currentArray.splice(indexToRemove, 1);
+      if (currentArray.length === 0) {
+        handlePromptChange(imageKey, '');
+      } else {
+        handlePromptChange(imageKey, JSON.stringify(currentArray));
+      }
+    }
+  };
+
+  const renderImagePreviews = (fieldKey) => {
+    const imageKey = `${fieldKey}_image_base64`;
+    const existing = currentVersion.prompts[imageKey];
+    let images = [];
+    if (existing) {
+      if (existing.startsWith('[')) {
+        try {
+          images = JSON.parse(existing);
+        } catch {
+          images = [existing];
+        }
+      } else {
+        images = [existing];
+      }
+    }
+
+    if (images.length === 0) {
+      return (
+        <label style={{ cursor: activeVersionLocked ? 'not-allowed' : 'pointer', textAlign: 'center', color: '#888', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '5px', opacity: activeVersionLocked ? 0.5 : 1, margin: 0 }}>
+          <span style={{ fontSize: '2em' }}>🖼️</span>
+          <span style={{ fontSize: '0.8em' }}>Tải ảnh mẫu lên</span>
+          <input type="file" multiple accept="image/png, image/jpeg, image/webp" style={{ display: 'none' }} disabled={activeVersionLocked} onChange={(e) => handleImageUpload(e, imageKey)} />
+        </label>
+      );
+    }
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', width: '100%' }}>
+        <div style={{ display: 'flex', gap: '5px', flexWrap: 'wrap', justifyContent: 'center' }}>
+          {images.map((b64, idx) => (
+            <div key={idx} style={{ position: 'relative' }}>
+              <img
+                src={`data:image/png;base64,${b64}`}
+                alt="Reference"
+                style={{ width: '45px', height: '45px', objectFit: 'cover', borderRadius: '4px', border: '1px solid #444' }}
+              />
+              <button
+                onClick={() => handleRemoveImage(imageKey, idx)}
+                disabled={activeVersionLocked}
+                style={{ position: 'absolute', top: '-5px', right: '-5px', background: '#e74c3c', border: 'none', color: 'white', borderRadius: '50%', width: '16px', height: '16px', fontSize: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: activeVersionLocked ? 'not-allowed' : 'pointer', padding: 0 }}
+                title="Xóa ảnh này"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ display: 'flex', gap: '5px', justifyContent: 'center', marginTop: '4px' }}>
+          <label style={{ cursor: activeVersionLocked ? 'not-allowed' : 'pointer', background: 'var(--accent)', color: 'white', padding: '2px 8px', borderRadius: '4px', fontSize: '0.7em', opacity: activeVersionLocked ? 0.5 : 1, margin: 0 }}>
+            + Thêm
+            <input type="file" multiple accept="image/png, image/jpeg, image/webp" style={{ display: 'none' }} disabled={activeVersionLocked} onChange={(e) => handleImageUpload(e, imageKey)} />
+          </label>
+          <button onClick={() => handleRemoveImage(imageKey, -1)} disabled={activeVersionLocked} style={{ background: '#e74c3c', border: 'none', color: 'white', padding: '2px 8px', borderRadius: '4px', fontSize: '0.7em', cursor: activeVersionLocked ? 'not-allowed' : 'pointer', opacity: activeVersionLocked ? 0.5 : 1, margin: 0 }}>
+            Xóa hết
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="settings-container">
@@ -606,13 +746,21 @@ export default function Settings({
                 </button>
               </div>
             </div>
-            <textarea
-              className="prompt-textarea"
-              value={currentVersion.prompts[field.key] || ''}
-              onChange={(e) => handlePromptChange(field.key, e.target.value)}
-              rows={6}
-              disabled={activeVersionLocked}
-            />
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <textarea
+                className="prompt-textarea"
+                style={{ flex: 1 }}
+                value={currentVersion.prompts[field.key] || ''}
+                onChange={(e) => handlePromptChange(field.key, e.target.value)}
+                rows={6}
+                disabled={activeVersionLocked}
+              />
+              {(field.key === 'thumb_text' || field.key === 'thumb_notext') && (
+                <div style={{ width: '150px', border: '1px dashed #666', borderRadius: '4px', padding: '10px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.2)' }}>
+                  {renderImagePreviews(field.key)}
+                </div>
+              )}
+            </div>
           </div>
         ))}
       </div>

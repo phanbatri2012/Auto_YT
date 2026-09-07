@@ -214,6 +214,36 @@ class LongAudioTests(unittest.TestCase):
         start_watcher.assert_not_called()
         self.assertEqual(result["audio_task"]["status"], "completed")
 
+    def test_audio_status_repairs_missing_script_marker_from_completed_task(self):
+        completed_task = {
+            "video_id": 70,
+            "request_hash": "request-hash",
+            "task_id": "task-1",
+            "status": "completed",
+            "audio_url": "http://127.0.0.1:8080/api/audio/video_70.mp3",
+            "error": "",
+            "updated_at": "2026-08-08T00:00:00+00:00",
+            "segments_json": "",
+            "voice_id": "voice-id",
+            "voice_name": "Giọng thử nghiệm",
+        }
+        with (
+            patch.object(main.db, "get_video", return_value={
+                "generated_script": "### [BODY]\nNội dung",
+            }),
+            patch.object(main.db, "get_audio_task", return_value=completed_task),
+            patch.object(main, "_save_audio_url") as save_audio_url,
+        ):
+            result = main.get_audio_status(70)
+
+        save_audio_url.assert_called_once_with(
+            70,
+            completed_task["audio_url"],
+            "voice-id",
+            "Giọng thử nghiệm",
+        )
+        self.assertEqual(result["audio_task"]["status"], "completed")
+
     def test_interrupted_batch_submits_only_missing_segments(self):
         chunks = ["Đoạn đã hoàn thành.", "Đoạn còn thiếu."]
         segments = [

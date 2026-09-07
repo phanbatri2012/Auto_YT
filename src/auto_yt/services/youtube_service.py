@@ -1,9 +1,13 @@
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.formatters import TextFormatter
 import urllib.parse as urlparse
-import urllib.request
 import re
+
+from curl_cffi import requests as curl_requests
 import truststore
+from yt_dlp import YoutubeDL
+from yt_dlp.networking.impersonate import ImpersonateTarget
+
+
+YOUTUBE_REQUEST_TIMEOUT_SECONDS = 30
 
 
 def _configure_system_trust_store() -> None:
@@ -16,8 +20,13 @@ _configure_system_trust_store()
 def get_video_title(url: str) -> str:
     """Fetches the video title from YouTube URL."""
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-        html = urllib.request.urlopen(req).read().decode('utf-8')
+        response = curl_requests.get(
+            url,
+            impersonate="chrome",
+            timeout=YOUTUBE_REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        html = response.text
         match = re.search(r'<title>(.*?)</title>', html)
         if match:
             return match.group(1).replace(' - YouTube', '').strip()
@@ -38,21 +47,55 @@ def extract_video_id(url: str) -> str:
 
 def get_video_transcript(url: str) -> str:
     """
-    Fetches the transcript for the given YouTube video URL.
+    Fetches the transcript for the given YouTube video URL using yt-dlp.
     Returns the transcript as a single formatted string.
     """
-    video_id = extract_video_id(url)
+    ydl_opts = {
+        'skip_download': True,
+        'writesubtitles': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': ['vi', 'en'],
+        'quiet': True,
+        'javascript_runtimes': ['node'],
+        'impersonate': ImpersonateTarget(client='chrome')
+    }
     
-    # Fetch transcript (tries Vietnamese and English)
-    api = YouTubeTranscriptApi()
-    transcript_list = api.list(video_id)
-    transcript_obj = transcript_list.find_transcript(['vi', 'en'])
-    transcript = transcript_obj.fetch()
-    
-    # Format into text
-    formatter = TextFormatter()
-    text_formatted = formatter.format_transcript(transcript)
-    
-    # Clean up line breaks for ChatGPT
-    text_cleaned = " ".join(text_formatted.split())
-    return text_cleaned
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        subs = {}
+        for cap_type in ['automatic_captions', 'subtitles']:
+            if info.get(cap_type):
+                for lang, formats in info[cap_type].items():
+                    if lang not in subs:
+                        subs[lang] = []
+                    subs[lang].extend(formats)
+
+        target_fmt = None
+        for lang in ['vi', 'en']:
+            if lang in subs:
+                for fmt in subs[lang]:
+                    if fmt['ext'] == 'json3':
+                        target_fmt = fmt
+                        break
+                if target_fmt:
+                    break
+
+        if not target_fmt:
+            raise ValueError("No transcript found for vi or en")
+
+        response = curl_requests.get(
+            target_fmt['url'],
+            impersonate="chrome",
+            timeout=YOUTUBE_REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        text_lines = []
+        for event in data.get('events', []):
+            if 'segs' in event:
+                text = "".join(seg.get('utf8', '') for seg in event['segs'])
+                if text.strip():
+                    text_lines.append(text.strip())
+
+        return " ".join(text_lines).replace("\n", " ").strip()

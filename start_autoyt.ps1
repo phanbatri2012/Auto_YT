@@ -45,7 +45,21 @@ function Get-CombinedFingerprint {
 
     $hashes = foreach ($path in $Paths) {
         if (Test-Path -LiteralPath $path -PathType Leaf) {
-            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            $stream = [System.IO.File]::Open(
+                $path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::ReadWrite
+            )
+            $sha256 = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $hashBytes = $sha256.ComputeHash($stream)
+                [System.BitConverter]::ToString($hashBytes).Replace("-", "")
+            }
+            finally {
+                $sha256.Dispose()
+                $stream.Dispose()
+            }
         }
     }
     return $hashes -join ":"
@@ -114,18 +128,37 @@ function Wait-ForService {
     throw "$Name did not become ready within $TimeoutSeconds seconds."
 }
 
+function Test-PythonCommand {
+    param(
+        [string]$FilePath,
+        [string[]]$Prefix = @()
+    )
+
+    if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        & $FilePath @Prefix -c "import sys; raise SystemExit(0 if sys.version_info.major == 3 else 1)" *> $null
+        return $LASTEXITCODE -eq 0
+    }
+    catch {
+        return $false
+    }
+}
+
 function Resolve-SystemPython {
     $pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($pythonCommand) {
+    if ($pythonCommand -and (Test-PythonCommand $pythonCommand.Source)) {
         return @{ FilePath = $pythonCommand.Source; Prefix = @() }
     }
 
     $pyCommand = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($pyCommand) {
+    if ($pyCommand -and (Test-PythonCommand $pyCommand.Source @("-3"))) {
         return @{ FilePath = $pyCommand.Source; Prefix = @("-3") }
     }
 
-    throw "Python 3 is required but was not found in PATH."
+    throw "A working Python 3 installation is required but was not found in PATH."
 }
 
 function Ensure-PythonEnvironment {
@@ -142,13 +175,17 @@ function Ensure-PythonEnvironment {
         }
     }
 
+    if (-not $venvNeedsRebuild -and -not (Test-PythonCommand $venvPython)) {
+        $venvNeedsRebuild = $true
+    }
+
     if ($venvNeedsRebuild) {
         if (Test-Path -LiteralPath $venvRoot) {
             $resolvedVenv = (Resolve-Path -LiteralPath $venvRoot).Path.TrimEnd("\")
             if ($resolvedVenv -ne $venvRoot) {
                 throw "Refusing to remove unexpected virtual environment path: $resolvedVenv"
             }
-            Write-Step "Project path changed; rebuilding the Python environment."
+            Write-Step "Python environment is missing, moved, or unusable; rebuilding it."
             Remove-Item -LiteralPath $resolvedVenv -Recurse -Force
         }
         else {

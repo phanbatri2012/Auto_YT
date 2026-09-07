@@ -113,6 +113,7 @@ function App() {
   const [videoTitle, setVideoTitle] = useState('')
   const [currentVideoPromptVersion, setCurrentVideoPromptVersion] = useState('')
   const [isCurrentVideoPublished, setIsCurrentVideoPublished] = useState(false)
+  const [currentVideoHasCheckpoint, setCurrentVideoHasCheckpoint] = useState(false)
   const [chatGptStatus, setChatGptStatus] = useState({
     busy: false,
     operation: '',
@@ -449,6 +450,7 @@ function App() {
               setIsCurrentVideoPublished(false);
               setAudioStatus(data.audio_task?.status || 'not_started');
               setAudioMissingSegments(data.audio_task?.missing_segments || 0);
+              setCurrentVideoHasCheckpoint(Boolean(data.failed_step));
               if (data.generation_warning) {
                 setErrorMsg(
                   'Đã lưu phần nội dung hoàn tất. Bước cần tạo lại: ' +
@@ -464,13 +466,13 @@ function App() {
               setErrorMsg(job.error || 'Đã xảy ra lỗi không xác định.');
               resolve();
             }
-          } catch (e) {
+          } catch {
             // ignore transient fetch errors, keep polling
           }
         }, 3000);
       });
 
-    } catch (err) {
+    } catch {
       setErrorMsg('Cannot connect to the Python backend. Is it running?');
     } finally {
       setIsFetching(false)
@@ -485,18 +487,6 @@ function App() {
     clean = clean.replace(/### \[[^\]]+\]/g, ''); // Remove all ### [TITLE] markers
     clean = clean.replace(/\n\s*\n\s*\n/g, '\n\n').trim(); // Collapse excess newlines
     return clean;
-  };
-
-  const handleCopy = () => {
-    const textToCopy = activeTab === 'summary' ? getCleanText(resultText) : fullTranscript;
-    navigator.clipboard.writeText(textToCopy).then(() => {
-      const btn = document.getElementById('copy-btn');
-      if (btn) {
-        const originalText = btn.innerText;
-        btn.innerText = 'Copied! ✅';
-        setTimeout(() => { btn.innerText = originalText; }, 2000);
-      }
-    });
   };
 
   const handleExportTxt = () => {
@@ -530,6 +520,7 @@ function App() {
       setActiveView('fetcher');
       setCurrentVideoId(id);  // track which video is loaded
       setIsCurrentVideoPublished(Boolean(data.is_published));
+      setCurrentVideoHasCheckpoint(Boolean(data.has_checkpoint));
       setAudioStatus('not_started');
       setAudioMissingSegments(0);
       setErrorMsg('');
@@ -618,6 +609,67 @@ function App() {
     }
   };
 
+  const handleContinueGeneration = async () => {
+    if (!currentVideoId || chatGptControlsDisabled) return;
+    setIsFetching(true);
+    setProgressMsg('⏳ Đang tiếp tục tạo...');
+    setErrorMsg('');
+    setShowResult(false);
+
+    try {
+      const response = await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}/continue-generation`, {
+        method: 'POST',
+      });
+      const data = await response.json();
+      if (!response.ok || !data.job_id) {
+        throw new Error(data.detail || data.error || 'Lỗi gọi API tiếp tục.');
+      }
+
+      const job_id = data.job_id;
+      // Poll every 3 seconds until done or error
+      await new Promise((resolve) => {
+        const interval = setInterval(async () => {
+          try {
+            const res = await fetch(`http://127.0.0.1:8080/api/jobs/${job_id}`);
+            const job = await res.json();
+            setProgressMsg(job.progress || '...');
+            if (job.status === 'done') {
+              clearInterval(interval);
+              const resultData = job.result;
+              if (resultData) {
+                setResultText(resultData.summary);
+                setFullTranscript(resultData.full_transcript);
+                setChatUrl(resultData.chat_url || '');
+                setCurrentVideoId(resultData.video_id);
+                setVideoTitle(resultData.title || '');
+                setCurrentVideoHasCheckpoint(Boolean(resultData.failed_step));
+                if (resultData.generation_warning) {
+                  setErrorMsg(
+                    'Đã lưu phần nội dung hoàn tất. Bước cần tạo lại: ' +
+                    resultData.generation_warning
+                  );
+                }
+              }
+              resolve();
+            } else if (job.status === 'error') {
+              clearInterval(interval);
+              setErrorMsg(job.error || 'Đã xảy ra lỗi không xác định.');
+              resolve();
+            }
+          } catch {
+            // ignore transient fetch errors
+          }
+        }, 3000);
+      });
+    } catch {
+      setErrorMsg('Lỗi tiếp tục: ' + err.message);
+    } finally {
+      setIsFetching(false);
+      setShowResult(true);
+      await fetchSavedVideos(currentPage, publishFilter);
+    }
+  };
+
   const handleGenerateThumbnail = async (thumbnailType) => {
     if (!resultText || chatGptControlsDisabled) return;
     setGeneratingThumbnailType(thumbnailType);
@@ -665,7 +717,7 @@ function App() {
       } else {
         alert('Lỗi tạo thumbnail: ' + (data.error || 'Unknown error'));
       }
-    } catch (err) {
+    } catch {
       alert('Không thể kết nối Backend.');
     } finally {
       setGeneratingThumbnailType(null);
@@ -776,7 +828,7 @@ function App() {
         setCurrentVideoVoiceId(video.voice_id || '');
         setCurrentVideoVoiceName(video.voice_name || '');
       }
-    } catch (err) {
+    } catch {
       alert('Không thể kết nối Backend.');
     } finally {
       setIsGenAudio(keepPolling);
@@ -884,7 +936,7 @@ function App() {
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         // Remove leading markdown asterisks, dashes, numbers, etc for matching
-        const cleanLower = line.toLowerCase().replace(/^[\*\-\d\.\s]+/, '').trim();
+        const cleanLower = line.toLowerCase().replace(/^[*\-\d.\s]+/, '').trim();
         
         if (cleanLower.startsWith('tiêu đề') && cleanLower.includes(':')) {
           flush(); currentTitle = 'TIÊU ĐỀ VIDEO'; currentBody += line.split(':').slice(1).join(':').trim() + '\n';
@@ -931,12 +983,11 @@ function App() {
     }
 
     // --- NEW LOGIC: Combine MÔ TẢ VIDEO, HASHTAG, and CHAPTERS ---
-    let finalSections = [];
-    let moTaIndex = -1;
+    const finalSections = [];
     let chaptersContent = '';
 
     // First pass to extract chapters content
-    sections.forEach((sec, idx) => {
+    sections.forEach((sec) => {
       if (sec.title === 'CHAPTERS') {
         chaptersContent = sec.content;
       }
@@ -1536,6 +1587,46 @@ function App() {
                               : audioStatus === 'failed'
                                 ? '⚠️ Retry Audio (sẽ tốn credit)'
                                 : '🎵 Tạo Audio'}
+                          </button>
+                        )}
+                        {chatUrl && currentVideoHasCheckpoint && (
+                          <button
+                            onClick={handleContinueGeneration}
+                            disabled={chatGptControlsDisabled}
+                            style={{
+                              padding: '4px 14px', borderRadius: '4px', cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
+                              border: '1px solid #e74c3c', background: chatGptControlsDisabled ? '#333' : 'rgba(231, 76, 60, 0.2)',
+                              color: chatGptControlsDisabled ? '#888' : '#e74c3c', fontWeight: 'bold'
+                            }}
+                            title="Tiếp tục tiến trình nếu bị lỗi giữa chừng"
+                          >
+                            ▶️ Tiếp tục tạo
+                          </button>
+                        )}
+                        {chatUrl && !currentVideoHasCheckpoint && resultText && resultText.includes('THUMBNAIL KHÔNG CHỮ') && resultText.includes('CHAPTERS') && (
+                          <button
+                            disabled={true}
+                            style={{
+                              padding: '4px 14px', borderRadius: '4px', cursor: 'not-allowed',
+                              border: '1px solid #27ae60', background: 'rgba(39, 174, 96, 0.2)',
+                              color: '#27ae60', fontWeight: 'bold'
+                            }}
+                            title="Video này đã được tạo xong toàn bộ."
+                          >
+                            ✅ Đã Hoàn thành
+                          </button>
+                        )}
+                        {chatUrl && !currentVideoHasCheckpoint && resultText && (!resultText.includes('THUMBNAIL KHÔNG CHỮ') || !resultText.includes('CHAPTERS')) && (
+                          <button
+                            disabled={true}
+                            style={{
+                              padding: '4px 14px', borderRadius: '4px', cursor: 'not-allowed',
+                              border: '1px solid #c0392b', background: 'rgba(192, 57, 43, 0.2)',
+                              color: '#c0392b', fontWeight: 'bold'
+                            }}
+                            title="Lỗi: Video bị lỗi ngầm từ trước và đã mất bản nháp. Bạn phải tạo lại từ đầu."
+                          >
+                            ❌ Lỗi (Mất dữ liệu)
                           </button>
                         )}
                         {chatUrl && (

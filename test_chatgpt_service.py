@@ -1,5 +1,7 @@
 import unittest
 import hashlib
+import json
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from auto_yt.services import chatgpt_service, chatgpt_worker
@@ -73,6 +75,30 @@ class ChatGptServiceTests(unittest.TestCase):
         self.assertIn("Metadata", script)
         self.assertIn("00:00 - Mở đầu", script)
 
+    def test_complete_script_sanitizer_preserves_non_narrative_sections(self):
+        long_paragraph = (
+            "Lực lượng được tổ chức linh hoạt để thích nghi với chiến trường "
+            "và giữ được sức mạnh trong những thời điểm quyết định. " * 3
+        )
+        script = (
+            f"### [INTRO]\n{long_paragraph}\n\n"
+            f"### [BODY]\n{long_paragraph}\n\n"
+            "Làm rõ vai trò từng lực lượng\n"
+            "Tăng nhịp kể và sức hút\n\n"
+            f"{long_paragraph}\n\n"
+            f"### [OUTRO]\n{long_paragraph}\n\n"
+            "### [METADATA & QUIZ]\n"
+            "TIÊU ĐỀ: Giữ nguyên metadata\n\n"
+            "### [CHAPTERS]\n00:00 - Mở đầu\n"
+        )
+
+        result = chatgpt_worker.sanitize_generated_script(script)
+
+        self.assertNotIn("Làm rõ vai trò từng lực lượng", result)
+        self.assertNotIn("Tăng nhịp kể và sức hút", result)
+        self.assertIn("TIÊU ĐỀ: Giữ nguyên metadata", result)
+        self.assertIn("00:00 - Mở đầu", result)
+
     def test_video_id_is_forwarded_for_durable_worker_checkpoints(self):
         completed_process = Mock(
             returncode=0,
@@ -93,6 +119,92 @@ class ChatGptServiceTests(unittest.TestCase):
         worker_env = run_worker.call_args.kwargs["env"]
         self.assertEqual(worker_env["PROMPT_VERSION"], "version-key")
         self.assertEqual(worker_env["VIDEO_ID"], "122")
+
+    def test_pipeline_snapshot_is_forwarded_to_the_worker(self):
+        pipeline = {
+            "metadata": False,
+            "chapters": True,
+            "thumbnail_with_text": False,
+            "thumbnail_without_text": True,
+            "audio": False,
+        }
+        completed_process = Mock(
+            returncode=0,
+            stdout=b"Generated script",
+            stderr=b"",
+        )
+        with patch.object(
+            chatgpt_service.subprocess,
+            "run",
+            return_value=completed_process,
+        ) as run_worker:
+            chatgpt_service.process_prompt_via_chatgpt(
+                "transcript",
+                "version-key",
+                video_id=122,
+                pipeline=pipeline,
+            )
+
+        worker_env = run_worker.call_args.kwargs["env"]
+        self.assertEqual(
+            json.loads(worker_env["PROMPT_PIPELINE_JSON"]),
+            pipeline,
+        )
+
+    def test_disabled_optional_pipeline_steps_send_no_chatgpt_prompt(self):
+        page = Mock()
+        page.url = "https://chatgpt.com/g/g-p-test/project"
+        context = Mock()
+        context.pages = [page]
+        state = {
+            "chat_url": "",
+            "current_step": "outro",
+            "expected_body_parts": 1,
+            "outline_parts": ["Part one"],
+            "intro": "Intro complete",
+            "body_parts": ["Body complete"],
+            "outro": "Outro complete",
+            "metadata": "",
+            "chapters": "",
+            "thumb_text": "",
+            "thumb_notext": "",
+            "pipeline": {
+                "metadata": False,
+                "chapters": False,
+                "thumbnail_with_text": False,
+                "thumbnail_without_text": False,
+                "audio": False,
+            },
+        }
+        playwright_manager = Mock()
+        playwright_manager.__enter__ = Mock(
+            return_value=Mock(chromium=Mock())
+        )
+        playwright_manager.__exit__ = Mock(return_value=False)
+
+        with (
+            patch.object(chatgpt_worker, "gpt_profile_dir", return_value=Path.cwd()),
+            patch.object(
+                chatgpt_worker,
+                "sync_playwright",
+                return_value=playwright_manager,
+            ),
+            patch.object(
+                chatgpt_worker,
+                "launch_chatgpt_context",
+                return_value=context,
+            ),
+            patch.object(chatgpt_worker, "ensure_expected_project_page"),
+            patch.object(chatgpt_worker, "send_prompt") as send_prompt,
+            patch.object(chatgpt_worker, "send_thumbnail_prompt") as send_thumbnail,
+            patch.object(chatgpt_worker, "persist_generation_state"),
+        ):
+            result = chatgpt_worker._run_complete("Transcript", state)
+
+        send_prompt.assert_not_called()
+        send_thumbnail.assert_not_called()
+        self.assertEqual(result["pipeline"], state["pipeline"])
+        self.assertTrue(result["complete_for_audio"])
 
     def test_long_worker_is_not_limited_by_a_total_process_timeout(self):
         completed_process = Mock(
@@ -248,6 +360,57 @@ class ChatGptServiceTests(unittest.TestCase):
             result = chatgpt_worker.run(transcript)
 
         self.assertEqual(result["script"], "resumed")
+
+    def test_queue_pipeline_snapshot_wins_when_recovering_a_checkpoint(self):
+        transcript = "saved transcript"
+        pipeline = {
+            "metadata": False,
+            "chapters": True,
+            "thumbnail_with_text": False,
+            "thumbnail_without_text": False,
+            "audio": True,
+        }
+        checkpoint = {
+            "chat_url": "https://chatgpt.com/c/saved",
+            "current_step": "body 1/2",
+            "expected_body_parts": 2,
+            "outline_parts": ["one", "two"],
+            "intro": "Saved intro",
+            "body_parts": ["Saved body"],
+            "outro": "",
+            "pipeline": {
+                key: True for key in pipeline
+            },
+            "transcript_fingerprint": hashlib.sha256(
+                transcript.encode("utf-8")
+            ).hexdigest(),
+        }
+
+        def inspect_state(_transcript, state):
+            self.assertEqual(state["pipeline"], pipeline)
+            return {
+                "script": "resumed",
+                "chat_url": state["chat_url"],
+                "warning": "",
+                "failed_step": "",
+                "complete_for_audio": True,
+                "pipeline": state["pipeline"],
+            }
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "VIDEO_ID": "122",
+                    "PROMPT_PIPELINE_JSON": json.dumps(pipeline),
+                },
+            ),
+            patch.object(chatgpt_worker, "load_checkpoint", return_value=checkpoint),
+            patch.object(chatgpt_worker, "_run_complete", side_effect=inspect_state),
+        ):
+            result = chatgpt_worker.run(transcript)
+
+        self.assertEqual(result["pipeline"], pipeline)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 from fastapi import BackgroundTasks
@@ -739,29 +741,40 @@ class ThumbnailGenerationTests(unittest.TestCase):
         finally:
             main._finish_chatgpt_operation()
 
-    def test_video_job_is_rejected_while_thumbnail_generation_is_running(self):
-        self.assertTrue(main._try_start_chatgpt_operation("thumbnails"))
-        try:
-            response = main.process_video(
-                main.VideoRequest(
-                    url="https://www.youtube.com/watch?v=test",
-                    prompt_version="default",
+    def test_video_job_is_queued_while_thumbnail_generation_is_running(self):
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch.object(
+                main.db,
+                "DB_PATH",
+                Path(temporary_directory) / "database.db",
+            ),
+            patch.object(main, "_kick_video_queue"),
+        ):
+            main.db.init_db()
+            self.assertTrue(main._try_start_chatgpt_operation("thumbnails"))
+            try:
+                response = main.process_video(
+                    main.VideoRequest(
+                        url="https://www.youtube.com/watch?v=test",
+                        prompt_version="default",
+                    )
                 )
-            )
-            job = main.get_job(response["job_id"])
+                job = main.get_job(response["job_id"])
 
-            self.assertEqual(job["status"], "error")
-            self.assertEqual(job["error"], main.CHATGPT_BUSY_ERROR)
-            self.assertEqual(
-                main.get_chatgpt_status(),
-                {
-                    "busy": True,
-                    "operation": "thumbnails",
-                    "prompt_version": "",
-                },
-            )
-        finally:
-            main._finish_chatgpt_operation()
+                self.assertEqual(job["status"], "queued")
+                self.assertIsNone(job["error"])
+                self.assertEqual(job["queue_position"], 1)
+                self.assertEqual(
+                    main.get_chatgpt_status(),
+                    {
+                        "busy": True,
+                        "operation": "thumbnails",
+                        "prompt_version": "",
+                    },
+                )
+            finally:
+                main._finish_chatgpt_operation()
 
     def test_thumbnail_selects_only_the_response_after_its_request(self):
         visible_turns = (

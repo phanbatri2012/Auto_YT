@@ -108,6 +108,7 @@ class VoiceSelectionTests(unittest.TestCase):
             }
 
         with (
+            patch.object(main, "_require_audio_review_approval"),
             patch.object(
                 main.db,
                 "get_video",

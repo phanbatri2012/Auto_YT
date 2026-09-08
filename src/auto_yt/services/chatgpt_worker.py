@@ -14,7 +14,10 @@ from auto_yt.default_prompts import DEFAULT_PROMPTS_DATA
 from auto_yt.services.chatgpt_projects import (
     CHATGPT_PROJECT_URL_ENV,
     DEFAULT_CHATGPT_PROJECT_URL,
+    PROMPT_PIPELINE_ENV,
     get_project_url,
+    normalize_prompt_pipeline,
+    validate_prompt_pipeline,
 )
 from auto_yt.services.generation_checkpoint import (
     load_checkpoint,
@@ -591,6 +594,32 @@ def get_active_prompts():
     return DEFAULT_PROMPTS_DATA["versions"]["default"]["prompts"]
 
 
+def get_active_pipeline() -> dict[str, bool]:
+    pipeline_json = os.environ.get(PROMPT_PIPELINE_ENV, "").strip()
+    if pipeline_json:
+        try:
+            return validate_prompt_pipeline(json.loads(pipeline_json))
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError("Invalid prompt pipeline snapshot.") from exc
+
+    try:
+        if PROMPTS_PATH.exists():
+            data = json.loads(PROMPTS_PATH.read_text(encoding="utf-8"))
+            version_override = os.environ.get("PROMPT_VERSION", "").strip()
+            active_version = version_override or data.get("active_version", "default")
+            version = data.get("versions", {}).get(active_version)
+            if not isinstance(version, dict):
+                version = data.get("versions", {}).get(
+                    data.get("active_version", "default"),
+                    {},
+                )
+            return normalize_prompt_pipeline(version.get("pipeline"))
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    return normalize_prompt_pipeline(None)
+
+
 def build_metadata_generation_prompt(metadata_prompt: str) -> str:
     if not metadata_prompt.strip():
         raise RuntimeError("The selected prompt version has no metadata prompt.")
@@ -760,6 +789,25 @@ def sanitize_narrative_response(response_text: str) -> str:
     if not kept_blocks:
         return cleaned_text
     return "\n\n".join(kept_blocks).strip()
+
+
+def sanitize_generated_script(script_text: str) -> str:
+    """Sanitize narrative sections while preserving all other sections."""
+    if not isinstance(script_text, str) or not script_text:
+        return script_text
+
+    section_pattern = re.compile(
+        r"(### \[(?:INTRO|BODY|OUTRO)\]\r?\n)(.*?)(?=\r?\n### \[)",
+        flags=re.DOTALL,
+    )
+
+    def replace_section(match: re.Match) -> str:
+        section_header = match.group(1)
+        cleaned_content = sanitize_narrative_response(match.group(2))
+        separator = "\n" if cleaned_content else ""
+        return f"{section_header}{cleaned_content}{separator}"
+
+    return section_pattern.sub(replace_section, script_text)
 
 
 def validate_prompt_text(prompt_text: str) -> None:
@@ -1345,6 +1393,8 @@ def _run_complete(transcript: str, state: dict) -> dict:
         STRICT_NO_FILLER = "\n\nLƯU Ý QUAN TRỌNG: TRẢ LỜI TRỰC TIẾP VÀO NỘI DUNG. TUYỆT ĐỐI KHÔNG CHÀO HỎI, KHÔNG DẠ VÂNG, KHÔNG THÊM BẤT KỲ CÂU DẪN HAY GIẢI THÍCH NÀO (VD: 'Dưới đây là...', 'Trân trọng gửi bạn...'). CHỈ IN RA ĐÚNG NỘI DUNG CẦN VIẾT."
 
         prompts = get_active_prompts()
+        pipeline = normalize_prompt_pipeline(state.get("pipeline"))
+        state["pipeline"] = pipeline
 
         parts = state.get("outline_parts", [])
         if not parts:
@@ -1447,7 +1497,7 @@ def _run_complete(transcript: str, state: dict) -> dict:
             )
 
         # Step 6: Metadata & Quiz
-        if not state.get("metadata"):
+        if pipeline["metadata"] and not state.get("metadata"):
             print(">>> BƯỚC 6: TẠO METADATA & QUIZ", file=sys.stderr)
             prompt6 = prompts.get("metadata", "") + STRICT_NO_FILLER
             state["current_step"] = "metadata"
@@ -1456,7 +1506,7 @@ def _run_complete(transcript: str, state: dict) -> dict:
             persist_generation_state(state)
 
         # Step 7: Chapters
-        if not state.get("chapters"):
+        if pipeline["chapters"] and not state.get("chapters"):
             print(">>> BƯỚC 7: TẠO CHAPTERS", file=sys.stderr)
             prompt7 = prompts.get("chapters", "") + STRICT_NO_FILLER
             state["current_step"] = "chapters"
@@ -1508,7 +1558,7 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 return chatgpt_url  # fallback to original URL
 
         # Step 8: Thumbnail Idea 1 (With Text)
-        if not state.get("thumb_text"):
+        if pipeline["thumbnail_with_text"] and not state.get("thumb_text"):
             print(">>> BƯỚC 8: TẠO Ý TƯỞNG THUMBNAIL (CÓ CHỮ)", file=sys.stderr)
             prompt8 = build_thumbnail_generation_prompt(
                 prompts.get("thumb_text", ""),
@@ -1533,7 +1583,7 @@ def _run_complete(transcript: str, state: dict) -> dict:
             persist_generation_state(state)
 
         # Step 9: Thumbnail Idea 2 (No Text)
-        if not state.get("thumb_notext"):
+        if pipeline["thumbnail_without_text"] and not state.get("thumb_notext"):
             print(">>> BƯỚC 9: TẠO Ý TƯỞNG THUMBNAIL (KHÔNG CHỮ)", file=sys.stderr)
             prompt9 = build_thumbnail_generation_prompt(
                 prompts.get("thumb_notext", ""),
@@ -1569,6 +1619,7 @@ def _run_complete(transcript: str, state: dict) -> dict:
             "warning": warning,
             "failed_step": "" if complete_for_audio else state["current_step"],
             "complete_for_audio": complete_for_audio,
+            "pipeline": pipeline,
         }
 
 
@@ -1588,6 +1639,7 @@ def run(transcript: str) -> dict:
         "chapters": "",
         "thumb_text": "",
         "thumb_notext": "",
+        "pipeline": get_active_pipeline(),
         "transcript_fingerprint": transcript_fingerprint,
     }
     video_id = _checkpoint_video_id()
@@ -1595,6 +1647,14 @@ def run(transcript: str) -> dict:
         saved_state = load_checkpoint(video_id)
         if saved_state and saved_state.get("transcript_fingerprint") == transcript_fingerprint:
             state.update(saved_state)
+            if os.environ.get(PROMPT_PIPELINE_ENV, "").strip():
+                # The persistent queue snapshot is authoritative for automatic
+                # recovery, even if Settings changed while the job was waiting.
+                state["pipeline"] = get_active_pipeline()
+            else:
+                state["pipeline"] = normalize_prompt_pipeline(
+                    state.get("pipeline")
+                )
             print(
                 f">>> KHÔI PHỤC CHECKPOINT VIDEO #{video_id}: "
                 f"{state.get('current_step', 'unknown')}",
@@ -1631,6 +1691,7 @@ def run(transcript: str) -> dict:
             "warning": warning,
             "failed_step": failed_step,
             "complete_for_audio": complete_for_audio,
+            "pipeline": normalize_prompt_pipeline(state.get("pipeline")),
         }
 
 
@@ -2016,6 +2077,11 @@ if __name__ == "__main__":
                 result.get("complete_for_audio", True)
                 if isinstance(result, dict)
                 else True
+            ),
+            "pipeline": (
+                result.get("pipeline", normalize_prompt_pipeline(None))
+                if isinstance(result, dict)
+                else normalize_prompt_pipeline(None)
             ),
         }
         # Print script then marker then chat_url for the service to parse

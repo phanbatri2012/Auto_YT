@@ -1,6 +1,42 @@
 import { useState, useEffect } from 'react';
 import './Settings.css';
 
+const DEFAULT_PIPELINE = {
+  metadata: true,
+  chapters: true,
+  thumbnail_with_text: true,
+  thumbnail_without_text: true,
+  audio: true
+};
+
+const PIPELINE_STEPS = [
+  {
+    key: 'metadata',
+    label: 'Metadata & Quiz',
+    description: 'Tự động tạo tiêu đề, slug, mô tả, hashtag, bình luận ghim và quiz.'
+  },
+  {
+    key: 'chapters',
+    label: 'Chapters',
+    description: 'Tự động tạo các mốc chapter sau khi kịch bản lõi hoàn tất.'
+  },
+  {
+    key: 'thumbnail_with_text',
+    label: 'Thumbnail có chữ',
+    description: 'Tự động gửi prompt và lấy ảnh thumbnail có chữ.'
+  },
+  {
+    key: 'thumbnail_without_text',
+    label: 'Thumbnail không chữ',
+    description: 'Tự động gửi prompt và lấy ảnh thumbnail không chữ.'
+  },
+  {
+    key: 'audio',
+    label: 'Tự động tạo audio',
+    description: 'Tự kiểm duyệt kịch bản và gửi sang Genmax bằng giọng đã chọn.'
+  }
+];
+
 export default function Settings({
   lockedPromptVersion = '',
   chatGptOperation = ''
@@ -130,6 +166,23 @@ export default function Settings({
     }));
   };
 
+  const handlePipelineChange = (stepKey, enabled) => {
+    setPromptsData(prev => ({
+      ...prev,
+      versions: {
+        ...prev.versions,
+        [activeVersion]: {
+          ...prev.versions[activeVersion],
+          pipeline: {
+            ...DEFAULT_PIPELINE,
+            ...prev.versions[activeVersion].pipeline,
+            [stepKey]: enabled
+          }
+        }
+      }
+    }));
+  };
+
   const handleVersionChange = (e) => {
     const newVersion = e.target.value;
     setActiveVersion(newVersion);
@@ -151,6 +204,10 @@ export default function Settings({
         project_url: newData.versions[activeVersion].project_url,
         default_voice_id:
           newData.versions[activeVersion].default_voice_id || '',
+        pipeline: {
+          ...DEFAULT_PIPELINE,
+          ...(newData.versions[activeVersion].pipeline || {})
+        },
         prompts: currentPrompts
       };
       
@@ -266,6 +323,39 @@ export default function Settings({
     );
   };
 
+  const handleSavePipeline = async () => {
+    const versionId = activeVersion;
+    const pipeline = {
+      ...DEFAULT_PIPELINE,
+      ...promptsData.versions[versionId].pipeline
+    };
+    const result = await saveSection(
+      'pipeline',
+      'Đang lưu pipeline của bộ prompt...',
+      'Đã lưu pipeline cho bộ prompt này.',
+      () => fetch(
+        `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/pipeline`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(pipeline)
+        }
+      )
+    );
+    if (result && activeVersion === versionId) {
+      setPromptsData(prev => ({
+        ...prev,
+        versions: {
+          ...prev.versions,
+          [versionId]: {
+            ...prev.versions[versionId],
+            pipeline: result.pipeline
+          }
+        }
+      }));
+    }
+  };
+
   const handleSaveVoices = async () => {
     const result = await saveSection(
       'voices',
@@ -373,6 +463,10 @@ export default function Settings({
     promptDefaultVoiceId &&
     !voicesData.voices.some(voice => voice.id === promptDefaultVoiceId)
   );
+  const currentPipeline = {
+    ...DEFAULT_PIPELINE,
+    ...currentVersion.pipeline
+  };
 
   const promptFields = [
     { key: 'outline', label: '1. Dàn ý (Outline)', help: 'Biến có sẵn: {transcript}' },
@@ -639,6 +733,49 @@ export default function Settings({
           style={{ width: '100%', marginTop: '12px' }}
           disabled={activeVersionLocked}
         />
+      </div>
+
+      <div className="prompt-item" style={{ marginBottom: '20px' }}>
+        <div className="prompt-header">
+          <div>
+            <label>⚙️ Pipeline tự động của bộ prompt</label>
+            <div className="help-text" style={{ marginTop: '5px' }}>
+              Bốn bước lõi Dàn ý → Intro → Body → Outro luôn bắt buộc. Các bước
+              dưới đây được áp dụng độc lập cho video mới của riêng bộ prompt này.
+            </div>
+          </div>
+          <button
+            className="btn-save section-save-button"
+            onClick={handleSavePipeline}
+            disabled={Boolean(savingSection) || activeVersionLocked}
+          >
+            💾 Lưu pipeline
+          </button>
+        </div>
+        <div className="pipeline-core-flow" aria-label="Các bước lõi bắt buộc">
+          <span>Dàn ý</span><b>→</b><span>Intro</span><b>→</b><span>Body</span><b>→</b><span>Outro</span>
+        </div>
+        <div className="pipeline-options">
+          {PIPELINE_STEPS.map((step, index) => (
+            <label key={step.key} className="pipeline-option">
+              <input
+                type="checkbox"
+                checked={currentPipeline[step.key]}
+                onChange={(event) => handlePipelineChange(step.key, event.target.checked)}
+                disabled={activeVersionLocked}
+              />
+              <span className="pipeline-step-number">{index + 6}</span>
+              <span>
+                <strong>{step.label}</strong>
+                <small>{step.description}</small>
+              </span>
+            </label>
+          ))}
+        </div>
+        <div className="help-text pipeline-snapshot-help">
+          Mỗi job lưu một bản chụp pipeline khi được thêm vào hàng đợi. Sửa cấu
+          hình tại đây không thay đổi job đã xếp hàng hoặc đang phục hồi.
+        </div>
       </div>
 
       <div className="prompt-item" style={{ marginBottom: '20px' }}>

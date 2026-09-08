@@ -10,6 +10,47 @@ DEFAULT_CHATGPT_PROJECT_URL = (
     "https://chatgpt.com/g/"
     "g-p-6a1f9204f2d88191b39b64eb7f2dbb97-dd-vn2-phan-tich/project"
 )
+PROMPT_PIPELINE_ENV = "PROMPT_PIPELINE_JSON"
+DEFAULT_PROMPT_PIPELINE = {
+    "metadata": True,
+    "chapters": True,
+    "thumbnail_with_text": True,
+    "thumbnail_without_text": True,
+    "audio": True,
+}
+
+
+def normalize_prompt_pipeline(value: object) -> dict[str, bool]:
+    """Return a complete, dependency-safe pipeline for legacy config data."""
+    pipeline = value if isinstance(value, dict) else {}
+    return {
+        key: pipeline.get(key) if isinstance(pipeline.get(key), bool) else default
+        for key, default in DEFAULT_PROMPT_PIPELINE.items()
+    }
+
+
+def validate_prompt_pipeline(value: object) -> dict[str, bool]:
+    """Validate pipeline writes while still filling keys added in newer releases."""
+    if value is None:
+        return dict(DEFAULT_PROMPT_PIPELINE)
+    if not isinstance(value, dict):
+        raise ValueError("Cấu hình pipeline của bộ prompt không hợp lệ.")
+    unknown_keys = set(value) - set(DEFAULT_PROMPT_PIPELINE)
+    if unknown_keys:
+        raise ValueError(
+            "Pipeline chứa bước không được hỗ trợ: "
+            + ", ".join(sorted(unknown_keys))
+        )
+    invalid_keys = [key for key, enabled in value.items() if not isinstance(enabled, bool)]
+    if invalid_keys:
+        raise ValueError(
+            "Trạng thái bước pipeline phải là bật hoặc tắt: "
+            + ", ".join(sorted(invalid_keys))
+        )
+    return {
+        key: value.get(key, default)
+        for key, default in DEFAULT_PROMPT_PIPELINE.items()
+    }
 
 
 def validate_project_url(value: str) -> str:
@@ -59,11 +100,20 @@ def add_project_defaults(data: dict) -> dict:
     for version in normalized.get("versions", {}).values():
         version.setdefault("project_url", DEFAULT_CHATGPT_PROJECT_URL)
         version.setdefault("default_voice_id", "")
+        version["pipeline"] = normalize_prompt_pipeline(version.get("pipeline"))
     return normalized
 
 
 def validate_prompt_projects(data: dict) -> dict:
     normalized = add_project_defaults(data)
-    for version in normalized.get("versions", {}).values():
+    source_versions = data.get("versions", {}) if isinstance(data, dict) else {}
+    for version_id, version in normalized.get("versions", {}).items():
         version["project_url"] = validate_project_url(version["project_url"])
+        source_version = source_versions.get(version_id, {})
+        source_pipeline = (
+            source_version.get("pipeline")
+            if isinstance(source_version, dict)
+            else None
+        )
+        version["pipeline"] = validate_prompt_pipeline(source_pipeline)
     return normalized

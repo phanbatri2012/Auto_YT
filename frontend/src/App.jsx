@@ -1,7 +1,11 @@
 import { useState, useEffect, useRef } from 'react'
 import './App.css'
 import AutoLogin from './AutoLogin'
+import AudioReviewPanel from './AudioReviewPanel'
+import JobCenter from './JobCenter'
 import Settings from './Settings'
+import VideoQueuePanel from './VideoQueuePanel'
+import YouTubeDownloader from './YouTubeDownloader'
 
 const SECONDS_PER_MINUTE = 60
 const SECONDS_PER_HOUR = 60 * SECONDS_PER_MINUTE
@@ -33,7 +37,7 @@ async function saveAudioDuration(videoId, durationSeconds) {
   }
 }
 
-function AudioDurationBadge({ videoId, audioUrl, savedDurationSeconds }) {
+function AudioDurationBadge({ videoId, audioUrl, savedDurationSeconds, audioReviewStatus }) {
   const [durationSeconds, setDurationSeconds] = useState(savedDurationSeconds || null)
   const [loadFailed, setLoadFailed] = useState(false)
 
@@ -72,6 +76,10 @@ function AudioDurationBadge({ videoId, audioUrl, savedDurationSeconds }) {
     label = durationSeconds !== null
       ? formatAudioDuration(durationSeconds)
       : loadFailed ? 'Audio không khả dụng' : 'Đang tải...'
+  } else if (audioReviewStatus === 'pending') {
+    label = 'Chưa tự động kiểm tra'
+  } else if (audioReviewStatus === 'blocked') {
+    label = 'Kịch bản cần sửa'
   }
 
   return (
@@ -108,6 +116,7 @@ function App() {
   const [audioStatus, setAudioStatus] = useState('not_started')
   const [audioMissingSegments, setAudioMissingSegments] = useState(0)
   const [progressMsg, setProgressMsg] = useState('')
+  const [queueRefreshKey, setQueueRefreshKey] = useState(0)
   const [currentVideoId, setCurrentVideoId] = useState(null)
   const currentVideoIdRef = useRef(null)
   const [videoTitle, setVideoTitle] = useState('')
@@ -128,6 +137,8 @@ function App() {
   const [currentVideoVoiceId, setCurrentVideoVoiceId] = useState('')
   const [currentVideoVoiceName, setCurrentVideoVoiceName] = useState('')
   const [audioTaskVoiceName, setAudioTaskVoiceName] = useState('')
+  const [audioReview, setAudioReview] = useState(null)
+  const [isLoadingAudioReview, setIsLoadingAudioReview] = useState(false)
   const [regenerateVoiceId, setRegenerateVoiceId] = useState('')
   const [publishFilter, setPublishFilter] = useState('unpublished') // 'all' | 'published' | 'unpublished'
   const [promptVersionFilter, setPromptVersionFilter] = useState('all')
@@ -352,6 +363,34 @@ function App() {
       if (intervalId) clearInterval(intervalId);
     };
   }, [currentVideoId])
+
+  useEffect(() => {
+    if (!currentVideoId) {
+      setAudioReview(null)
+      return undefined
+    }
+
+    let stopped = false
+    setIsLoadingAudioReview(true)
+    fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}/audio-review`)
+      .then(async response => {
+        const data = await response.json()
+        if (!response.ok || !data.success) {
+          throw new Error(data.detail || data.error || `HTTP ${response.status}`)
+        }
+        if (!stopped) setAudioReview(data.audio_review || null)
+      })
+      .catch(error => {
+        if (!stopped) console.error('Failed to load audio review', error)
+      })
+      .finally(() => {
+        if (!stopped) setIsLoadingAudioReview(false)
+      })
+
+    return () => {
+      stopped = true
+    }
+  }, [currentVideoId])
   
   const fetchPromptVersions = async () => {
     try {
@@ -390,93 +429,39 @@ function App() {
   }
 
   const handleRun = async () => {
-    if (!url.trim() || chatGptControlsDisabled) return
-    const selectedVoice = voiceOptions.find(
-      voice => voice.id === selectedVoiceId
-    )
+    if (!url.trim() || isFetching) return
+    const submittedUrl = url.trim()
     setIsFetching(true)
-    setShowResult(false)
     setErrorMsg('')
-    setResultText('')
-    setVideoTitle('')
-    setCurrentVideoPromptVersion(selectedPromptVersion)
-    setCurrentVideoVoiceId(selectedVoiceId)
-    setCurrentVideoVoiceName(selectedVoice?.name || '')
-    setAudioTaskVoiceName(selectedVoice?.name || '')
-    setRegenerateVoiceId(selectedVoiceId)
-    setAudioStatus('not_started')
-    setAudioMissingSegments(0)
-    setChatUrl('')
-    setProgressMsg('⏳ Đang khởi động...')
+    setProgressMsg('Đang thêm video vào hàng đợi...')
     
     try {
-      // Start job - returns immediately with job_id
       const response = await fetch('http://127.0.0.1:8080/api/process-video', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          url,
+          url: submittedUrl,
           prompt_version: selectedPromptVersion,
           voice_id: selectedVoiceId || null
         })
-      });
-      const { job_id } = await response.json();
-      if (!job_id) throw new Error('Backend did not return a job_id');
-
-      // Poll every 3 seconds until done or error
-      await new Promise((resolve) => {
-        const interval = setInterval(async () => {
-          try {
-            const res = await fetch(`http://127.0.0.1:8080/api/jobs/${job_id}`);
-            const job = await res.json();
-            setProgressMsg(job.progress || '...');
-            if (job.status === 'done') {
-              clearInterval(interval);
-              const data = job.result;
-              setResultText(data.summary);
-              setFullTranscript(data.full_transcript);
-              setChatUrl(data.chat_url || '');
-              setCurrentVideoId(data.video_id);
-              setVideoTitle(data.title || '');
-              setCurrentVideoPromptVersion(
-                data.prompt_version || selectedPromptVersion
-              );
-              setCurrentVideoVoiceId(data.voice_id || selectedVoiceId);
-              setCurrentVideoVoiceName(data.voice_name || selectedVoice?.name || '');
-              setAudioTaskVoiceName(
-                data.audio_task?.voice_name || data.voice_name || ''
-              );
-              setRegenerateVoiceId(data.voice_id || selectedVoiceId);
-              setIsCurrentVideoPublished(false);
-              setAudioStatus(data.audio_task?.status || 'not_started');
-              setAudioMissingSegments(data.audio_task?.missing_segments || 0);
-              setCurrentVideoHasCheckpoint(Boolean(data.failed_step));
-              if (data.generation_warning) {
-                setErrorMsg(
-                  'Đã lưu phần nội dung hoàn tất. Bước cần tạo lại: ' +
-                  data.generation_warning
-                );
-              }
-              if (data.audio_error) {
-                alert('Audio chưa được gửi: ' + data.audio_error);
-              }
-              resolve();
-            } else if (job.status === 'error') {
-              clearInterval(interval);
-              setErrorMsg(job.error || 'Đã xảy ra lỗi không xác định.');
-              resolve();
-            }
-          } catch {
-            // ignore transient fetch errors, keep polling
-          }
-        }, 3000);
-      });
-
-    } catch {
-      setErrorMsg('Cannot connect to the Python backend. Is it running?');
+      })
+      const data = await response.json()
+      if (!response.ok || !data.job_id) {
+        throw new Error(data.detail || 'Backend không trả về mã job.')
+      }
+      setUrl('')
+      setProgressMsg(
+        data.duplicate
+          ? 'Video này đã có trong hàng đợi; hệ thống không tạo job trùng.'
+          : data.status === 'running'
+          ? 'Video đã bắt đầu xử lý.'
+          : `Đã thêm vào hàng đợi${data.queue_position ? ` ở vị trí #${data.queue_position}` : ''}.`
+      )
+      setQueueRefreshKey(value => value + 1)
+    } catch (error) {
+      setErrorMsg(error.message || 'Không thể kết nối tới backend Python.')
     } finally {
       setIsFetching(false)
-      setShowResult(true)
     }
   }
 
@@ -519,6 +504,7 @@ function App() {
       setShowResult(true);
       setActiveView('fetcher');
       setCurrentVideoId(id);  // track which video is loaded
+      setAudioReview(null);
       setIsCurrentVideoPublished(Boolean(data.is_published));
       setCurrentVideoHasCheckpoint(Boolean(data.has_checkpoint));
       setAudioStatus('not_started');
@@ -641,6 +627,7 @@ function App() {
                 setFullTranscript(resultData.full_transcript);
                 setChatUrl(resultData.chat_url || '');
                 setCurrentVideoId(resultData.video_id);
+                setAudioReview(resultData.audio_review || null);
                 setVideoTitle(resultData.title || '');
                 setCurrentVideoHasCheckpoint(Boolean(resultData.failed_step));
                 if (resultData.generation_warning) {
@@ -800,17 +787,24 @@ function App() {
 
   const handleGenerateAudio = async () => {
     if (!currentVideoId) return;
+    if (audioReview && !audioReview.can_approve) {
+      alert('Kịch bản không đạt kiểm tra tự động. Hãy sửa nội dung trước khi tạo audio.');
+      return;
+    }
+
     setIsGenAudio(true);
     let keepPolling = false;
     try {
-      const res = await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}/generate-audio`, {
-        method: 'POST',
-      });
+      const res = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/generate-audio`,
+        { method: 'POST' }
+      );
       const data = await res.json();
+      if (data.audio_review) setAudioReview(data.audio_review);
       if (!data.success) {
-        setAudioStatus(data.audio_task?.status || 'failed');
+        setAudioStatus(data.audio_task?.status || 'not_started');
         setAudioMissingSegments(data.audio_task?.missing_segments || 0);
-        alert('Lỗi: ' + (data.error || 'Không thể tạo audio.'));
+        alert('Lỗi: ' + (data.detail || data.error || 'Không thể tạo audio.'));
         return;
       }
 
@@ -837,6 +831,10 @@ function App() {
 
   const handleRetryAudio = async () => {
     if (!currentVideoId) return;
+    if (audioReview?.status === 'blocked') {
+      alert('Kịch bản không đạt kiểm tra tự động nên chưa thể retry audio.');
+      return;
+    }
     const confirmed = window.confirm(
       'Genmax sẽ trừ credit thêm một lần. Bạn có chắc muốn retry audio?'
     );
@@ -867,6 +865,10 @@ function App() {
 
   const handleRegenerateAudio = async () => {
     if (!currentVideoId || !regenerateVoiceId || isGenAudio) return;
+    if (audioReview?.status === 'blocked') {
+      alert('Kịch bản không đạt kiểm tra tự động nên chưa thể tạo lại audio.');
+      return;
+    }
     const voiceName = getVoiceName(regenerateVoiceId);
     const confirmed = window.confirm(
       `Tạo lại toàn bộ audio bằng giọng "${voiceName}" sẽ tốn credit Genmax. ` +
@@ -1053,7 +1055,12 @@ function App() {
         </div>
         <ul className="nav-menu">
           <li className={`nav-item ${activeView === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveView('dashboard')}>Dashboard</li>
+          <li className={`nav-item ${activeView === 'jobs' ? 'active' : ''}`} onClick={() => setActiveView('jobs')}>Trung tâm Job</li>
           <li className={`nav-item ${activeView === 'fetcher' ? 'active' : ''}`} onClick={() => setActiveView('fetcher')}>Video Fetcher</li>
+          <li
+            className={`nav-item ${activeView === 'downloader' ? 'active' : ''}`}
+            onClick={() => setActiveView('downloader')}
+          >YouTube Downloader</li>
           <li
             className={`nav-item ${activeView === 'autologin' ? 'active' : ''}`}
             aria-disabled={chatGptControlsDisabled}
@@ -1084,6 +1091,10 @@ function App() {
               lockedPromptVersion={chatGptStatus.promptVersion}
               chatGptOperation={chatGptStatus.operation}
             />
+          ) : activeView === 'jobs' ? (
+            <JobCenter onOpenVideo={viewSavedVideo} />
+          ) : activeView === 'downloader' ? (
+            <YouTubeDownloader />
           ) : activeView === 'dashboard' ? (
             <>
               <h1 className="hero-title">Video Library</h1>
@@ -1208,6 +1219,7 @@ function App() {
                             videoId={video.id}
                             audioUrl={video.audio_url}
                             savedDurationSeconds={video.audio_duration_seconds}
+                            audioReviewStatus={video.audio_review_status}
                           />
                         </div>
                         <div style={{ display: 'flex', gap: '15px', marginBottom: '10px', alignItems: 'center' }}>
@@ -1411,34 +1423,29 @@ function App() {
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !chatGptControlsDisabled) handleRun()
+                    if (e.key === 'Enter' && !isFetching) handleRun()
                   }}
                 />
-                <button className="btn-run" onClick={handleRun} disabled={chatGptControlsDisabled}>
+                <button className="btn-run" onClick={handleRun} disabled={isFetching || !url.trim()}>
                   {isFetching
-                    ? 'Generating (5-10 mins)...'
+                    ? 'Đang thêm vào hàng đợi...'
                     : chatGptStatus.busy
-                      ? 'ChatGPT đang bận...'
-                      : 'Lên Kịch Bản & Audio ⚡'}
+                      ? 'Thêm vào hàng đợi ＋'
+                      : 'Lên Kịch Bản ⚡'}
                 </button>
               </div>
 
-              {isFetching && !showResult && (
-                <div className="result-panel" style={{ textAlign: 'center', padding: '40px' }}>
-                  <h3 style={{ color: 'var(--accent)' }}>Executing Multi-Step AI Workflow...</h3>
-                  <p style={{ color: '#aaa', marginTop: '12px', fontSize: '1.05em', fontWeight: '500' }}>
-                    {progressMsg || '...'}
-                  </p>
-                  <p style={{ color: '#666', marginTop: '8px', fontSize: '0.85em' }}>
-                    Quá trình có thể mất <strong>5-15 phút</strong>. Bạn có thể mở tab khác trong lúc chờ.
-                  </p>
-                  <div style={{ marginTop: '20px', display: 'flex', justifyContent: 'center', gap: '8px' }}>
-                    <div className="status-dot" style={{ animation: 'pulse 1.5s infinite' }}></div>
-                    <div className="status-dot" style={{ animation: 'pulse 1.5s infinite 0.2s' }}></div>
-                    <div className="status-dot" style={{ animation: 'pulse 1.5s infinite 0.4s' }}></div>
-                  </div>
+              {progressMsg && (
+                <div style={{ color: '#76d7c4', textAlign: 'center', marginTop: '12px' }}>
+                  {progressMsg}
                 </div>
               )}
+
+              <VideoQueuePanel
+                refreshKey={queueRefreshKey}
+                onOpenJobCenter={() => setActiveView('jobs')}
+                onOpenVideo={viewSavedVideo}
+              />
 
               {showResult && (
                 <div className="result-panel">
@@ -1568,13 +1575,19 @@ function App() {
                                 ? handleRetryAudio
                                 : handleGenerateAudio
                             }
-                            disabled={isGenAudio}
+                            disabled={
+                              isGenAudio ||
+                              isLoadingAudioReview ||
+                              (audioStatus === 'failed'
+                                ? audioReview?.status !== 'approved'
+                                : Boolean(audioReview && !audioReview.can_approve))
+                            }
                             style={{
                               padding: '4px 14px', borderRadius: '4px',
-                              cursor: isGenAudio ? 'not-allowed' : 'pointer',
+                              cursor: (isGenAudio || isLoadingAudioReview || Boolean(audioReview && !audioReview.can_approve)) ? 'not-allowed' : 'pointer',
                               border: '1px solid #1abc9c',
-                              background: isGenAudio ? '#333' : 'rgba(26,188,156,0.2)',
-                              color: isGenAudio ? '#888' : '#1abc9c',
+                              background: (isGenAudio || isLoadingAudioReview) ? '#333' : 'rgba(26,188,156,0.2)',
+                              color: (isGenAudio || isLoadingAudioReview) ? '#888' : '#1abc9c',
                               fontWeight: 'bold'
                             }}
                           >
@@ -1586,7 +1599,9 @@ function App() {
                                 ? `🔄 Tiếp tục Audio${audioMissingSegments ? ` (còn ${audioMissingSegments} phần)` : ''}`
                               : audioStatus === 'failed'
                                 ? '⚠️ Retry Audio (sẽ tốn credit)'
-                                : '🎵 Tạo Audio'}
+                                : audioReview?.status === 'blocked'
+                                  ? '⛔ Kịch bản cần sửa'
+                                  : '🔎 Kiểm tra tự động & tạo Audio'}
                           </button>
                         )}
                         {chatUrl && currentVideoHasCheckpoint && (
@@ -1603,7 +1618,7 @@ function App() {
                             ▶️ Tiếp tục tạo
                           </button>
                         )}
-                        {chatUrl && !currentVideoHasCheckpoint && resultText && resultText.includes('THUMBNAIL KHÔNG CHỮ') && resultText.includes('CHAPTERS') && (
+                        {chatUrl && !currentVideoHasCheckpoint && resultText && audioUrl && resultText.includes('THUMBNAIL KHÔNG CHỮ') && resultText.includes('CHAPTERS') && (
                           <button
                             disabled={true}
                             style={{
@@ -1647,6 +1662,15 @@ function App() {
                   </div>
                   
                   <div className="content-blocks" style={{ display: 'flex', flexDirection: 'column', gap: '20px', marginTop: '20px' }}>
+                    {activeTab === 'summary' && currentVideoId && (
+                      <AudioReviewPanel
+                        review={audioReview}
+                        loading={isLoadingAudioReview}
+                        submitting={isGenAudio}
+                        voiceName={getVoiceName(currentVideoVoiceId, currentVideoVoiceName)}
+                        hasAudio={Boolean(audioUrl)}
+                      />
+                    )}
                     {errorMsg ? (
                       <span style={{color: '#ff4b4b'}}>{errorMsg}</span>
                     ) : (

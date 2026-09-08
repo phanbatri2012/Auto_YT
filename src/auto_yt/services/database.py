@@ -1,5 +1,6 @@
 import sqlite3
 import datetime
+import json
 import re
 import unicodedata
 from pathlib import Path
@@ -233,6 +234,46 @@ def init_db():
         'CREATE INDEX IF NOT EXISTS idx_audio_tasks_request_hash '
         'ON audio_tasks(request_hash)'
     )
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS audio_reviews (
+            video_id INTEGER PRIMARY KEY,
+            script_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            report_json TEXT DEFAULT '{}',
+            reviewed_at TEXT DEFAULT '',
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS system_jobs (
+            id TEXT PRIMARY KEY,
+            job_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            title TEXT DEFAULT '',
+            progress TEXT DEFAULT '',
+            payload_json TEXT DEFAULT '{}',
+            result_json TEXT DEFAULT '{}',
+            error TEXT DEFAULT '',
+            video_id INTEGER,
+            prompt_version TEXT DEFAULT '',
+            voice_id TEXT DEFAULT '',
+            attempt INTEGER DEFAULT 0,
+            recovery_count INTEGER DEFAULT 0,
+            resume_from_step TEXT DEFAULT '',
+            next_retry_at TEXT DEFAULT '',
+            cancel_requested INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            started_at TEXT DEFAULT '',
+            finished_at TEXT DEFAULT '',
+            FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE SET NULL
+        )
+    ''')
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_system_jobs_queue '
+        'ON system_jobs(job_type, status, created_at)'
+    )
     try:
         c.execute("ALTER TABLE audio_tasks ADD COLUMN segments_json TEXT DEFAULT ''")
     except sqlite3.OperationalError:
@@ -245,6 +286,15 @@ def init_db():
         c.execute("ALTER TABLE audio_tasks ADD COLUMN voice_name TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
+    for column_definition in (
+        "recovery_count INTEGER DEFAULT 0",
+        "resume_from_step TEXT DEFAULT ''",
+        "next_retry_at TEXT DEFAULT ''",
+    ):
+        try:
+            c.execute(f"ALTER TABLE system_jobs ADD COLUMN {column_definition}")
+        except sqlite3.OperationalError:
+            pass
     c.execute(
         "SELECT id, generated_script FROM videos "
         "WHERE COALESCE(generated_title, '') = ''"
@@ -364,6 +414,8 @@ def get_all_videos(
         "COALESCE(NULLIF(generated_title, ''), title) AS title, "
         'created_at, is_published, chat_url, '
         'prompt_version, voice_id, voice_name, audio_duration_seconds, '
+        "COALESCE((SELECT status FROM audio_reviews WHERE video_id = videos.id), '') "
+        'AS audio_review_status, '
         'SUBSTR(generated_script, 1, 300) as snippet, '
         'COALESCE('
         'NULLIF((SELECT audio_url FROM audio_tasks WHERE video_id = videos.id), \'\'), '
@@ -408,6 +460,7 @@ def get_video(video_id: int) -> dict:
 def delete_video(video_id: int) -> bool:
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
+    c.execute('DELETE FROM audio_reviews WHERE video_id = ?', (video_id,))
     c.execute('DELETE FROM audio_tasks WHERE video_id = ?', (video_id,))
     c.execute('DELETE FROM videos WHERE id = ?', (video_id,))
     deleted = c.rowcount > 0
@@ -514,6 +567,92 @@ def get_audio_task(video_id: int) -> dict:
     conn.close()
     return dict(row) if row else None
 
+
+def get_audio_review(video_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM audio_reviews WHERE video_id = ?', (video_id,))
+    row = c.fetchone()
+    conn.close()
+    if row is None:
+        return None
+    review = dict(row)
+    try:
+        review["report"] = json.loads(review.get("report_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        review["report"] = {}
+    review.pop("report_json", None)
+    return review
+
+
+def upsert_audio_review(
+    video_id: int,
+    script_hash: str,
+    status: str,
+    report: dict,
+    reviewed_at: str = "",
+) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH))
+    c = conn.cursor()
+    c.execute(
+        '''
+        INSERT INTO audio_reviews (
+            video_id, script_hash, status, report_json, reviewed_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(video_id) DO UPDATE SET
+            script_hash = excluded.script_hash,
+            status = excluded.status,
+            report_json = excluded.report_json,
+            reviewed_at = excluded.reviewed_at,
+            updated_at = excluded.updated_at
+        ''',
+        (
+            video_id,
+            script_hash,
+            status,
+            json.dumps(report, ensure_ascii=False),
+            reviewed_at,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return get_audio_review(video_id)
+
+
+def list_audio_reviews(limit: int = 100) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        '''
+        SELECT audio_reviews.*,
+               COALESCE(NULLIF(videos.generated_title, ''), videos.title) AS title,
+               videos.title AS original_title,
+               videos.generated_title AS generated_title,
+               videos.url AS video_url
+        FROM audio_reviews
+        LEFT JOIN videos ON videos.id = audio_reviews.video_id
+        ORDER BY audio_reviews.updated_at DESC
+        LIMIT ?
+        ''',
+        (max(1, min(int(limit), 500)),),
+    )
+    rows = c.fetchall()
+    conn.close()
+    reviews = []
+    for row in rows:
+        review = dict(row)
+        try:
+            review["report"] = json.loads(review.get("report_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            review["report"] = {}
+        review.pop("report_json", None)
+        reviews.append(review)
+    return reviews
+
 def get_audio_task_by_request_hash(request_hash: str) -> dict:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -545,6 +684,29 @@ def get_active_audio_tasks() -> list[dict]:
     c = conn.cursor()
     c.execute(
         "SELECT * FROM audio_tasks WHERE status IN ('pending', 'processing')"
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def list_audio_tasks(limit: int = 100) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        '''
+        SELECT audio_tasks.*,
+               COALESCE(NULLIF(videos.generated_title, ''), videos.title) AS title,
+               videos.title AS original_title,
+               videos.generated_title AS generated_title,
+               videos.url AS video_url
+        FROM audio_tasks
+        LEFT JOIN videos ON videos.id = audio_tasks.video_id
+        ORDER BY audio_tasks.updated_at DESC
+        LIMIT ?
+        ''',
+        (max(1, min(int(limit), 500)),),
     )
     rows = c.fetchall()
     conn.close()
@@ -610,6 +772,421 @@ def upsert_audio_task(
     conn.commit()
     conn.close()
     return get_audio_task(video_id)
+
+
+SYSTEM_JOB_JSON_FIELDS = {"payload_json", "result_json"}
+SYSTEM_JOB_MUTABLE_FIELDS = {
+    "status",
+    "title",
+    "progress",
+    "payload_json",
+    "result_json",
+    "error",
+    "video_id",
+    "prompt_version",
+    "voice_id",
+    "attempt",
+    "recovery_count",
+    "resume_from_step",
+    "next_retry_at",
+    "cancel_requested",
+    "started_at",
+    "finished_at",
+}
+
+
+def utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _decode_system_job(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    job = dict(row)
+    for field in SYSTEM_JOB_JSON_FIELDS:
+        try:
+            job[field.removesuffix("_json")] = json.loads(job.get(field) or "{}")
+        except (TypeError, json.JSONDecodeError):
+            job[field.removesuffix("_json")] = {}
+        job.pop(field, None)
+    job["cancel_requested"] = bool(job.get("cancel_requested"))
+    return job
+
+
+def create_system_job(
+    job_id: str,
+    job_type: str,
+    title: str,
+    payload: dict,
+    prompt_version: str = "",
+    voice_id: str = "",
+) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    c = conn.cursor()
+    c.execute(
+        '''
+        INSERT INTO system_jobs (
+            id, job_type, status, title, progress, payload_json,
+            result_json, error, prompt_version, voice_id, created_at, updated_at
+        ) VALUES (?, ?, 'queued', ?, ?, ?, '{}', '', ?, ?, ?, ?)
+        ''',
+        (
+            job_id,
+            job_type,
+            title,
+            "Đang chờ trong hàng đợi",
+            json.dumps(payload, ensure_ascii=False),
+            prompt_version,
+            voice_id,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return get_system_job(job_id)
+
+
+def get_system_job(job_id: str) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM system_jobs WHERE id = ?", (job_id,))
+    row = c.fetchone()
+    conn.close()
+    return _decode_system_job(row)
+
+
+def list_system_jobs(
+    limit: int = 100,
+    job_type: str | None = None,
+) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    params: list = []
+    where_clause = ""
+    if job_type:
+        where_clause = " WHERE job_type = ?"
+        params.append(job_type)
+    params.append(max(1, min(int(limit), 500)))
+    c.execute(
+        f'''
+        SELECT system_jobs.*,
+               videos.url AS video_url,
+               videos.title AS original_title,
+               videos.generated_title AS generated_title
+        FROM system_jobs
+        LEFT JOIN videos ON videos.id = system_jobs.video_id
+        {where_clause}
+        ORDER BY system_jobs.created_at DESC
+        LIMIT ?
+        ''',
+        params,
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [_decode_system_job(row) for row in rows]
+
+
+def update_system_job(job_id: str, **changes) -> dict | None:
+    invalid_fields = set(changes) - SYSTEM_JOB_MUTABLE_FIELDS
+    if invalid_fields:
+        raise ValueError(f"Unsupported system job fields: {sorted(invalid_fields)}")
+    if not changes:
+        return get_system_job(job_id)
+
+    encoded_changes = dict(changes)
+    for field in SYSTEM_JOB_JSON_FIELDS:
+        if field in encoded_changes and not isinstance(encoded_changes[field], str):
+            encoded_changes[field] = json.dumps(
+                encoded_changes[field],
+                ensure_ascii=False,
+            )
+    encoded_changes["updated_at"] = utc_now()
+    assignments = ", ".join(f"{field} = ?" for field in encoded_changes)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    c = conn.cursor()
+    c.execute(
+        f"UPDATE system_jobs SET {assignments} WHERE id = ?",
+        (*encoded_changes.values(), job_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_system_job(job_id)
+
+
+def claim_next_system_job(job_type: str) -> dict | None:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            '''
+            SELECT * FROM system_jobs
+            WHERE job_type = ? AND cancel_requested = 0
+              AND status IN ('queued', 'retry_wait')
+            ORDER BY created_at ASC
+            LIMIT 1
+            ''',
+            (job_type,),
+        ).fetchone()
+        if row is None:
+            conn.execute("COMMIT")
+            return None
+        if (
+            row["status"] == "retry_wait"
+            and row["next_retry_at"]
+            and row["next_retry_at"] > now
+        ):
+            conn.execute("COMMIT")
+            return None
+        conn.execute(
+            '''
+            UPDATE system_jobs
+            SET status = 'running', progress = ?, attempt = attempt + 1,
+                started_at = ?, finished_at = '', next_retry_at = '', updated_at = ?
+            WHERE id = ? AND status IN ('queued', 'retry_wait')
+            ''',
+            ("Đang khởi động", now, now, row["id"]),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    return get_system_job(row["id"])
+
+
+def recover_interrupted_system_jobs(job_type: str) -> int:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    c = conn.cursor()
+    c.execute(
+        '''
+        UPDATE system_jobs
+        SET status = CASE WHEN cancel_requested = 1 THEN 'canceled' ELSE 'queued' END,
+            progress = CASE
+                WHEN cancel_requested = 1 THEN 'Đã hủy khi ứng dụng khởi động lại'
+                ELSE 'Đã khôi phục sau khi ứng dụng khởi động lại'
+            END,
+            finished_at = CASE WHEN cancel_requested = 1 THEN ? ELSE '' END,
+            recovery_count = CASE
+                WHEN cancel_requested = 1 THEN recovery_count
+                ELSE recovery_count + 1
+            END,
+            next_retry_at = '',
+            cancel_requested = 0,
+            updated_at = ?
+        WHERE job_type = ? AND status = 'running'
+        ''',
+        (now, now, job_type),
+    )
+    recovered = c.rowcount
+    conn.commit()
+    conn.close()
+    return recovered
+
+
+def schedule_system_job_recovery(
+    job_id: str,
+    resume_from_step: str,
+    delay_seconds: float,
+    error: str,
+    result_json: dict | None = None,
+) -> dict | None:
+    retry_at = (
+        datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(seconds=max(0.0, float(delay_seconds)))
+    ).isoformat()
+    changes = {
+        "status": "retry_wait",
+        "progress": (
+            f"Chờ tự phục hồi từ bước {resume_from_step or 'gần nhất'}"
+        ),
+        "error": error,
+        "resume_from_step": resume_from_step,
+        "next_retry_at": retry_at,
+        "cancel_requested": 0,
+        "finished_at": "",
+    }
+    if result_json is not None:
+        changes["result_json"] = result_json
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT recovery_count FROM system_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            conn.execute("ROLLBACK")
+            return None
+        changes["recovery_count"] = int(row[0] or 0) + 1
+        changes["updated_at"] = utc_now()
+        assignments = ", ".join(f"{field} = ?" for field in changes)
+        encoded_values = []
+        for field, value in changes.items():
+            if field in SYSTEM_JOB_JSON_FIELDS and not isinstance(value, str):
+                value = json.dumps(value, ensure_ascii=False)
+            encoded_values.append(value)
+        conn.execute(
+            f"UPDATE system_jobs SET {assignments} WHERE id = ?",
+            (*encoded_values, job_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    return get_system_job(job_id)
+
+
+def has_claimable_system_jobs(job_type: str) -> bool:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        '''
+        SELECT status, next_retry_at FROM system_jobs
+        WHERE job_type = ? AND cancel_requested = 0
+          AND status IN ('queued', 'retry_wait')
+        ORDER BY created_at ASC
+        LIMIT 1
+        ''',
+        (job_type,),
+    )
+    row = c.fetchone()
+    conn.close()
+    if row is None:
+        return False
+    return (
+        row["status"] == "queued"
+        or not row["next_retry_at"]
+        or row["next_retry_at"] <= now
+    )
+
+
+def get_next_system_job_retry_delay(job_type: str) -> float | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        '''
+        SELECT status, next_retry_at FROM system_jobs
+        WHERE job_type = ? AND status IN ('queued', 'retry_wait')
+          AND cancel_requested = 0
+        ORDER BY created_at ASC
+        LIMIT 1
+        ''',
+        (job_type,),
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row or row["status"] == "queued":
+        return 0.0 if row else None
+    if not row["next_retry_at"]:
+        return None
+    try:
+        retry_at = datetime.datetime.fromisoformat(row["next_retry_at"])
+    except (TypeError, ValueError):
+        return 0.0
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return max(0.0, (retry_at - now).total_seconds())
+
+
+def request_cancel_system_job(job_id: str) -> dict | None:
+    job = get_system_job(job_id)
+    if not job:
+        return None
+    if job["status"] in {"queued", "retry_wait", "paused"}:
+        return update_system_job(
+            job_id,
+            status="canceled",
+            progress="Đã hủy khỏi hàng đợi",
+            cancel_requested=0,
+            finished_at=utc_now(),
+        )
+    if job["status"] == "running":
+        return update_system_job(
+            job_id,
+            progress="Đã nhận yêu cầu dừng; sẽ dừng tại điểm an toàn",
+            cancel_requested=1,
+        )
+    return job
+
+
+def pause_system_job(job_id: str) -> dict | None:
+    job = get_system_job(job_id)
+    if not job:
+        return None
+    if job["status"] not in {"queued", "retry_wait"}:
+        raise ValueError("Chỉ có thể tạm dừng job đang chờ.")
+    return update_system_job(
+        job_id,
+        status="paused",
+        progress="Đã tạm dừng trong hàng đợi",
+    )
+
+
+def resume_system_job(job_id: str) -> dict | None:
+    job = get_system_job(job_id)
+    if not job:
+        return None
+    if job["status"] != "paused":
+        raise ValueError("Chỉ có thể tiếp tục job đang tạm dừng.")
+    return update_system_job(
+        job_id,
+        status="queued",
+        progress="Đang chờ sau khi tiếp tục",
+        next_retry_at="",
+    )
+
+
+def retry_system_job(job_id: str) -> dict | None:
+    job = get_system_job(job_id)
+    if not job:
+        return None
+    if job["status"] not in {"error", "canceled"}:
+        raise ValueError("Chỉ có thể chạy lại job lỗi hoặc đã hủy.")
+    return update_system_job(
+        job_id,
+        status="queued",
+        progress="Đang chờ chạy lại",
+        error="",
+        result_json={},
+        recovery_count=0,
+        next_retry_at="",
+        cancel_requested=0,
+        finished_at="",
+    )
+
+
+def get_system_job_queue_position(job_id: str) -> int | None:
+    job = get_system_job(job_id)
+    if not job or job["status"] != "queued":
+        return None
+    conn = sqlite3.connect(str(DB_PATH))
+    c = conn.cursor()
+    c.execute(
+        '''
+        SELECT COUNT(*) FROM system_jobs
+        WHERE job_type = ? AND status = 'queued' AND cancel_requested = 0
+          AND created_at <= ?
+        ''',
+        (job["job_type"], job["created_at"]),
+    )
+    position = int(c.fetchone()[0])
+    conn.close()
+    return position
 
 # Initialize tables when module is imported
 init_db()

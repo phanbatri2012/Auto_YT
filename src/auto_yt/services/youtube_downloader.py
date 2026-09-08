@@ -7,6 +7,7 @@ import shutil
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -267,6 +268,7 @@ class DownloadJobManager:
         job = {
             "id": job_id,
             "status": "running",
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "destination": str(destination_path),
             "total": len(normalized_videos),
             "completed": 0,
@@ -297,6 +299,11 @@ class DownloadJobManager:
             daemon=True,
         ).start()
         return job_id
+
+    def list_jobs(self, limit: int = 100) -> list[dict]:
+        with self._lock:
+            job_ids = list(self._jobs.keys())[-max(1, min(int(limit), 500)):]
+        return [job for job_id in reversed(job_ids) if (job := self.get(job_id))]
 
     def get(self, job_id: str) -> dict | None:
         with self._lock:

@@ -29,6 +29,7 @@ class AudioDeduplicationTests(unittest.TestCase):
         }
 
         with (
+            patch.object(main, "_require_audio_review_approval"),
             patch.object(
                 main.db,
                 "get_video",
@@ -47,6 +48,7 @@ class AudioDeduplicationTests(unittest.TestCase):
 
     def test_history_failure_never_falls_through_to_paid_submission(self):
         with (
+            patch.object(main, "_require_audio_review_approval"),
             patch.object(
                 main.db,
                 "get_video",

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Literal, Optional
 import asyncio
 import json
@@ -27,9 +27,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from auto_yt.services.youtube_service import get_video_transcript, get_video_title
 from auto_yt.services.chatgpt_service import process_prompt_via_chatgpt
+from auto_yt.services.chatgpt_worker import sanitize_generated_script
 import auto_yt.services.database as db
 import auto_yt.services.audio_utils as audio_utils
 import auto_yt.services.tts_service as tts
+from auto_yt.services.audio_review import (
+    audit_script_for_audio,
+    get_audio_script,
+    get_audio_script_hash,
+)
 from auto_yt.services import voice_config
 from auto_yt.services import chatgpt_projects
 from auto_yt.services.generation_checkpoint import (
@@ -48,6 +54,10 @@ import re
 # In-memory job store: job_id -> {status, progress, result, error}
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
+_video_queue_state_lock = threading.Lock()
+_video_queue_worker_active = False
+_video_queue_wakeup_timer: threading.Timer | None = None
+_video_queue_wakeup_at = 0.0
 _prompts_config_lock = threading.Lock()
 _chatgpt_profile_lock = threading.Lock()
 _chatgpt_state_lock = threading.Lock()
@@ -66,6 +76,7 @@ INITIAL_GENERATED_SCRIPT = (
     "### [THUMBNAIL KHÔNG CHỮ]\n"
 )
 MAX_THUMBNAIL_IMAGES_PER_RESPONSE = 2
+VIDEO_RECOVERY_DELAYS_SECONDS = (30, 120, 300)
 
 
 def _normalize_thumbnail_urls(value, fallback_url: str = "") -> list[str]:
@@ -96,6 +107,9 @@ def _finish_chatgpt_operation() -> None:
         _chatgpt_operation = ""
         _chatgpt_prompt_version = ""
     _chatgpt_profile_lock.release()
+    queue_kicker = globals().get("_kick_video_queue")
+    if queue_kicker:
+        queue_kicker()
 
 
 def _get_chatgpt_operation() -> str:
@@ -113,11 +127,20 @@ class AccountData(BaseModel):
     totp_secret: str = ""
     headless: bool = True
 
+class PromptPipelineData(BaseModel):
+    metadata: bool = True
+    chapters: bool = True
+    thumbnail_with_text: bool = True
+    thumbnail_without_text: bool = True
+    audio: bool = True
+
+
 class PromptVersion(BaseModel):
     name: str
     prompts: dict
     project_url: str = chatgpt_projects.DEFAULT_CHATGPT_PROJECT_URL
     default_voice_id: str = ""
+    pipeline: PromptPipelineData = Field(default_factory=PromptPipelineData)
 
 class PromptsData(BaseModel):
     active_version: str
@@ -234,6 +257,11 @@ class RetryAudioRequest(BaseModel):
 class RegenerateAudioRequest(BaseModel):
     voice_id: str
     confirm_credit_charge: bool
+
+
+class ApproveAudioReviewRequest(BaseModel):
+    confirm_credit_charge: bool
+    voice_id: Optional[str] = None
 
 
 class AudioDurationRequest(BaseModel):
@@ -353,19 +381,7 @@ def apply_tts_filters(text: str) -> str:
     return filtered_text
 
 def get_clean_script_for_tts(text: str) -> str:
-    # Extract only INTRO, BODY, and OUTRO for reading
-    script = ""
-    try:
-        # Match from ### [INTRO] to ### [METADATA
-        match = re.search(r"### \[INTRO\](.*?)### \[METADATA", text, re.DOTALL)
-        if match:
-            script = match.group(1)
-            # Remove inner ### tags
-            script = re.sub(r"### \[[^\]]+\]", "", script)
-            script = re.sub(r"\n\s*\n", "\n\n", script).strip()
-    except Exception:
-        pass
-    return script
+    return get_audio_script(text)
 
 
 AUDIO_VOICE_ID = voice_config.DEFAULT_VOICE_ID
@@ -376,6 +392,108 @@ _audio_watchers: dict[int, threading.Thread] = {}
 _audio_watchers_lock = threading.Lock()
 _audio_sync_locks: dict[int, threading.Lock] = {}
 _audio_sync_locks_guard = threading.Lock()
+
+
+def _audio_review_response(review: dict) -> dict:
+    report = review.get("report") or {}
+    return {
+        "video_id": review["video_id"],
+        "script_hash": review.get("script_hash", ""),
+        "status": review.get("status", "pending"),
+        "reviewed_at": review.get("reviewed_at", ""),
+        "updated_at": review.get("updated_at", ""),
+        "can_approve": bool(report.get("can_approve")),
+        "errors": report.get("errors") or [],
+        "warnings": report.get("warnings") or [],
+        "metrics": report.get("metrics") or {},
+    }
+
+
+def _prepare_audio_review(video_id: int) -> dict:
+    video = db.get_video(video_id)
+    if not video:
+        raise RuntimeError("Video không tồn tại.")
+
+    report = audit_script_for_audio(video.get("generated_script", ""))
+    previous_review = db.get_audio_review(video_id)
+    same_approved_script = (
+        previous_review
+        and previous_review.get("status") == "approved"
+        and previous_review.get("script_hash") == report["script_hash"]
+        and report["can_approve"]
+    )
+    status = (
+        "approved"
+        if same_approved_script
+        else "pending" if report["can_approve"] else "blocked"
+    )
+    reviewed_at = (
+        previous_review.get("reviewed_at", "") if same_approved_script else ""
+    )
+    return db.upsert_audio_review(
+        video_id=video_id,
+        script_hash=report["script_hash"],
+        status=status,
+        report=report,
+        reviewed_at=reviewed_at,
+    )
+
+
+def _automatically_approve_audio_review(video_id: int) -> dict:
+    """Approve the current narrative hash only when deterministic checks pass."""
+    review = _prepare_audio_review(video_id)
+    report = review.get("report") or {}
+    if not report.get("can_approve"):
+        return review
+    if review.get("status") == "approved":
+        return review
+    return db.upsert_audio_review(
+        video_id=video_id,
+        script_hash=review["script_hash"],
+        status="approved",
+        report=report,
+        reviewed_at=db.utc_now(),
+    )
+
+
+def _auto_review_and_create_audio(
+    video_id: int,
+    requested_voice_id: str = "",
+    requested_voice_name: str = "",
+) -> tuple[dict, dict | None, str]:
+    """Run the quality gate and idempotent TTS submission as one system step."""
+    review = _automatically_approve_audio_review(video_id)
+    if review.get("status") != "approved":
+        return (
+            review,
+            None,
+            "Kịch bản không đạt kiểm tra tự động; chưa gửi sang Genmax.",
+        )
+    try:
+        task = _ensure_audio_task(
+            video_id,
+            requested_voice_id=requested_voice_id,
+            requested_voice_name=requested_voice_name,
+        )
+        if task.get("status") == "failed":
+            return (
+                review,
+                task,
+                task.get("error")
+                or "Task Genmax đã thất bại; hệ thống không tự retry để tránh trừ credit.",
+            )
+        return review, task, ""
+    except Exception as exc:
+        return review, db.get_audio_task(video_id), str(exc) or repr(exc)
+
+
+def _require_audio_review_approval(video_id: int) -> dict:
+    review = _prepare_audio_review(video_id)
+    if review.get("status") != "approved":
+        raise RuntimeError(
+            "Kịch bản chưa đạt bước kiểm tra tự động cho nội dung hiện tại."
+        )
+    return review
 
 
 def _audio_task_response(task: dict) -> dict:
@@ -818,6 +936,7 @@ def _ensure_audio_task(
     video = db.get_video(video_id)
     if not video:
         raise RuntimeError("Video không tồn tại.")
+    _require_audio_review_approval(video_id)
 
     existing_task = db.get_audio_task(video_id)
     if requested_voice_id:
@@ -949,13 +1068,463 @@ def _ensure_audio_task(
 
 
 @app.on_event("startup")
-def resume_audio_watchers() -> None:
+def resume_background_jobs() -> None:
     for task in db.get_active_audio_tasks():
         _start_audio_watcher(task["video_id"])
+    db.recover_interrupted_system_jobs("video_generation")
+    _kick_video_queue()
+
+
+@app.on_event("shutdown")
+def stop_video_queue_wakeup_timer() -> None:
+    global _video_queue_wakeup_at, _video_queue_wakeup_timer
+    with _video_queue_state_lock:
+        if _video_queue_wakeup_timer is not None:
+            _video_queue_wakeup_timer.cancel()
+        _video_queue_wakeup_timer = None
+        _video_queue_wakeup_at = 0.0
+
+
+class VideoJobCanceled(RuntimeError):
+    pass
+
+
+def _sync_legacy_job(job: dict | None) -> None:
+    if not job:
+        return
+    with _jobs_lock:
+        _jobs[job["id"]] = {
+            "status": job["status"],
+            "progress": job.get("progress", ""),
+            "result": job.get("result") or None,
+            "error": job.get("error") or None,
+            "queue_position": db.get_system_job_queue_position(job["id"]),
+        }
+
+
+def _update_video_job(job_id: str, **changes) -> dict | None:
+    job = db.update_system_job(job_id, **changes)
+    _sync_legacy_job(job)
+    return job
+
+
+def _raise_if_video_job_canceled(job_id: str) -> None:
+    job = db.get_system_job(job_id)
+    if job and job.get("cancel_requested"):
+        raise VideoJobCanceled("Job đã được người dùng yêu cầu dừng.")
+
+
+def _schedule_automatic_video_recovery(
+    job_id: str,
+    video_id: int | None,
+    error: str,
+    result: dict | None,
+) -> bool:
+    if video_id is None:
+        return False
+    checkpoint = load_checkpoint(video_id)
+    resume_from_step = str(checkpoint.get("current_step") or "").strip()
+    if not checkpoint or not resume_from_step or resume_from_step == "complete":
+        return False
+
+    job = db.get_system_job(job_id)
+    recovery_count = int((job or {}).get("recovery_count") or 0)
+    if recovery_count >= len(VIDEO_RECOVERY_DELAYS_SECONDS):
+        return False
+
+    delay_seconds = VIDEO_RECOVERY_DELAYS_SECONDS[recovery_count]
+    recovered_job = db.schedule_system_job_recovery(
+        job_id,
+        resume_from_step=resume_from_step,
+        delay_seconds=delay_seconds,
+        error=error,
+        result_json=result,
+    )
+    if not recovered_job:
+        return False
+    recovered_job = db.update_system_job(
+        job_id,
+        progress=(
+            f"Đã lưu checkpoint; tự phục hồi bước {resume_from_step} sau "
+            f"{delay_seconds} giây "
+            f"(lần {recovered_job['recovery_count']}/"
+            f"{len(VIDEO_RECOVERY_DELAYS_SECONDS)})"
+        ),
+    )
+    _sync_legacy_job(recovered_job)
+    _schedule_video_queue_wakeup(delay_seconds)
+    return True
+
+
+def _execute_video_job(job: dict) -> None:
+    job_id = job["id"]
+    payload = job.get("payload") or {}
+    request_url = str(payload.get("url") or "").strip()
+    prompt_version = str(job.get("prompt_version") or payload.get("prompt_version") or "")
+    voice_id = str(job.get("voice_id") or payload.get("voice_id") or "")
+    voice_name = str(payload.get("voice_name") or "")
+    pipeline = chatgpt_projects.normalize_prompt_pipeline(
+        payload.get("pipeline")
+        if "pipeline" in payload
+        else _get_prompt_pipeline(prompt_version)
+    )
+    video_id = job.get("video_id")
+    full_transcript = ""
+    title = ""
+    completed_script_before_restart = ""
+
+    def update(message: str) -> None:
+        _update_video_job(job_id, progress=message)
+
+    try:
+        _raise_if_video_job_canceled(job_id)
+        if video_id:
+            existing_video = db.get_video(video_id)
+            if not existing_video:
+                raise RuntimeError(f"Không tìm thấy bản nháp video #{video_id} để tiếp tục.")
+            full_transcript = existing_video["transcript"]
+            title = existing_video["title"]
+            existing_script = existing_video.get("generated_script", "")
+            if (
+                existing_script
+                and existing_script != INITIAL_GENERATED_SCRIPT
+                and not load_checkpoint(video_id)
+                and get_clean_script_for_tts(existing_script)
+            ):
+                completed_script_before_restart = existing_script
+            update("Đang tiếp tục bản nháp đã lưu")
+        else:
+            update("Đang tải phụ đề YouTube")
+            full_transcript = get_video_transcript(request_url)
+            _raise_if_video_job_canceled(job_id)
+            title = get_video_title(request_url)
+            update("Đang lưu bản nháp an toàn")
+            video_id = db.save_video(
+                request_url,
+                title,
+                full_transcript,
+                INITIAL_GENERATED_SCRIPT,
+                "",
+                prompt_version,
+                voice_id,
+                voice_name,
+            )
+            _update_video_job(job_id, video_id=video_id, title=title)
+
+        _raise_if_video_job_canceled(job_id)
+        if completed_script_before_restart:
+            update("Đã tìm thấy kịch bản hoàn tất; đang tiếp tục bước audio")
+            worker_result = {
+                "script": completed_script_before_restart,
+                "chat_url": existing_video.get("chat_url", ""),
+                "warning": "",
+                "complete_for_audio": True,
+            }
+        else:
+            combined_text = (
+                f"TIÊU ĐỀ KỊCH BẢN: {title}\n\nNỘI DUNG:\n{full_transcript}"
+            )
+            update("ChatGPT đang viết kịch bản (5-15 phút)")
+            worker_result = process_prompt_via_chatgpt(
+                combined_text,
+                prompt_version,
+                video_id,
+                pipeline=pipeline,
+            )
+        _raise_if_video_job_canceled(job_id)
+        summary_text = (
+            worker_result["script"]
+            if isinstance(worker_result, dict)
+            else worker_result
+        )
+        summary_text = sanitize_generated_script(summary_text)
+        chat_url = (
+            worker_result.get("chat_url", "")
+            if isinstance(worker_result, dict)
+            else ""
+        )
+        generation_warning = (
+            worker_result.get("warning", "")
+            if isinstance(worker_result, dict)
+            else ""
+        )
+        failed_step = (
+            worker_result.get("failed_step", "")
+            if isinstance(worker_result, dict)
+            else ""
+        )
+        complete_for_audio = (
+            worker_result.get("complete_for_audio", True)
+            if isinstance(worker_result, dict)
+            else True
+        )
+
+        update("Đang lưu vào database")
+        if not db.update_video_generation(video_id, summary_text, chat_url):
+            raise RuntimeError("Không thể cập nhật bản nháp video.")
+        if not generation_warning:
+            clear_checkpoint(video_id)
+
+        _raise_if_video_job_canceled(job_id)
+        if pipeline["audio"]:
+            update("Đang tự động kiểm tra kịch bản trước bước audio")
+        else:
+            update("Đã hoàn thành các bước tự động của pipeline")
+        audio_task = None
+        audio_error = ""
+        audio_review = None
+        if complete_for_audio and pipeline["audio"]:
+            audio_review, audio_task, audio_error = _auto_review_and_create_audio(
+                video_id,
+                requested_voice_id=voice_id,
+                requested_voice_name=voice_name,
+            )
+        elif not complete_for_audio:
+            audio_review = _prepare_audio_review(video_id)
+        review_response = (
+            _audio_review_response(audio_review) if audio_review else None
+        )
+
+        result = {
+            "success": True,
+            "full_transcript": full_transcript,
+            "summary": summary_text,
+            "title": title,
+            "prompt_version": prompt_version,
+            "voice_id": voice_id,
+            "voice_name": voice_name,
+            "pipeline": pipeline,
+            "chat_url": chat_url,
+            "video_id": video_id,
+            "audio_task": (
+                _audio_task_response(audio_task) if audio_task else None
+            ),
+            "audio_error": audio_error or None,
+            "audio_review": review_response,
+            "generation_warning": generation_warning,
+            "complete_for_audio": complete_for_audio,
+            "failed_step": failed_step,
+        }
+        if generation_warning and _schedule_automatic_video_recovery(
+            job_id,
+            video_id,
+            generation_warning,
+            result,
+        ):
+            return
+        _update_video_job(
+            job_id,
+            status="error" if generation_warning else "done",
+            progress=(
+                (
+                    "Đã giữ phần hoàn tất nhưng tự phục hồi đã hết số lần thử"
+                )
+                if generation_warning
+                else (
+                    "Kịch bản đã hoàn thành; pipeline không tự tạo audio"
+                    if not pipeline["audio"]
+                    else (
+                        "Kịch bản không đạt kiểm tra tự động; chưa tạo audio"
+                        if audio_review and audio_review.get("status") == "blocked"
+                        else (
+                            "Kịch bản đã tự động duyệt; audio chưa thể khởi tạo"
+                            if audio_error
+                            else (
+                                "Kịch bản và audio đã hoàn thành"
+                                if audio_task and audio_task.get("status") == "completed"
+                                else "Kịch bản đã tự động duyệt; Genmax đang tạo audio"
+                            )
+                        )
+                    )
+                )
+            ),
+            result_json=result,
+            error=generation_warning,
+            resume_from_step="",
+            next_retry_at="",
+            cancel_requested=0,
+            finished_at=db.utc_now(),
+        )
+    except VideoJobCanceled as exc:
+        _update_video_job(
+            job_id,
+            status="canceled",
+            progress="Đã dừng tại điểm an toàn",
+            error=str(exc),
+            cancel_requested=0,
+            finished_at=db.utc_now(),
+        )
+    except Exception as exc:
+        error_message = str(exc) or repr(exc)
+        if (
+            "Could not retrieve a transcript" in error_message
+            or "Subtitles are disabled" in error_message
+        ):
+            error_message = (
+                "Video này không có phụ đề (Transcript). Vui lòng chọn video khác."
+            )
+
+        recovered_result = None
+        if video_id is not None:
+            checkpoint = load_checkpoint(video_id)
+            if checkpoint:
+                from auto_yt.services.chatgpt_worker import build_video_script
+
+                partial_script = build_video_script(checkpoint)
+                checkpoint_chat_url = checkpoint.get("chat_url", "")
+                db.update_video_generation(
+                    video_id,
+                    partial_script,
+                    checkpoint_chat_url,
+                )
+                recovered_result = {
+                    "success": True,
+                    "full_transcript": full_transcript,
+                    "summary": partial_script,
+                    "title": title,
+                    "prompt_version": prompt_version,
+                    "voice_id": voice_id,
+                    "voice_name": voice_name,
+                    "pipeline": pipeline,
+                    "chat_url": checkpoint_chat_url,
+                    "video_id": video_id,
+                    "audio_task": None,
+                    "audio_error": None,
+                    "generation_warning": error_message,
+                    "complete_for_audio": False,
+                    "failed_step": checkpoint.get("current_step", "unknown"),
+                }
+            error_message = (
+                f"{error_message} Bản nháp video #{video_id} đã được lưu ở Dashboard."
+            )
+
+        if recovered_result and _schedule_automatic_video_recovery(
+            job_id,
+            video_id,
+            error_message,
+            recovered_result,
+        ):
+            return
+
+        _update_video_job(
+            job_id,
+            status="error",
+            progress=(
+                "Đã giữ phần hoàn tất nhưng tự phục hồi đã hết số lần thử"
+                if recovered_result
+                else "Tạo video thất bại"
+            ),
+            result_json=recovered_result or {},
+            error=error_message,
+            cancel_requested=0,
+            finished_at=db.utc_now(),
+        )
+    finally:
+        _finish_chatgpt_operation()
+
+
+def _drain_video_queue() -> None:
+    global _video_queue_worker_active
+    blocked_by_chatgpt = False
+    try:
+        while True:
+            job = db.claim_next_system_job("video_generation")
+            if not job:
+                return
+            _sync_legacy_job(job)
+            if not _try_start_chatgpt_operation(
+                "video",
+                job.get("prompt_version", ""),
+            ):
+                blocked_by_chatgpt = True
+                _update_video_job(
+                    job["id"],
+                    status="queued",
+                    progress="Đang chờ tác vụ ChatGPT hiện tại hoàn tất",
+                )
+                return
+            _execute_video_job(job)
+            current_job = db.get_system_job(job["id"])
+            if current_job and current_job["status"] == "retry_wait":
+                return
+    finally:
+        with _video_queue_state_lock:
+            _video_queue_worker_active = False
+        if (
+            not blocked_by_chatgpt
+            and not _chatgpt_profile_lock.locked()
+        ):
+            if db.has_claimable_system_jobs("video_generation"):
+                _kick_video_queue()
+            else:
+                _schedule_video_queue_wakeup()
+
+
+def _schedule_video_queue_wakeup(delay_seconds: float | None = None) -> None:
+    global _video_queue_wakeup_at, _video_queue_wakeup_timer
+    if delay_seconds is None:
+        delay_seconds = db.get_next_system_job_retry_delay("video_generation")
+    if delay_seconds is None:
+        return
+
+    delay_seconds = max(0.05, float(delay_seconds))
+    wakeup_at = time.monotonic() + delay_seconds
+
+    def wake_queue() -> None:
+        global _video_queue_wakeup_at, _video_queue_wakeup_timer
+        with _video_queue_state_lock:
+            if _video_queue_wakeup_timer is not timer:
+                return
+            _video_queue_wakeup_timer = None
+            _video_queue_wakeup_at = 0.0
+        _kick_video_queue()
+
+    with _video_queue_state_lock:
+        if (
+            _video_queue_wakeup_timer is not None
+            and _video_queue_wakeup_timer.is_alive()
+            and _video_queue_wakeup_at <= wakeup_at + 0.05
+        ):
+            return
+        if _video_queue_wakeup_timer is not None:
+            _video_queue_wakeup_timer.cancel()
+        timer = threading.Timer(delay_seconds, wake_queue)
+        timer.daemon = True
+        _video_queue_wakeup_timer = timer
+        _video_queue_wakeup_at = wakeup_at
+    timer.start()
+
+
+def _kick_video_queue() -> None:
+    global _video_queue_wakeup_at, _video_queue_wakeup_timer
+    global _video_queue_worker_active
+    should_schedule_wakeup = False
+    with _video_queue_state_lock:
+        if _video_queue_worker_active:
+            return
+        if not db.has_claimable_system_jobs("video_generation"):
+            should_schedule_wakeup = True
+        else:
+            if _video_queue_wakeup_timer is not None:
+                _video_queue_wakeup_timer.cancel()
+                _video_queue_wakeup_timer = None
+                _video_queue_wakeup_at = 0.0
+            _video_queue_worker_active = True
+    if should_schedule_wakeup:
+        _schedule_video_queue_wakeup()
+        return
+    thread = threading.Thread(target=_drain_video_queue, daemon=True)
+    try:
+        thread.start()
+    except Exception:
+        with _video_queue_state_lock:
+            _video_queue_worker_active = False
+        raise
 
 @app.post("/api/process-video")
 def process_video(request: VideoRequest):
     resolved_prompt_version = request.prompt_version or _get_active_prompt_version_id()
+    pipeline = _get_prompt_pipeline(resolved_prompt_version)
     requested_voice_id = request.voice_id or _get_prompt_default_voice_id(
         resolved_prompt_version
     )
@@ -969,171 +1538,57 @@ def process_video(request: VideoRequest):
         else:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    job_id = uuid.uuid4().hex[:12]
-    with _jobs_lock:
-        _jobs[job_id] = {"status": "running", "progress": "⏳ Đang khởi động...", "result": None, "error": None}
-
-    if not _try_start_chatgpt_operation(
-        "video",
-        resolved_prompt_version,
+    normalized_url = request.url.strip()
+    if not normalized_url:
+        raise HTTPException(status_code=400, detail="YouTube URL is required")
+    for existing_job in db.list_system_jobs(
+        limit=500,
+        job_type="video_generation",
     ):
-        with _jobs_lock:
-            _jobs[job_id].update({
-                "status": "error",
-                "progress": f"❌ Lỗi: {CHATGPT_BUSY_ERROR}",
-                "error": CHATGPT_BUSY_ERROR,
-            })
-        return {"job_id": job_id}
+        existing_payload = existing_job.get("payload") or {}
+        if (
+            existing_job["status"] in {"queued", "running", "retry_wait", "paused"}
+            and str(existing_payload.get("url") or "").strip() == normalized_url
+            and existing_job.get("prompt_version", "") == resolved_prompt_version
+            and existing_job.get("voice_id", "") == selected_voice["id"]
+            and chatgpt_projects.normalize_prompt_pipeline(
+                existing_payload.get("pipeline")
+            ) == pipeline
+        ):
+            _sync_legacy_job(existing_job)
+            _kick_video_queue()
+            return {
+                "job_id": existing_job["id"],
+                "status": existing_job["status"],
+                "queue_position": db.get_system_job_queue_position(
+                    existing_job["id"]
+                ),
+                "duplicate": True,
+            }
 
-    def _run():
-        profile_reserved = True
-        video_id = None
-
-        def update(msg: str):
-            with _jobs_lock:
-                _jobs[job_id]["progress"] = msg
-
-        try:
-            update("📥 Đang tải phụ đề YouTube...")
-            full_transcript = get_video_transcript(request.url)
-            title = get_video_title(request.url)
-
-            update("💾 Đang lưu bản nháp an toàn...")
-            video_id = db.save_video(
-                request.url,
-                title,
-                full_transcript,
-                INITIAL_GENERATED_SCRIPT,
-                "",
-                resolved_prompt_version,
-                selected_voice["id"],
-                selected_voice["name"],
-            )
-
-            combined_text = f"TIÊU ĐỀ KỊCH BẢN: {title}\n\nNỘI DUNG:\n{full_transcript}"
-
-            update("🤖 ChatGPT đang viết kịch bản (5-15 phút)...")
-            worker_result = process_prompt_via_chatgpt(
-                combined_text,
-                resolved_prompt_version,
-                video_id,
-            )
-            _finish_chatgpt_operation()
-            profile_reserved = False
-            summary_text = worker_result["script"] if isinstance(worker_result, dict) else worker_result
-            chat_url = worker_result.get("chat_url", "") if isinstance(worker_result, dict) else ""
-            generation_warning = (
-                worker_result.get("warning", "")
-                if isinstance(worker_result, dict)
-                else ""
-            )
-            complete_for_audio = (
-                worker_result.get("complete_for_audio", True)
-                if isinstance(worker_result, dict)
-                else True
-            )
-
-            update("💾 Đang lưu vào database...")
-            if not db.update_video_generation(video_id, summary_text, chat_url):
-                raise RuntimeError("Không thể cập nhật bản nháp video.")
-            if complete_for_audio and not generation_warning:
-                clear_checkpoint(video_id)
-            audio_task = None
-            audio_error = None
-            if complete_for_audio and get_clean_script_for_tts(summary_text):
-                try:
-                    update("🎙️ Đang kiểm tra và gửi yêu cầu audio an toàn...")
-                    audio_task = _ensure_audio_task(video_id)
-                    summary_text = db.get_video(video_id)["generated_script"]
-                except Exception as exc:
-                    audio_error = str(exc)
-
-            with _jobs_lock:
-                _jobs[job_id].update({
-                    "status": "done",
-                    "progress": (
-                        "⚠️ Đã lưu phần hoàn tất; một bước ChatGPT cần tạo lại."
-                        if generation_warning
-                        else "✅ Hoàn thành!"
-                    ),
-                    "result": {
-                        "success": True,
-                        "full_transcript": full_transcript,
-                        "summary": summary_text,
-                        "title": title,
-                        "prompt_version": resolved_prompt_version,
-                        "voice_id": selected_voice["id"],
-                        "voice_name": selected_voice["name"],
-                        "chat_url": chat_url,
-                        "video_id": video_id,
-                        "audio_task": (
-                            _audio_task_response(audio_task) if audio_task else None
-                        ),
-                        "audio_error": audio_error,
-                        "generation_warning": generation_warning,
-                        "complete_for_audio": complete_for_audio,
-                    }
-                })
-
-        except Exception as e:
-            error_msg = str(e)
-            if not error_msg:
-                error_msg = repr(e)
-            if "Could not retrieve a transcript" in error_msg or "Subtitles are disabled" in error_msg:
-                error_msg = "Video này không có phụ đề (Transcript). Vui lòng chọn video khác."
-
-            recovered_result = None
-            if video_id is not None:
-                cp = load_checkpoint(video_id)
-                if cp:
-                    from auto_yt.services.chatgpt_worker import build_video_script
-                    partial_script = build_video_script(cp)
-                    cp_chat_url = cp.get("chat_url", "")
-                    db.update_video_generation(video_id, partial_script, cp_chat_url)
-                    recovered_result = {
-                        "success": True,
-                        "full_transcript": full_transcript if 'full_transcript' in locals() else "",
-                        "summary": partial_script,
-                        "title": title if 'title' in locals() else "",
-                        "prompt_version": resolved_prompt_version,
-                        "voice_id": selected_voice["id"],
-                        "voice_name": selected_voice["name"],
-                        "chat_url": cp_chat_url,
-                        "video_id": video_id,
-                        "audio_task": None,
-                        "audio_error": None,
-                        "generation_warning": error_msg,
-                        "complete_for_audio": False,
-                        "failed_step": cp.get("current_step", "unknown")
-                    }
-                error_msg = (
-                    f"{error_msg} Bản nháp video #{video_id} đã được lưu ở Dashboard."
-                )
-
-            with _jobs_lock:
-                if recovered_result:
-                    _jobs[job_id].update({
-                        "status": "done",
-                        "progress": f"⚠️ Lỗi: {error_msg[:100]}",
-                        "result": recovered_result
-                    })
-                else:
-                    _jobs[job_id].update({
-                        "status": "error",
-                        "progress": f"❌ Lỗi: {error_msg[:100]}",
-                        "error": error_msg
-                    })
-        finally:
-            if profile_reserved:
-                _finish_chatgpt_operation()
-
-    thread = threading.Thread(target=_run, daemon=True)
-    try:
-        thread.start()
-    except Exception:
-        _finish_chatgpt_operation()
-        raise
-    return {"job_id": job_id}
+    job_id = uuid.uuid4().hex[:12]
+    job = db.create_system_job(
+        job_id=job_id,
+        job_type="video_generation",
+        title=normalized_url,
+        payload={
+            "url": normalized_url,
+            "prompt_version": resolved_prompt_version,
+            "voice_id": selected_voice["id"],
+            "voice_name": selected_voice["name"],
+            "pipeline": pipeline,
+        },
+        prompt_version=resolved_prompt_version,
+        voice_id=selected_voice["id"],
+    )
+    _sync_legacy_job(job)
+    _kick_video_queue()
+    refreshed_job = db.get_system_job(job_id)
+    return {
+        "job_id": job_id,
+        "status": refreshed_job["status"],
+        "queue_position": db.get_system_job_queue_position(job_id),
+    }
 
 
 @app.post("/api/videos/{video_id}/continue-generation")
@@ -1154,6 +1609,11 @@ def continue_video_generation(video_id: int):
         )
 
     prompt_version = video.get("prompt_version", "")
+    pipeline = chatgpt_projects.normalize_prompt_pipeline(
+        checkpoint.get("pipeline")
+        if "pipeline" in checkpoint
+        else _get_prompt_pipeline(prompt_version)
+    )
     job_id = uuid.uuid4().hex[:12]
     with _jobs_lock:
         _jobs[job_id] = {
@@ -1189,36 +1649,61 @@ def continue_video_generation(video_id: int):
                 combined_text,
                 prompt_version,
                 video_id,
+                pipeline=pipeline,
             )
             _finish_chatgpt_operation()
             profile_reserved = False
 
-            summary_text = worker_result["script"]
+            summary_text = sanitize_generated_script(worker_result["script"])
             chat_url = worker_result.get("chat_url", "")
             generation_warning = worker_result.get("warning", "")
             complete_for_audio = worker_result.get("complete_for_audio", True)
             if not db.update_video_generation(video_id, summary_text, chat_url):
                 raise RuntimeError("Không thể cập nhật video sau khi tiếp tục.")
-            if complete_for_audio and not generation_warning:
+            if complete_for_audio:
                 clear_checkpoint(video_id)
 
+            update(
+                "🔎 Đang tự động kiểm tra kịch bản trước bước audio..."
+                if pipeline["audio"]
+                else "✅ Đã hoàn thành các bước tự động của pipeline."
+            )
             audio_task = None
-            audio_error = None
-            if complete_for_audio and get_clean_script_for_tts(summary_text):
-                try:
-                    update("🎙️ Đang kiểm tra và gửi yêu cầu audio an toàn...")
-                    audio_task = _ensure_audio_task(video_id)
-                    summary_text = db.get_video(video_id)["generated_script"]
-                except Exception as exc:
-                    audio_error = str(exc)
+            audio_error = ""
+            audio_review = None
+            if complete_for_audio and pipeline["audio"]:
+                audio_review, audio_task, audio_error = _auto_review_and_create_audio(
+                    video_id,
+                    requested_voice_id=video.get("voice_id", ""),
+                    requested_voice_name=video.get("voice_name", ""),
+                )
+            elif not complete_for_audio:
+                audio_review = _prepare_audio_review(video_id)
 
             with _jobs_lock:
                 _jobs[job_id].update({
                     "status": "done",
                     "progress": (
-                        "⚠️ Đã lưu checkpoint mới; còn bước cần tiếp tục."
+                        (
+                            "⚠️ Phần đọc đã tự động duyệt và gửi audio; "
+                            "còn bước ChatGPT cần tiếp tục."
+                            if audio_task and not audio_error
+                            else "⚠️ Đã lưu checkpoint mới; còn bước cần tiếp tục."
+                        )
                         if generation_warning
-                        else "✅ Video đã được tiếp tục hoàn tất."
+                        else (
+                            "✅ Kịch bản đã hoàn thành; pipeline không tự tạo audio."
+                            if not pipeline["audio"]
+                            else (
+                                "⛔ Kịch bản không đạt kiểm tra tự động; chưa tạo audio."
+                                if audio_review and audio_review.get("status") == "blocked"
+                                else (
+                                    "⚠️ Kịch bản đã tự động duyệt; audio chưa thể khởi tạo."
+                                    if audio_error
+                                    else "🎙️ Kịch bản đã tự động duyệt; Genmax đang tạo audio."
+                                )
+                            )
+                        )
                     ),
                     "result": {
                         "success": True,
@@ -1228,12 +1713,18 @@ def continue_video_generation(video_id: int):
                         "prompt_version": prompt_version,
                         "voice_id": video.get("voice_id", ""),
                         "voice_name": video.get("voice_name", ""),
+                        "pipeline": pipeline,
                         "chat_url": chat_url,
                         "video_id": video_id,
                         "audio_task": (
                             _audio_task_response(audio_task) if audio_task else None
                         ),
-                        "audio_error": audio_error,
+                        "audio_error": audio_error or None,
+                        "audio_review": (
+                            _audio_review_response(audio_review)
+                            if audio_review
+                            else None
+                        ),
                         "generation_warning": generation_warning,
                         "complete_for_audio": complete_for_audio,
                     },
@@ -1259,13 +1750,353 @@ def continue_video_generation(video_id: int):
     return {"job_id": job_id}
 
 
-@app.get("/api/jobs/{job_id}")
-def get_job(job_id: str):
-    with _jobs_lock:
-        job = _jobs.get(job_id)
+def _system_job_center_item(job: dict, queue_position: int | None) -> dict:
+    payload = job.get("payload") or {}
+    return {
+        "id": job["id"],
+        "raw_id": job["id"],
+        "type": job["job_type"],
+        "type_label": "Tạo video",
+        "status": job["status"],
+        "title": (
+            job.get("generated_title")
+            or job.get("original_title")
+            or job.get("title")
+            or payload.get("url", "")
+        ),
+        "original_title": job.get("original_title") or job.get("title", ""),
+        "generated_title": job.get("generated_title", ""),
+        "video_url": job.get("video_url") or payload.get("url", ""),
+        "progress": job.get("progress", ""),
+        "error": job.get("error", ""),
+        "video_id": job.get("video_id"),
+        "prompt_version": job.get("prompt_version", ""),
+        "voice_id": job.get("voice_id", ""),
+        "pipeline": chatgpt_projects.normalize_prompt_pipeline(
+            payload.get("pipeline")
+        ),
+        "queue_position": queue_position,
+        "attempt": job.get("attempt", 0),
+        "recovery_count": job.get("recovery_count", 0),
+        "recovery_limit": len(VIDEO_RECOVERY_DELAYS_SECONDS),
+        "resume_from_step": job.get("resume_from_step", ""),
+        "next_retry_at": job.get("next_retry_at", ""),
+        "created_at": job.get("created_at", ""),
+        "updated_at": job.get("updated_at", ""),
+        "started_at": job.get("started_at", ""),
+        "finished_at": job.get("finished_at", ""),
+        "can_cancel": job["status"] in {"queued", "running", "retry_wait", "paused"},
+        "can_retry": job["status"] in {"error", "canceled"},
+        "can_pause": job["status"] in {"queued", "retry_wait"},
+        "can_resume": job["status"] == "paused",
+    }
+
+
+def _audio_job_center_item(task: dict) -> dict:
+    status_map = {
+        "pending": "queued",
+        "processing": "running",
+        "completed": "done",
+        "failed": "error",
+        "interrupted": "error",
+    }
+    status = status_map.get(task.get("status"), task.get("status", "error"))
+    progress_map = {
+        "pending": "Đang chờ Genmax",
+        "processing": "Genmax đang tạo audio",
+        "completed": "Audio hoàn thành",
+        "failed": "Tạo audio thất bại",
+        "interrupted": "Audio bị gián đoạn",
+    }
+    return {
+        "id": f"audio:{task['video_id']}",
+        "raw_id": str(task["video_id"]),
+        "type": "audio",
+        "type_label": "Tạo audio",
+        "status": status,
+        "title": task.get("title") or f"Video #{task['video_id']}",
+        "original_title": task.get("original_title", ""),
+        "generated_title": task.get("generated_title", ""),
+        "video_url": task.get("video_url", ""),
+        "progress": progress_map.get(task.get("status"), task.get("status", "")),
+        "error": task.get("error", ""),
+        "video_id": task["video_id"],
+        "voice_id": task.get("voice_id", ""),
+        "created_at": task.get("created_at", ""),
+        "updated_at": task.get("updated_at", ""),
+        "can_cancel": False,
+        "can_retry": False,
+    }
+
+
+def _audio_review_job_center_item(review: dict) -> dict:
+    status_map = {
+        "pending": "awaiting_review",
+        "blocked": "review_blocked",
+        "approved": "done",
+    }
+    progress_map = {
+        "pending": "Bản ghi cũ chưa chạy bước tự động kiểm tra audio",
+        "blocked": "Kịch bản không đạt kiểm tra tự động; chưa gửi Genmax",
+        "approved": "Kịch bản đã được hệ thống tự động duyệt",
+    }
+    status = review.get("status", "blocked")
+    return {
+        "id": f"audio-review:{review['video_id']}",
+        "raw_id": str(review["video_id"]),
+        "type": "audio_review",
+        "type_label": "Kiểm duyệt audio",
+        "status": status_map.get(status, "review_blocked"),
+        "title": review.get("title") or f"Video #{review['video_id']}",
+        "original_title": review.get("original_title", ""),
+        "generated_title": review.get("generated_title", ""),
+        "video_url": review.get("video_url", ""),
+        "progress": progress_map.get(status, status),
+        "error": (
+            "; ".join(
+                item.get("message", "")
+                for item in (review.get("report") or {}).get("errors", [])
+                if item.get("message")
+            )
+            if status == "blocked"
+            else ""
+        ),
+        "video_id": review["video_id"],
+        "created_at": review.get("updated_at", ""),
+        "updated_at": review.get("updated_at", ""),
+        "can_cancel": False,
+        "can_retry": False,
+    }
+
+
+def _download_job_center_item(job: dict) -> dict:
+    status_map = {
+        "completed": "done",
+        "completed_with_errors": "error",
+        "stopped": "canceled",
+        "stopping": "running",
+    }
+    status = status_map.get(job.get("status"), job.get("status", "running"))
+    download_videos = [
+        {
+            "id": item.get("id", ""),
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+        }
+        for item in job.get("items", [])
+    ]
+    return {
+        "id": f"download:{job['id']}",
+        "raw_id": job["id"],
+        "type": "youtube_download",
+        "type_label": "Tải YouTube",
+        "status": status,
+        "title": f"Tải {job.get('total', 0)} video",
+        "download_videos": download_videos,
+        "progress": (
+            f"{job.get('progress', 0)}% · "
+            f"{job.get('completed', 0)}/{job.get('total', 0)} hoàn thành"
+        ),
+        "error": (
+            f"{job.get('failed', 0)} video tải lỗi"
+            if job.get("failed")
+            else ""
+        ),
+        "created_at": job.get("created_at", ""),
+        "updated_at": job.get("created_at", ""),
+        "can_cancel": job.get("status") in {"running", "paused"},
+        "can_retry": False,
+        "can_pause": job.get("status") == "running",
+        "can_resume": job.get("status") == "paused",
+    }
+
+
+def _job_matches_video_search(item: dict, query: str) -> bool:
+    normalized_query = db.normalize_search_text(query)
+    if not normalized_query:
+        return True
+
+    values = [
+        item.get("title", ""),
+        item.get("original_title", ""),
+        item.get("generated_title", ""),
+        item.get("video_url", ""),
+        item.get("video_id", ""),
+        item.get("id", ""),
+        item.get("raw_id", ""),
+    ]
+    for video in item.get("download_videos", []):
+        values.extend((video.get("title", ""), video.get("url", ""), video.get("id", "")))
+    searchable = db.normalize_search_text(" ".join(str(value or "") for value in values))
+    return normalized_query in searchable
+
+
+@app.get("/api/jobs")
+def list_jobs(
+    limit: int = 100,
+    job_type: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    requested_limit = max(1, min(limit, 500))
+    normalized_search = db.normalize_search_text(search or "")[:300]
+    source_limit = 500 if normalized_search else requested_limit
+    items: list[dict] = []
+
+    if job_type in {None, "video_generation"}:
+        system_jobs = db.list_system_jobs(
+            limit=source_limit,
+            job_type="video_generation",
+        )
+        queued_jobs = sorted(
+            (job for job in system_jobs if job["status"] == "queued"),
+            key=lambda job: job["created_at"],
+        )
+        queue_positions = {
+            job["id"]: index for index, job in enumerate(queued_jobs, start=1)
+        }
+        items.extend(
+            _system_job_center_item(job, queue_positions.get(job["id"]))
+            for job in system_jobs
+        )
+
+    if job_type in {None, "audio"}:
+        items.extend(
+            _audio_job_center_item(task)
+            for task in db.list_audio_tasks(limit=source_limit)
+        )
+
+    if job_type in {None, "audio_review"}:
+        items.extend(
+            _audio_review_job_center_item(review)
+            for review in db.list_audio_reviews(limit=source_limit)
+        )
+
+    if job_type in {None, "youtube_download"}:
+        items.extend(
+            _download_job_center_item(job)
+            for job in download_jobs.list_jobs(limit=source_limit)
+        )
+
+    operation, prompt_version = _get_chatgpt_state()
+    if operation and operation != "video" and job_type in {None, "chatgpt"}:
+        items.append({
+            "id": "chatgpt:current",
+            "raw_id": "current",
+            "type": "chatgpt",
+            "type_label": "Tác vụ ChatGPT",
+            "status": "running",
+            "title": operation,
+            "progress": "Đang sử dụng phiên ChatGPT",
+            "error": "",
+            "prompt_version": prompt_version,
+            "created_at": "",
+            "updated_at": "",
+            "can_cancel": False,
+            "can_retry": False,
+        })
+
+    if normalized_search:
+        items = [item for item in items if _job_matches_video_search(item, normalized_search)]
+
+    items.sort(
+        key=lambda item: (
+            item["status"] in {"queued", "running", "retry_wait", "paused"},
+            item.get("updated_at") or item.get("created_at") or "",
+        ),
+        reverse=True,
+    )
+    items = items[:requested_limit]
+    for item in items:
+        item.pop("download_videos", None)
+    return {
+        "items": items,
+        "counts": {
+            "total": len(items),
+            "active": sum(
+                item["status"] in {"queued", "running", "retry_wait", "paused"}
+                for item in items
+            ),
+            "error": sum(
+                item["status"] in {"error", "review_blocked"} for item in items
+            ),
+        },
+    }
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    job = db.get_system_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    updated_job = db.request_cancel_system_job(job_id)
+    _sync_legacy_job(updated_job)
+    _kick_video_queue()
+    return {
+        "success": True,
+        "job": _system_job_center_item(
+            updated_job,
+            db.get_system_job_queue_position(job_id),
+        ),
+    }
+
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_job(job_id: str):
+    try:
+        updated_job = db.retry_system_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not updated_job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    _sync_legacy_job(updated_job)
+    _kick_video_queue()
+    return {
+        "success": True,
+        "job": _system_job_center_item(
+            updated_job,
+            db.get_system_job_queue_position(job_id),
+        ),
+    }
+
+
+@app.post("/api/jobs/{job_id}/pause")
+def pause_job(job_id: str):
+    try:
+        updated_job = db.pause_system_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not updated_job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    _sync_legacy_job(updated_job)
+    _kick_video_queue()
+    return {"success": True}
+
+
+@app.post("/api/jobs/{job_id}/resume")
+def resume_job(job_id: str):
+    try:
+        updated_job = db.resume_system_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not updated_job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    _sync_legacy_job(updated_job)
+    _kick_video_queue()
+    return {"success": True}
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str):
+    persistent_job = db.get_system_job(job_id)
+    if persistent_job:
+        _sync_legacy_job(persistent_job)
+        with _jobs_lock:
+            return dict(_jobs[job_id])
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job:
+            return dict(job)
+    raise HTTPException(status_code=404, detail="Job not found")
 
 
 @app.get("/api/chatgpt-status")
@@ -1591,24 +2422,96 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
         _finish_chatgpt_operation()
 
 
+@app.get("/api/videos/{video_id}/audio-review")
+def get_audio_review(video_id: int):
+    if not db.get_video(video_id):
+        raise HTTPException(status_code=404, detail="Video not found")
+    review = _prepare_audio_review(video_id)
+    return {"success": True, "audio_review": _audio_review_response(review)}
+
+
+@app.post("/api/videos/{video_id}/audio-review/approve")
+def approve_audio_review(
+    video_id: int,
+    request: ApproveAudioReviewRequest,
+):
+    if not request.confirm_credit_charge:
+        raise HTTPException(
+            status_code=400,
+            detail="Phải xác nhận Genmax có thể trừ credit khi tạo audio.",
+        )
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    review = _prepare_audio_review(video_id)
+    report = review.get("report") or {}
+    if not report.get("can_approve"):
+        return {
+            "success": False,
+            "requires_review": True,
+            "error": "Kịch bản còn lỗi bắt buộc; chưa thể gửi sang Genmax.",
+            "audio_review": _audio_review_response(review),
+        }
+
+    selected_voice = None
+    if request.voice_id:
+        try:
+            selected_voice = voice_config.get_voice(request.voice_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    approved_review = db.upsert_audio_review(
+        video_id=video_id,
+        script_hash=review["script_hash"],
+        status="approved",
+        report=report,
+        reviewed_at=db.utc_now(),
+    )
+    try:
+        task = _ensure_audio_task(
+            video_id,
+            requested_voice_id=(selected_voice or {}).get("id", ""),
+            requested_voice_name=(selected_voice or {}).get("name", ""),
+        )
+    except Exception as exc:
+        current_task = db.get_audio_task(video_id)
+        return {
+            "success": False,
+            "error": str(exc),
+            "audio_review": _audio_review_response(approved_review),
+            "audio_task": (
+                _audio_task_response(current_task) if current_task else None
+            ),
+        }
+    return {
+        "success": task.get("status") != "failed",
+        "audio_review": _audio_review_response(approved_review),
+        "audio_task": _audio_task_response(task),
+    }
+
+
 @app.post("/api/videos/{video_id}/generate-audio")
 def generate_audio_for_video(video_id: int):
-    """Create or safely resume the persistent Genmax audio workflow."""
+    """Automatically audit, approve and safely start the Genmax workflow."""
     video = db.get_video(video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
     script = video["generated_script"]
     if "### [AUDIO]" in script:
+        review = _automatically_approve_audio_review(video_id)
         stored_task = db.get_audio_task(video_id)
         if stored_task and stored_task["status"] != "failed":
             return {
                 "success": True,
+                "audio_review": _audio_review_response(review),
                 "audio_task": _audio_task_response(stored_task),
             }
         if not stored_task:
             return {
                 "success": True,
+                "audio_review": _audio_review_response(review),
                 "audio_task": {
                     "video_id": video_id,
                     "status": "completed",
@@ -1619,16 +2522,21 @@ def generate_audio_for_video(video_id: int):
                 },
             }
 
-    try:
-        task = _ensure_audio_task(video_id)
-    except Exception as exc:
-        stored_task = db.get_audio_task(video_id)
+    review, task, audio_error = _auto_review_and_create_audio(video_id)
+    if review.get("status") != "approved":
         return {
             "success": False,
-            "error": str(exc),
-            "audio_task": (
-                _audio_task_response(stored_task) if stored_task else None
-            ),
+            "quality_blocked": True,
+            "error": audio_error,
+            "audio_review": _audio_review_response(review),
+            "audio_task": None,
+        }
+    if audio_error:
+        return {
+            "success": False,
+            "error": audio_error,
+            "audio_review": _audio_review_response(review),
+            "audio_task": _audio_task_response(task) if task else None,
         }
 
     if task["status"] == "failed":
@@ -1638,9 +2546,14 @@ def generate_audio_for_video(video_id: int):
                 "Task Genmax đã thất bại. Hệ thống không tự retry để tránh "
                 "trừ credit lần nữa."
             ),
+            "audio_review": _audio_review_response(review),
             "audio_task": _audio_task_response(task),
         }
-    return {"success": True, "audio_task": _audio_task_response(task)}
+    return {
+        "success": True,
+        "audio_review": _audio_review_response(review),
+        "audio_task": _audio_task_response(task),
+    }
 
 
 @app.get("/api/videos/{video_id}/audio-status")
@@ -1717,6 +2630,12 @@ def regenerate_audio_for_video(
     video = db.get_video(video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
+    review = _automatically_approve_audio_review(video_id)
+    if review.get("status") != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail="Kịch bản không đạt kiểm tra tự động; chưa tạo lại audio.",
+        )
     try:
         selected_voice = voice_config.get_voice(request.voice_id)
     except ValueError as exc:
@@ -1791,6 +2710,16 @@ def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
             detail="Phải xác nhận Genmax sẽ trừ credit lần nữa.",
         )
 
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    review = _automatically_approve_audio_review(video_id)
+    if review.get("status") != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail="Kịch bản không đạt kiểm tra tự động; không thể retry audio.",
+        )
+
     with _audio_submit_lock:
         task = db.get_audio_task(video_id)
         if not task:
@@ -1799,6 +2728,22 @@ def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
             raise HTTPException(
                 status_code=409,
                 detail="Chỉ được retry task đã thất bại.",
+            )
+
+        current_script = apply_tts_filters(
+            get_clean_script_for_tts(video["generated_script"])
+        )
+        current_request_hash = tts.get_generation_request_hash(
+            current_script,
+            task.get("voice_id") or AUDIO_VOICE_ID,
+        )
+        if current_request_hash != task.get("request_hash"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Kịch bản hoặc giọng đọc đã đổi; không thể retry task cũ. "
+                    "Hãy duyệt kịch bản và tạo audio mới."
+                ),
             )
 
         segments = _get_audio_segments(task)
@@ -1991,6 +2936,17 @@ def _get_prompt_default_voice_id(version_id: str = "") -> str:
         return str(version.get("default_voice_id", "") or "").strip()
 
 
+def _get_prompt_pipeline(version_id: str = "") -> dict[str, bool]:
+    with _prompts_config_lock:
+        data = _read_prompts_config()
+        resolved_version_id = version_id.strip() or data.get(
+            "active_version",
+            "default",
+        )
+        version = data.get("versions", {}).get(resolved_version_id, {})
+        return chatgpt_projects.normalize_prompt_pipeline(version.get("pipeline"))
+
+
 def _get_active_prompt_version_id() -> str:
     with _prompts_config_lock:
         data = _read_prompts_config()
@@ -2106,6 +3062,22 @@ def save_prompt_default_voice(
     return {
         "version_id": version_id,
         "version": normalized_data["versions"][version_id],
+    }
+
+
+@app.patch("/api/prompts/{version_id}/pipeline")
+def save_prompt_pipeline(version_id: str, payload: PromptPipelineData):
+    with _prompts_config_lock:
+        _assert_prompt_version_editable(version_id)
+        data = _read_prompts_config()
+        version = _get_prompt_version(data, version_id)
+        version["pipeline"] = chatgpt_projects.validate_prompt_pipeline(
+            payload.model_dump()
+        )
+        normalized_data = _write_prompts_config(data)
+    return {
+        "version_id": version_id,
+        "pipeline": normalized_data["versions"][version_id]["pipeline"],
     }
 
 

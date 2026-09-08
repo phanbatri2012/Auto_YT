@@ -14,6 +14,7 @@ def process_prompt_via_chatgpt(
     prompt_text: str,
     prompt_version: str = "",
     video_id: int | None = None,
+    pipeline: dict[str, bool] | None = None,
 ) -> dict:
     """
     Spawns chatgpt_worker.py as a subprocess.
@@ -25,6 +26,8 @@ def process_prompt_via_chatgpt(
         env["PROMPT_VERSION"] = prompt_version
     if video_id is not None:
         env["VIDEO_ID"] = str(video_id)
+    if pipeline is not None:
+        env["PROMPT_PIPELINE_JSON"] = json.dumps(pipeline)
 
     result = subprocess.run(
         [PYTHON_EXE, str(WORKER_SCRIPT)],

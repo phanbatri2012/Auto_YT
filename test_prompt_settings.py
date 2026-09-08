@@ -57,7 +57,7 @@ class PromptSettingsTests(unittest.TestCase):
         return json.loads(self.prompts_path.read_text(encoding="utf-8"))
 
     def test_rename_only_changes_selected_version_name(self):
-        before = self.read_saved_data()
+        before = main._read_prompts_config()
 
         main.save_prompt_version_name(
             "default",
@@ -91,7 +91,7 @@ class PromptSettingsTests(unittest.TestCase):
         )
 
     def test_prompt_save_only_changes_requested_prompt(self):
-        before = self.read_saved_data()
+        before = main._read_prompts_config()
 
         main.save_prompt_field(
             "default",
@@ -108,7 +108,7 @@ class PromptSettingsTests(unittest.TestCase):
         self.assertEqual(saved["versions"]["second"], before["versions"]["second"])
 
     def test_default_voice_save_only_changes_selected_prompt_version(self):
-        before = self.read_saved_data()
+        before = main._read_prompts_config()
         voice_id = "a39e4493-3a8a-4be8-bd13-b96f2f5c4906"
 
         with patch.object(
@@ -143,6 +143,40 @@ class PromptSettingsTests(unittest.TestCase):
         self.assertEqual(
             main._get_prompt_default_voice_id("second"),
             "voice-second",
+        )
+
+    def test_old_prompt_versions_receive_the_full_default_pipeline(self):
+        data = main._read_prompts_config()
+
+        self.assertEqual(
+            data["versions"]["default"]["pipeline"],
+            chatgpt_projects.DEFAULT_PROMPT_PIPELINE,
+        )
+        self.assertEqual(
+            data["versions"]["second"]["pipeline"],
+            chatgpt_projects.DEFAULT_PROMPT_PIPELINE,
+        )
+
+    def test_pipeline_save_only_changes_selected_prompt_version(self):
+        before = main._read_prompts_config()
+        pipeline = {
+            "metadata": True,
+            "chapters": False,
+            "thumbnail_with_text": True,
+            "thumbnail_without_text": False,
+            "audio": False,
+        }
+
+        main.save_prompt_pipeline(
+            "default",
+            main.PromptPipelineData(**pipeline),
+        )
+
+        saved = self.read_saved_data()
+        self.assertEqual(saved["versions"]["default"]["pipeline"], pipeline)
+        self.assertEqual(
+            saved["versions"]["second"]["pipeline"],
+            before["versions"]["second"]["pipeline"],
         )
 
     def test_rejects_blank_name_and_unknown_prompt(self):

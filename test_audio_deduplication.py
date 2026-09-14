@@ -74,10 +74,26 @@ class AudioDeduplicationTests(unittest.TestCase):
 
     def test_retry_requires_explicit_credit_confirmation(self):
         request = main.RetryAudioRequest(confirm_credit_charge=False)
-        with patch.object(main.tts, "retry_tts_task") as retry_task:
+        with (
+            patch.object(main, "_require_actionable_video", return_value={}),
+            patch.object(
+                main,
+                "_automatically_approve_audio_review",
+                return_value={"status": "approved"},
+            ),
+            patch.object(
+                main.db,
+                "get_audio_task",
+                return_value={
+                    "status": "failed",
+                    "tts_provider_id": "genmax",
+                },
+            ),
+            patch.object(main.tts, "retry_tts_task") as retry_task,
+        ):
             with self.assertRaisesRegex(
                 main.HTTPException,
-                "Phải xác nhận Genmax sẽ trừ credit lần nữa.",
+                "cloud có thể trừ credit",
             ):
                 main.retry_audio_for_video(31, request)
 

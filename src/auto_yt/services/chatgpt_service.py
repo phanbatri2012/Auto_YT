@@ -1,8 +1,16 @@
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
+from auto_yt.services.chatgpt_runtime import (
+    ChatGPTAttentionRequiredError,
+    decode_attention_error,
+)
+
+SOURCE_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = SOURCE_ROOT.parent
 WORKER_SCRIPT = Path(__file__).parent / "chatgpt_worker.py"
 PYTHON_EXE = sys.executable
 
@@ -20,8 +28,11 @@ def process_prompt_via_chatgpt(
     Spawns chatgpt_worker.py as a subprocess.
     Returns dict: {"script": str, "chat_url": str}
     """
-    import os
     env = os.environ.copy()
+    python_paths = [path for path in env.get("PYTHONPATH", "").split(os.pathsep) if path]
+    if str(SOURCE_ROOT) not in python_paths:
+        python_paths.insert(0, str(SOURCE_ROOT))
+    env["PYTHONPATH"] = os.pathsep.join(python_paths)
     if prompt_version:
         env["PROMPT_VERSION"] = prompt_version
     if video_id is not None:
@@ -34,6 +45,7 @@ def process_prompt_via_chatgpt(
         input=prompt_text.encode("utf-8"),
         capture_output=True,
         env=env,
+        cwd=str(PROJECT_ROOT),
     )
 
     stderr_output = result.stderr.decode("utf-8", errors="replace")
@@ -42,6 +54,12 @@ def process_prompt_via_chatgpt(
         print(stderr_output, file=sys.stderr)
 
     if result.returncode != 0:
+        attention_message = decode_attention_error(stderr_output)
+        if attention_message is not None:
+            raise ChatGPTAttentionRequiredError(
+                attention_message
+                or "Phiên ChatGPT cần được xác minh thủ công."
+            )
         raise Exception(f"Playwright worker failed: {stderr_output}")
 
     output = result.stdout.decode("utf-8", errors="replace")

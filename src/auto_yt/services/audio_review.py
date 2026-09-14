@@ -17,10 +17,13 @@ SECTION_PATTERN = re.compile(
 )
 EDITORIAL_PREFIXES = (
     "bổ sung ",
+    "bỏ ",
+    "chia đoạn",
     "chuyển ý",
     "dẫn dắt ",
     "đào sâu ",
     "giải thích ",
+    "giảm ",
     "giữ nhịp",
     "khai thác ",
     "kết nối ",
@@ -28,9 +31,32 @@ EDITORIAL_PREFIXES = (
     "mở rộng ",
     "nhấn mạnh ",
     "nêu bật ",
+    "rút gọn ",
+    "sửa ",
     "tăng nhịp",
+    "tách ",
+    "thêm ",
     "triển khai ",
+    "viết lại ",
 )
+STRUCTURAL_NARRATIVE_LABEL_PATTERN = re.compile(
+    r"^(?:intro|body|outro|giới thiệu|dẫn nhập|lời dẫn|"
+    r"mở\s+(?:đầu|bài)|nội\s+dung\s+chính|thân\s+bài|"
+    r"kết\s+(?:luận|bài|thúc)|lời\s+kết|"
+    r"phần\s+(?:\d+|intro|body|outro|giới thiệu|dẫn nhập|"
+    r"mở\s+(?:đầu|bài)|nội\s+dung\s+chính|thân\s+bài|"
+    r"kết\s+(?:luận|bài|thúc)))\s*:?\s*$",
+    flags=re.IGNORECASE,
+)
+
+
+def looks_like_editorial_artifact(value: str) -> bool:
+    """Recognize a writing instruction or a standalone structural label."""
+    normalized = re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+    return bool(
+        normalized.startswith(EDITORIAL_PREFIXES)
+        or STRUCTURAL_NARRATIVE_LABEL_PATTERN.fullmatch(normalized)
+    )
 
 
 def extract_audio_sections(script_text: str) -> dict[str, str]:
@@ -93,14 +119,8 @@ def _find_editorial_artifacts(sections: dict[str, str]) -> list[dict[str, str]]:
             lowered = " ".join(normalized_lines).lower()
             looks_editorial = (
                 any(line.startswith("#") for line in lines)
-                or lowered.startswith(EDITORIAL_PREFIXES)
-                or bool(
-                    re.match(
-                        r"^(?:intro|body|outro|ghi chú|ý chính|trọng tâm|"
-                        r"phần\s+(?:\d+|intro|body|outro))\b",
-                        lowered,
-                    )
-                )
+                or looks_like_editorial_artifact(lowered)
+                or bool(re.match(r"^(?:ghi chú|ý chính|trọng tâm)\b", lowered))
             )
             if looks_editorial or len(blocks) > 2:
                 preview = " / ".join(normalized_lines)[:120]

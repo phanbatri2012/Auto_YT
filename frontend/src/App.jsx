@@ -6,6 +6,8 @@ import JobCenter from './JobCenter'
 import Settings from './Settings'
 import VideoQueuePanel from './VideoQueuePanel'
 import YouTubeDownloader from './YouTubeDownloader'
+import YouTubeComments from './YouTubeComments'
+import TTSSettings from './TTSSettings'
 
 const SECONDS_PER_MINUTE = 60
 const SECONDS_PER_HOUR = 60 * SECONDS_PER_MINUTE
@@ -21,6 +23,30 @@ function formatAudioDuration(durationSeconds) {
     return `${hours}:${String(minutes).padStart(2, '0')}:${paddedSeconds}`
   }
   return `${minutes}:${paddedSeconds}`
+}
+
+function voiceProviderName(providerId) {
+  if (providerId === 'omnivoice') return 'OmniVoice'
+  if (providerId === 'genmax') return 'Genmax'
+  return providerId || 'TTS'
+}
+
+function VoiceOptions({ voices }) {
+  const groups = voices.reduce((result, voice) => {
+    const providerId = voice.provider_id || 'genmax'
+    if (!result[providerId]) result[providerId] = []
+    result[providerId].push(voice)
+    return result
+  }, {})
+  return Object.entries(groups).map(([providerId, providerVoices]) => (
+    <optgroup key={providerId} label={voiceProviderName(providerId)}>
+      {providerVoices.map(voice => (
+        <option key={voice.id} value={voice.id}>
+          [{voiceProviderName(providerId)}] {voice.name}
+        </option>
+      ))}
+    </optgroup>
+  ))
 }
 
 async function saveAudioDuration(videoId, durationSeconds) {
@@ -121,7 +147,11 @@ function App() {
   const currentVideoIdRef = useRef(null)
   const [videoTitle, setVideoTitle] = useState('')
   const [currentVideoPromptVersion, setCurrentVideoPromptVersion] = useState('')
+  const [currentVideoStatus, setCurrentVideoStatus] = useState('active')
   const [isCurrentVideoPublished, setIsCurrentVideoPublished] = useState(false)
+  const [currentVideoPublications, setCurrentVideoPublications] = useState([])
+  const [currentVideoDefaultChannelTitle, setCurrentVideoDefaultChannelTitle] = useState('')
+  const [publicationDialog, setPublicationDialog] = useState(null)
   const [currentVideoHasCheckpoint, setCurrentVideoHasCheckpoint] = useState(false)
   const [chatGptStatus, setChatGptStatus] = useState({
     busy: false,
@@ -136,23 +166,27 @@ function App() {
   const [selectedVoiceId, setSelectedVoiceId] = useState('')
   const [currentVideoVoiceId, setCurrentVideoVoiceId] = useState('')
   const [currentVideoVoiceName, setCurrentVideoVoiceName] = useState('')
+  const [currentVideoProviderId, setCurrentVideoProviderId] = useState('genmax')
   const [audioTaskVoiceName, setAudioTaskVoiceName] = useState('')
+  const [audioTaskProviderId, setAudioTaskProviderId] = useState('genmax')
   const [audioReview, setAudioReview] = useState(null)
   const [isLoadingAudioReview, setIsLoadingAudioReview] = useState(false)
   const [regenerateVoiceId, setRegenerateVoiceId] = useState('')
-  const [publishFilter, setPublishFilter] = useState('unpublished') // 'all' | 'published' | 'unpublished'
+  const [publishFilter, setPublishFilter] = useState('unpublished') // 'all' | 'published' | 'unpublished' | 'error'
   const [promptVersionFilter, setPromptVersionFilter] = useState('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('')
   const dashboardFetchRequestRef = useRef(0)
   
   const PAGE_SIZE = 10
-  const chatGptControlsDisabled =
+  const chatGptProfileBusy =
     isFetching ||
     chatGptStatus.busy ||
     generatingThumbnailType !== null ||
     isGeneratingChapters ||
     isGeneratingMetadata
+  const currentVideoIsError = currentVideoStatus === 'error'
+  const chatGptControlsDisabled = chatGptProfileBusy || currentVideoIsError
   const getPromptVersionName = (versionKey) =>
     promptVersions.find(version => version.key === versionKey)?.name ||
     versionKey ||
@@ -175,6 +209,8 @@ function App() {
       const params = new URLSearchParams({ limit: PAGE_SIZE, offset });
       if (filter === 'published') params.set('is_published', '1');
       else if (filter === 'unpublished') params.set('is_published', '0');
+      if (filter === 'published' || filter === 'unpublished') params.set('video_status', 'active');
+      else if (filter === 'error') params.set('video_status', 'error');
       if (versionFilter !== 'all') params.set('prompt_version', versionFilter);
       if (search) params.set('search', search);
       const response = await fetch(`http://127.0.0.1:8080/api/videos?${params}`);
@@ -192,32 +228,142 @@ function App() {
     setCurrentPage(newPage);
   }
 
-  const toggleCurrentVideoPublish = async () => {
-    if (!currentVideoId) return;
-    const newStatus = isCurrentVideoPublished ? 0 : 1;
+  const setVideoLifecycleState = async ({
+    videoId,
+    videoTitle,
+    videoStatus,
+    isPublished,
+    hasPublishedUrl,
+    defaultChannelTitle,
+    nextState
+  }) => {
+    if (!videoId) return;
+    if (
+      nextState === 'error' &&
+      !confirm('Đánh dấu video là Lỗi? Các chức năng tự động và hàng đợi sẽ bỏ qua video này.')
+    ) return;
+    if (nextState === 'unpublished' && hasPublishedUrl) {
+      alert('Hãy xóa link video đã đăng trước khi chuyển về Chưa đăng.');
+      return;
+    }
+    if (nextState === 'published' && !hasPublishedUrl) {
+      if (videoStatus === 'error') {
+        alert('Hãy chuyển video về Chưa đăng trước khi gắn link đã đăng.');
+        return;
+      }
+      setPublicationDialog({
+        videoId,
+        videoTitle: videoTitle || 'Video chưa có tiêu đề',
+        defaultChannelTitle: defaultChannelTitle || '',
+        publishedUrl: '',
+        isSaving: false,
+        error: ''
+      });
+      return;
+    }
+
     try {
-      const response = await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}/publish?is_published=${newStatus}`, { method: 'PUT' });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      setIsCurrentVideoPublished(newStatus === 1);
+      let resolvedStatus = videoStatus;
+      let resolvedPublished = Boolean(isPublished);
+      if (nextState === 'error') {
+        const response = await fetch(
+          `http://127.0.0.1:8080/api/videos/${videoId}/status`,
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: 'error' })
+          }
+        );
+        const data = await response.json();
+        if (!response.ok || data.success === false) {
+          throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+        }
+        resolvedStatus = 'error';
+      } else {
+        if (videoStatus === 'error') {
+          const response = await fetch(
+            `http://127.0.0.1:8080/api/videos/${videoId}/status`,
+            {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ status: 'active' })
+            }
+          );
+          const data = await response.json();
+          if (!response.ok || data.success === false) {
+            throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+          }
+          resolvedStatus = 'active';
+        }
+        const targetPublished = nextState === 'published';
+        if (targetPublished !== resolvedPublished) {
+          const response = await fetch(
+            `http://127.0.0.1:8080/api/videos/${videoId}/publish?is_published=${targetPublished ? 1 : 0}`,
+            { method: 'PUT' }
+          );
+          const data = await response.json();
+          if (!response.ok || data.success === false) {
+            throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+          }
+          resolvedPublished = targetPublished;
+        }
+      }
+      if (videoId === currentVideoId) {
+        setCurrentVideoStatus(resolvedStatus);
+        setIsCurrentVideoPublished(resolvedPublished);
+      }
+      setQueueRefreshKey(key => key + 1);
       await fetchSavedVideos(currentPage, publishFilter);
-    } catch (err) {
-      console.error('Failed to toggle publish status', err);
+    } catch (error) {
+      alert(error.message || 'Không thể cập nhật trạng thái video.');
+      await fetchSavedVideos(currentPage, publishFilter);
     }
   }
 
-  const togglePublish = async (videoId, currentStatus) => {
-    const newStatus = currentStatus ? 0 : 1;
+  const submitVideoPublication = async (event) => {
+    event.preventDefault();
+    if (!publicationDialog || publicationDialog.isSaving) return;
+    const publishedUrl = publicationDialog.publishedUrl.trim();
+    if (!publishedUrl) {
+      setPublicationDialog(dialog => ({ ...dialog, error: 'Hãy nhập link video đã đăng.' }));
+      return;
+    }
+
+    setPublicationDialog(dialog => ({ ...dialog, isSaving: true, error: '' }));
     try {
-      const response = await fetch(`http://127.0.0.1:8080/api/videos/${videoId}/publish?is_published=${newStatus}`, {
-        method: 'PUT'
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      if (videoId === currentVideoId) {
-        setIsCurrentVideoPublished(newStatus === 1);
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${publicationDialog.videoId}/publications`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ published_url: publishedUrl })
+        }
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || data.error || `HTTP ${response.status}`);
       }
+
+      if (publicationDialog.videoId === currentVideoId) {
+        setCurrentVideoStatus('active');
+        setIsCurrentVideoPublished(true);
+        setCurrentVideoPublications(publications => {
+          const remaining = publications.filter(item => item.id !== data.id);
+          return [{
+            ...data,
+            channel_title: data.channel_title || publicationDialog.defaultChannelTitle || ''
+          }, ...remaining];
+        });
+      }
+      setPublicationDialog(null);
+      setQueueRefreshKey(key => key + 1);
       await fetchSavedVideos(currentPage, publishFilter);
-    } catch (err) {
-      console.error('Failed to toggle publish status', err);
+    } catch (error) {
+      setPublicationDialog(dialog => dialog ? ({
+        ...dialog,
+        isSaving: false,
+        error: error.message || 'Không thể lưu link video đã đăng.'
+      }) : dialog);
     }
   }
 
@@ -332,6 +478,7 @@ function App() {
         setAudioStatus(status);
         setAudioMissingSegments(data.audio_task?.missing_segments || 0);
         setAudioTaskVoiceName(data.audio_task?.voice_name || '');
+        setAudioTaskProviderId(data.audio_task?.tts_provider_id || 'genmax');
         setIsGenAudio(status === 'pending' || status === 'processing');
 
         if (status === 'completed') {
@@ -343,6 +490,7 @@ function App() {
             setResultText(video.generated_script);
             setCurrentVideoVoiceId(video.voice_id || '');
             setCurrentVideoVoiceName(video.voice_name || '');
+            setCurrentVideoProviderId(video.tts_provider_id || 'genmax');
             setRegenerateVoiceId(previousVoiceId =>
               video.voice_id || previousVoiceId
             );
@@ -497,15 +645,20 @@ function App() {
       setChatUrl(data.chat_url || '');
       setVideoTitle(data.title || '');
       setCurrentVideoPromptVersion(data.prompt_version || '');
+      setCurrentVideoStatus(data.video_status || 'active');
       setCurrentVideoVoiceId(data.voice_id || '');
       setCurrentVideoVoiceName(data.voice_name || '');
+      setCurrentVideoProviderId(data.tts_provider_id || 'genmax');
       setAudioTaskVoiceName('');
+      setAudioTaskProviderId(data.tts_provider_id || 'genmax');
       setRegenerateVoiceId(data.voice_id || selectedVoiceId);
       setShowResult(true);
       setActiveView('fetcher');
       setCurrentVideoId(id);  // track which video is loaded
       setAudioReview(null);
       setIsCurrentVideoPublished(Boolean(data.is_published));
+      setCurrentVideoPublications(data.publications || []);
+      setCurrentVideoDefaultChannelTitle(data.default_youtube_channel_title || '');
       setCurrentVideoHasCheckpoint(Boolean(data.has_checkpoint));
       setAudioStatus('not_started');
       setAudioMissingSegments(0);
@@ -517,13 +670,59 @@ function App() {
     }
   };
 
+  const clearCurrentVideo = () => {
+    setCurrentVideoId(null);
+    setUrl('');
+    setResultText('');
+    setFullTranscript('');
+    setChatUrl('');
+    setVideoTitle('');
+    setCurrentVideoPromptVersion('');
+    setCurrentVideoStatus('active');
+    setCurrentVideoVoiceId('');
+    setCurrentVideoVoiceName('');
+    setCurrentVideoProviderId('genmax');
+    setAudioTaskVoiceName('');
+    setAudioTaskProviderId('genmax');
+    setRegenerateVoiceId(selectedVoiceId);
+    setShowResult(false);
+    setAudioReview(null);
+    setIsCurrentVideoPublished(false);
+    setCurrentVideoPublications([]);
+    setCurrentVideoDefaultChannelTitle('');
+    setCurrentVideoHasCheckpoint(false);
+    setAudioStatus('not_started');
+    setAudioMissingSegments(0);
+    setErrorMsg('');
+    setProgressMsg('');
+  };
+
   const deleteSavedVideo = async (id) => {
-    if (!confirm("Are you sure you want to delete this video?")) return;
+    if (!confirm("Xóa video và toàn bộ job, audio, checkpoint liên quan?")) return;
     try {
-      await fetch(`http://127.0.0.1:8080/api/videos/${id}`, { method: 'DELETE' });
-      fetchSavedVideos(); // Refresh list
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${id}`,
+        { method: 'DELETE' }
+      );
+      const data = await response.json();
+      if (!response.ok || data.success === false) {
+        throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+      }
+      if (currentVideoId === id) clearCurrentVideo();
+      setQueueRefreshKey(key => key + 1);
+      const nextPage = (
+        savedVideos.items.length === 1 && currentPage > 1
+          ? currentPage - 1
+          : currentPage
+      );
+      if (nextPage !== currentPage) setCurrentPage(nextPage);
+      await fetchSavedVideos(nextPage);
+      if (data.warnings?.length) {
+        alert(`Video đã được xóa, nhưng còn cảnh báo:\n${data.warnings.join('\n')}`);
+      }
     } catch (err) {
       console.error("Failed to delete", err);
+      alert(`Không thể xóa video: ${err.message}`);
     }
   };
 
@@ -786,7 +985,7 @@ function App() {
   };
 
   const handleGenerateAudio = async () => {
-    if (!currentVideoId) return;
+    if (!currentVideoId || currentVideoIsError) return;
     if (audioReview && !audioReview.can_approve) {
       alert('Kịch bản không đạt kiểm tra tự động. Hãy sửa nội dung trước khi tạo audio.');
       return;
@@ -812,6 +1011,7 @@ function App() {
       setAudioStatus(status);
       setAudioMissingSegments(data.audio_task?.missing_segments || 0);
       setAudioTaskVoiceName(data.audio_task?.voice_name || '');
+      setAudioTaskProviderId(data.audio_task?.tts_provider_id || 'genmax');
       keepPolling = status === 'pending' || status === 'processing';
       if (status === 'completed') {
         const videoResponse = await fetch(
@@ -821,6 +1021,7 @@ function App() {
         setResultText(video.generated_script);
         setCurrentVideoVoiceId(video.voice_id || '');
         setCurrentVideoVoiceName(video.voice_name || '');
+        setCurrentVideoProviderId(video.tts_provider_id || 'genmax');
       }
     } catch {
       alert('Không thể kết nối Backend.');
@@ -830,15 +1031,15 @@ function App() {
   };
 
   const handleRetryAudio = async () => {
-    if (!currentVideoId) return;
+    if (!currentVideoId || currentVideoIsError) return;
     if (audioReview?.status === 'blocked') {
       alert('Kịch bản không đạt kiểm tra tự động nên chưa thể retry audio.');
       return;
     }
-    const confirmed = window.confirm(
-      'Genmax sẽ trừ credit thêm một lần. Bạn có chắc muốn retry audio?'
-    );
-    if (!confirmed) return;
+    const billable = audioTaskProviderId === 'genmax';
+    if (billable && !window.confirm(
+      'Retry bằng Genmax có thể trừ credit thêm một lần. Bạn có chắc muốn tiếp tục?'
+    )) return;
 
     setIsGenAudio(true);
     try {
@@ -847,7 +1048,7 @@ function App() {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ confirm_credit_charge: true })
+          body: JSON.stringify({ confirm_credit_charge: billable })
         }
       );
       const data = await response.json();
@@ -857,6 +1058,7 @@ function App() {
       setAudioStatus(data.audio_task?.status || 'pending');
       setAudioMissingSegments(data.audio_task?.missing_segments || 0);
       setAudioTaskVoiceName(data.audio_task?.voice_name || '');
+      setAudioTaskProviderId(data.audio_task?.tts_provider_id || audioTaskProviderId);
     } catch (error) {
       setIsGenAudio(false);
       alert('Lỗi: ' + error.message);
@@ -864,14 +1066,20 @@ function App() {
   };
 
   const handleRegenerateAudio = async () => {
-    if (!currentVideoId || !regenerateVoiceId || isGenAudio) return;
+    if (!currentVideoId || currentVideoIsError || !regenerateVoiceId || isGenAudio) return;
     if (audioReview?.status === 'blocked') {
       alert('Kịch bản không đạt kiểm tra tự động nên chưa thể tạo lại audio.');
       return;
     }
     const voiceName = getVoiceName(regenerateVoiceId);
+    const selectedRegenerateVoice = voiceOptions.find(
+      voice => voice.id === regenerateVoiceId
+    );
+    const providerId = selectedRegenerateVoice?.provider_id || 'genmax';
+    const billable = providerId === 'genmax';
     const confirmed = window.confirm(
-      `Tạo lại toàn bộ audio bằng giọng "${voiceName}" sẽ tốn credit Genmax. ` +
+      `Tạo lại toàn bộ audio bằng [${voiceProviderName(providerId)}] ${voiceName}. ` +
+      (billable ? 'Dịch vụ cloud có thể tốn credit. ' : 'Engine local sẽ sử dụng GPU. ') +
       'Audio cũ được giữ cho đến khi audio mới hoàn thành. Bạn có tiếp tục không?'
     );
     if (!confirmed) return;
@@ -885,7 +1093,7 @@ function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             voice_id: regenerateVoiceId,
-            confirm_credit_charge: true
+            confirm_credit_charge: billable
           })
         }
       );
@@ -897,6 +1105,7 @@ function App() {
       setAudioStatus(status);
       setAudioMissingSegments(data.audio_task?.missing_segments || 0);
       setAudioTaskVoiceName(data.audio_task?.voice_name || voiceName);
+      setAudioTaskProviderId(data.audio_task?.tts_provider_id || providerId);
       setIsGenAudio(status === 'pending' || status === 'processing');
       if (status === 'completed') {
         const videoResponse = await fetch(
@@ -906,6 +1115,7 @@ function App() {
         setResultText(video.generated_script);
         setCurrentVideoVoiceId(video.voice_id || '');
         setCurrentVideoVoiceName(video.voice_name || '');
+        setCurrentVideoProviderId(video.tts_provider_id || 'genmax');
       }
     } catch (error) {
       setIsGenAudio(false);
@@ -1056,6 +1266,7 @@ function App() {
         <ul className="nav-menu">
           <li className={`nav-item ${activeView === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveView('dashboard')}>Dashboard</li>
           <li className={`nav-item ${activeView === 'jobs' ? 'active' : ''}`} onClick={() => setActiveView('jobs')}>Trung tâm Job</li>
+          <li className={`nav-item ${activeView === 'comments' ? 'active' : ''}`} onClick={() => setActiveView('comments')}>Bình luận YouTube</li>
           <li className={`nav-item ${activeView === 'fetcher' ? 'active' : ''}`} onClick={() => setActiveView('fetcher')}>Video Fetcher</li>
           <li
             className={`nav-item ${activeView === 'downloader' ? 'active' : ''}`}
@@ -1067,6 +1278,10 @@ function App() {
             onClick={() => !chatGptControlsDisabled && setActiveView('autologin')}
             style={chatGptControlsDisabled ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}
           >Auto Login</li>
+          <li
+            className={`nav-item ${activeView === 'tts' ? 'active' : ''}`}
+            onClick={() => setActiveView('tts')}
+          >Giọng đọc &amp; TTS</li>
           <li
             className={`nav-item ${activeView === 'settings' ? 'active' : ''}`}
             onClick={() => setActiveView('settings')}
@@ -1086,13 +1301,23 @@ function App() {
         <div className="view-container">
           {activeView === 'autologin' ? (
             <AutoLogin />
+          ) : activeView === 'tts' ? (
+            <TTSSettings />
           ) : activeView === 'settings' ? (
             <Settings
               lockedPromptVersion={chatGptStatus.promptVersion}
               chatGptOperation={chatGptStatus.operation}
             />
           ) : activeView === 'jobs' ? (
-            <JobCenter onOpenVideo={viewSavedVideo} />
+            <JobCenter
+              onOpenVideo={viewSavedVideo}
+              refreshKey={queueRefreshKey}
+            />
+          ) : activeView === 'comments' ? (
+            <YouTubeComments
+              onOpenVideo={viewSavedVideo}
+              refreshKey={queueRefreshKey}
+            />
           ) : activeView === 'downloader' ? (
             <YouTubeDownloader />
           ) : activeView === 'dashboard' ? (
@@ -1125,13 +1350,16 @@ function App() {
                 {/* Stats */}
                 <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
                   <span style={{ color: '#aaa', fontSize: '0.9em' }}>
-                    📦 Tổng: <strong style={{color:'white'}}>{(savedVideos.count_published || 0) + (savedVideos.count_unpublished || 0)}</strong> video
+                    📦 Tổng: <strong style={{color:'white'}}>{(savedVideos.count_published || 0) + (savedVideos.count_unpublished || 0) + (savedVideos.count_error || 0)}</strong> video
                   </span>
                   <span style={{ color: '#aaa', fontSize: '0.9em' }}>
                     ✅ Đã đăng: <strong style={{color:'#4caf50'}}>{savedVideos.count_published || 0}</strong>
                   </span>
                   <span style={{ color: '#aaa', fontSize: '0.9em' }}>
                     ⏳ Chưa đăng: <strong style={{color:'#f39c12'}}>{savedVideos.count_unpublished || 0}</strong>
+                  </span>
+                  <span style={{ color: '#aaa', fontSize: '0.9em' }}>
+                    ❌ Lỗi: <strong style={{color:'#e74c3c'}}>{savedVideos.count_error || 0}</strong>
                   </span>
                 </div>
                 {/* Version + publication filters */}
@@ -1161,20 +1389,20 @@ function App() {
                       <option key={version.key} value={version.key}>{version.name}</option>
                     ))}
                   </select>
-                  {[['all', '🗂️ Tất cả'], ['published', '✅ Đã đăng'], ['unpublished', '⏳ Chưa đăng']].map(([val, label]) => (
+                  {[['all', '🗂️ Tất cả'], ['published', '✅ Đã đăng'], ['unpublished', '⏳ Chưa đăng'], ['error', '❌ Lỗi']].map(([val, label]) => (
                     <button
                       key={val}
                       onClick={() => { setPublishFilter(val); setCurrentPage(1); }}
                       style={{
                         padding: '6px 14px', borderRadius: '20px', fontSize: '0.85em', cursor: 'pointer', fontWeight: '600',
                         border: publishFilter === val
-                          ? (val === 'published' ? '1px solid #4caf50' : val === 'unpublished' ? '1px solid #f39c12' : '1px solid var(--accent)')
+                          ? (val === 'published' ? '1px solid #4caf50' : val === 'unpublished' ? '1px solid #f39c12' : val === 'error' ? '1px solid #e74c3c' : '1px solid var(--accent)')
                           : '1px solid #444',
                         background: publishFilter === val
-                          ? (val === 'published' ? 'rgba(76,175,80,0.2)' : val === 'unpublished' ? 'rgba(243,156,18,0.2)' : 'rgba(155,89,182,0.2)')
+                          ? (val === 'published' ? 'rgba(76,175,80,0.2)' : val === 'unpublished' ? 'rgba(243,156,18,0.2)' : val === 'error' ? 'rgba(231,76,60,0.2)' : 'rgba(155,89,182,0.2)')
                           : 'transparent',
                         color: publishFilter === val
-                          ? (val === 'published' ? '#4caf50' : val === 'unpublished' ? '#f39c12' : 'var(--accent)')
+                          ? (val === 'published' ? '#4caf50' : val === 'unpublished' ? '#f39c12' : val === 'error' ? '#e74c3c' : 'var(--accent)')
                           : '#888',
                         transition: 'all 0.2s'
                       }}
@@ -1200,30 +1428,40 @@ function App() {
                        if (cleanSnippet.length > 80) cleanSnippet = cleanSnippet.substring(0, 80) + '...';
                     }
                     const isPublished = Boolean(video.is_published);
+                    const isError = video.video_status === 'error';
+                    const statusColor = isError ? '#e74c3c' : isPublished ? '#4caf50' : '#f39c12';
+                    const lifecycleState = isError ? 'error' : isPublished ? 'published' : 'unpublished';
                     return (
-                      <div key={video.id} className="result-panel" style={{ padding: '20px', display: 'flex', flexDirection: 'column', borderTop: `3px solid ${isPublished ? '#4caf50' : '#f39c12'}` }}>
+                      <div key={video.id} className="result-panel" style={{ padding: '20px', display: 'flex', flexDirection: 'column', borderTop: `3px solid ${statusColor}` }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '8px' }}>
                           <h4 style={{ margin: 0, color: 'white', flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', paddingRight: '8px' }}>{video.title}</h4>
                           <span style={{ 
                             fontSize: '0.75em', fontWeight: 'bold', padding: '3px 8px', borderRadius: '12px', whiteSpace: 'nowrap',
-                            backgroundColor: isPublished ? 'rgba(76,175,80,0.15)' : 'rgba(243,156,18,0.15)',
-                            color: isPublished ? '#4caf50' : '#f39c12',
-                            border: `1px solid ${isPublished ? '#4caf50' : '#f39c12'}`
+                            backgroundColor: isError ? 'rgba(231,76,60,0.15)' : isPublished ? 'rgba(76,175,80,0.15)' : 'rgba(243,156,18,0.15)',
+                            color: statusColor,
+                            border: `1px solid ${statusColor}`
                           }}>
-                            {isPublished ? '✅ Đã đăng' : '⏳ Chưa đăng'}
+                            {isError ? '❌ Lỗi' : isPublished ? '✅ Đã đăng' : '⏳ Chưa đăng'}
                           </span>
                         </div>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
                           <p style={{ color: '#888', fontSize: '0.9em', margin: 0 }}>{new Date(video.created_at).toLocaleString('vi-VN')}</p>
-                          <AudioDurationBadge
-                            videoId={video.id}
-                            audioUrl={video.audio_url}
-                            savedDurationSeconds={video.audio_duration_seconds}
-                            audioReviewStatus={video.audio_review_status}
-                          />
+                          {isError ? (
+                            <span style={{ color: '#e74c3c', fontSize: '0.8em' }}>Đã bỏ qua xử lý</span>
+                          ) : (
+                            <AudioDurationBadge
+                              videoId={video.id}
+                              audioUrl={video.audio_url}
+                              savedDurationSeconds={video.audio_duration_seconds}
+                              audioReviewStatus={video.audio_review_status}
+                            />
+                          )}
                         </div>
                         <div style={{ display: 'flex', gap: '15px', marginBottom: '10px', alignItems: 'center' }}>
-                          <a href={video.url} target="_blank" rel="noreferrer" style={{ color: 'var(--accent)', fontSize: '0.9em', textDecoration: 'none' }}>▶ Xem YouTube</a>
+                          <a href={video.url} target="_blank" rel="noreferrer" style={{ color: 'var(--accent)', fontSize: '0.9em', textDecoration: 'none' }}>▶ Video gốc</a>
+                          {video.published_url && (
+                            <a href={video.published_url} target="_blank" rel="noreferrer" style={{ color: '#4dd0e1', fontSize: '0.9em', textDecoration: 'none' }}>📺 Video đã đăng</a>
+                          )}
                           {video.chat_url && (
                             <a href={video.chat_url} target="_blank" rel="noreferrer" style={{ color: '#2ecc71', fontSize: '0.9em', textDecoration: 'none' }}>💬 Chat Gốc</a>
                           )}
@@ -1249,7 +1487,7 @@ function App() {
                             border: '1px solid rgba(26,188,156,0.4)',
                             whiteSpace: 'nowrap'
                           }} title={video.voice_id || 'Video cũ chưa lưu Voice ID'}>
-                            🎙️ {getVoiceName(video.voice_id, video.voice_name)}
+                            🎙️ [{voiceProviderName(video.tts_provider_id || 'genmax')}] {getVoiceName(video.voice_id, video.voice_name)}
                           </span>
                         </div>
                         
@@ -1263,16 +1501,50 @@ function App() {
                             style={{ padding: '8px', flex: 1, fontSize: '0.9em' }}
                             onClick={() => viewSavedVideo(video.id)}
                           >📄 Xem Script</button>
-                          <button 
-                            style={{ 
-                              padding: '8px 12px', fontSize: '0.85em', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold',
-                              backgroundColor: isPublished ? 'rgba(76,175,80,0.2)' : 'rgba(243,156,18,0.2)',
-                              color: isPublished ? '#4caf50' : '#f39c12',
+                          <select
+                            value={lifecycleState}
+                            onChange={(event) => setVideoLifecycleState({
+                              videoId: video.id,
+                              videoTitle: video.title,
+                              videoStatus: video.video_status || 'active',
+                              isPublished,
+                              hasPublishedUrl: Boolean(video.published_url),
+                              defaultChannelTitle: video.default_youtube_channel_title,
+                              nextState: event.target.value
+                            })}
+                            aria-label={`Trạng thái video ${video.title}`}
+                            title="Chuyển thủ công giữa Chưa đăng, Đã đăng và Lỗi"
+                            style={{
+                              padding: '8px 10px', fontSize: '0.85em', borderRadius: '6px',
+                              cursor: 'pointer', fontWeight: 'bold', border: `1px solid ${statusColor}`,
+                              backgroundColor: isError ? 'rgba(231,76,60,0.2)' : isPublished ? 'rgba(76,175,80,0.2)' : 'rgba(243,156,18,0.2)',
+                              color: statusColor
                             }}
-                            onClick={() => togglePublish(video.id, isPublished)}
                           >
-                            {isPublished ? '↩ Bỏ đăng' : '📤 Đánh dấu đã đăng'}
-                          </button>
+                            <option value="unpublished" disabled={Boolean(video.published_url)}>⏳ Chưa đăng</option>
+                            <option value="published">✅ Đã đăng</option>
+                            <option value="error">❌ Lỗi</option>
+                          </select>
+                          <button
+                            className="btn-secondary"
+                            style={{ padding: '8px 10px', fontSize: '0.85em' }}
+                            onClick={() => {
+                              if (isPublished && !video.published_url) {
+                                setPublicationDialog({
+                                  videoId: video.id,
+                                  videoTitle: video.title || 'Video chưa có tiêu đề',
+                                  defaultChannelTitle: video.default_youtube_channel_title || '',
+                                  publishedUrl: '',
+                                  isSaving: false,
+                                  error: ''
+                                });
+                              } else {
+                                setActiveView('comments');
+                              }
+                            }}
+                            disabled={isError}
+                            title="Gắn link chuẩn của video đã đăng để đồng bộ bình luận"
+                          >{isPublished && !video.published_url ? '🔗 Thêm link đã đăng' : '🔗 Link đã đăng'}</button>
                           <button className="btn-secondary" style={{ padding: '8px', fontSize: '0.9em' }} onClick={() => deleteSavedVideo(video.id)}>🗑️</button>
                         </div>
                       </div>
@@ -1402,15 +1674,7 @@ function App() {
                       fontSize: '15px', fontWeight: '600', cursor: 'pointer'
                     }}
                   >
-                    {voiceOptions.map(voice => (
-                      <option
-                        key={voice.id}
-                        value={voice.id}
-                        style={{ background: '#1a1a1a', color: 'white' }}
-                      >
-                        {voice.name}
-                      </option>
-                    ))}
+                    <VoiceOptions voices={voiceOptions} />
                   </select>
                 </div>
               </div>
@@ -1556,17 +1820,60 @@ function App() {
                           {isGeneratingMetadata ? '⏳ Đang tạo metadata...' : '✍️ Tạo lại TIÊU ĐỀ'}
                         </button>
                         {currentVideoId && (
-                          <button 
-                            style={{ 
-                              padding: '4px 14px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold',
-                              border: `1px solid ${isCurrentVideoPublished ? '#4caf50' : '#f39c12'}`,
-                              backgroundColor: isCurrentVideoPublished ? 'rgba(76,175,80,0.2)' : 'rgba(243,156,18,0.2)',
-                              color: isCurrentVideoPublished ? '#4caf50' : '#f39c12',
+                          <select
+                            value={currentVideoIsError ? 'error' : isCurrentVideoPublished ? 'published' : 'unpublished'}
+                            onChange={(event) => setVideoLifecycleState({
+                              videoId: currentVideoId,
+                              videoTitle,
+                              videoStatus: currentVideoStatus,
+                              isPublished: isCurrentVideoPublished,
+                              hasPublishedUrl: currentVideoPublications.length > 0,
+                              defaultChannelTitle: currentVideoDefaultChannelTitle,
+                              nextState: event.target.value
+                            })}
+                            aria-label="Trạng thái video đang xem"
+                            title="Chuyển thủ công giữa Chưa đăng, Đã đăng và Lỗi"
+                            style={{
+                              padding: '4px 12px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold',
+                              border: `1px solid ${currentVideoIsError ? '#e74c3c' : isCurrentVideoPublished ? '#4caf50' : '#f39c12'}`,
+                              backgroundColor: currentVideoIsError ? 'rgba(231,76,60,0.2)' : isCurrentVideoPublished ? 'rgba(76,175,80,0.2)' : 'rgba(243,156,18,0.2)',
+                              color: currentVideoIsError ? '#e74c3c' : isCurrentVideoPublished ? '#4caf50' : '#f39c12'
                             }}
-                            onClick={toggleCurrentVideoPublish}
                           >
-                            {isCurrentVideoPublished ? '✅ Đã đăng' : '⏳ Chưa đăng'}
-                          </button>
+                            <option value="unpublished" disabled={currentVideoPublications.length > 0}>⏳ Chưa đăng</option>
+                            <option value="published">✅ Đã đăng</option>
+                            <option value="error">❌ Lỗi</option>
+                          </select>
+                        )}
+                        {currentVideoPublications.map(publication => (
+                          <a
+                            key={publication.id}
+                            href={publication.published_url}
+                            target="_blank"
+                            rel="noreferrer"
+                            style={{
+                              padding: '4px 12px', borderRadius: '4px',
+                              border: '1px solid #4dd0e1', color: '#4dd0e1',
+                              textDecoration: 'none', fontWeight: 'bold', fontSize: '0.82em'
+                            }}
+                            title={publication.youtube_channel_id
+                              ? `${publication.channel_title}: ${publication.published_title || publication.published_url}`
+                              : 'Chưa gắn kênh — link chưa được xác minh; bình luận chưa khả dụng'}
+                          >📺 {publication.channel_title || 'Chưa gắn kênh — link chưa được xác minh'}</a>
+                        ))}
+                        {isCurrentVideoPublished && currentVideoPublications.length === 0 && (
+                          <button
+                            className="btn-secondary"
+                            onClick={() => setPublicationDialog({
+                              videoId: currentVideoId,
+                              videoTitle: videoTitle || 'Video chưa có tiêu đề',
+                              defaultChannelTitle: currentVideoDefaultChannelTitle,
+                              publishedUrl: '',
+                              isSaving: false,
+                              error: ''
+                            })}
+                            style={{ padding: '4px 12px', fontSize: '0.82em' }}
+                          >🔗 Thêm link đã đăng</button>
                         )}
                         {currentVideoId && (!audioUrl || audioStatus === 'failed') && (
                           <button
@@ -1576,6 +1883,7 @@ function App() {
                                 : handleGenerateAudio
                             }
                             disabled={
+                              currentVideoIsError ||
                               isGenAudio ||
                               isLoadingAudioReview ||
                               (audioStatus === 'failed'
@@ -1584,10 +1892,10 @@ function App() {
                             }
                             style={{
                               padding: '4px 14px', borderRadius: '4px',
-                              cursor: (isGenAudio || isLoadingAudioReview || Boolean(audioReview && !audioReview.can_approve)) ? 'not-allowed' : 'pointer',
+                              cursor: (currentVideoIsError || isGenAudio || isLoadingAudioReview || Boolean(audioReview && !audioReview.can_approve)) ? 'not-allowed' : 'pointer',
                               border: '1px solid #1abc9c',
-                              background: (isGenAudio || isLoadingAudioReview) ? '#333' : 'rgba(26,188,156,0.2)',
-                              color: (isGenAudio || isLoadingAudioReview) ? '#888' : '#1abc9c',
+                              background: (currentVideoIsError || isGenAudio || isLoadingAudioReview) ? '#333' : 'rgba(26,188,156,0.2)',
+                              color: (currentVideoIsError || isGenAudio || isLoadingAudioReview) ? '#888' : '#1abc9c',
                               fontWeight: 'bold'
                             }}
                           >
@@ -1639,9 +1947,9 @@ function App() {
                               border: '1px solid #c0392b', background: 'rgba(192, 57, 43, 0.2)',
                               color: '#c0392b', fontWeight: 'bold'
                             }}
-                            title="Lỗi: Video bị lỗi ngầm từ trước và đã mất bản nháp. Bạn phải tạo lại từ đầu."
+                            title="Quy trình cũ chưa hoàn tất; trạng thái Lỗi chỉ được gắn thủ công."
                           >
-                            ❌ Lỗi (Mất dữ liệu)
+                            ⚠️ Chưa hoàn tất
                           </button>
                         )}
                         {chatUrl && (
@@ -1685,7 +1993,7 @@ function App() {
                               <div>
                                 <h4 style={{color: 'var(--accent)', margin: 0}}>🔊 AI Voice-over:</h4>
                                 <div style={{ color: '#76d7c4', fontSize: '0.8em', marginTop: '5px' }}>
-                                  🎙️ Đang sử dụng: {getVoiceName(
+                                  🎙️ Đang sử dụng: [{voiceProviderName(currentVideoProviderId)}] {getVoiceName(
                                     currentVideoVoiceId,
                                     currentVideoVoiceName
                                   )}
@@ -1694,7 +2002,7 @@ function App() {
                                   ['pending', 'processing', 'interrupted', 'failed'].includes(audioStatus) &&
                                   audioTaskVoiceName !== currentVideoVoiceName && (
                                     <div style={{ color: '#f5b041', fontSize: '0.78em', marginTop: '3px' }}>
-                                      ⏳ Audio mới: {audioTaskVoiceName} ({audioStatus})
+                                      ⏳ Audio mới: [{voiceProviderName(audioTaskProviderId)}] {audioTaskVoiceName} ({audioStatus})
                                     </div>
                                   )}
                               </div>
@@ -1702,7 +2010,7 @@ function App() {
                                 <select
                                   value={regenerateVoiceId}
                                   onChange={(event) => setRegenerateVoiceId(event.target.value)}
-                                  disabled={isGenAudio || voiceOptions.length === 0}
+                                  disabled={currentVideoIsError || isGenAudio || voiceOptions.length === 0}
                                   aria-label="Giọng tạo lại audio"
                                   style={{
                                     background: '#17131d', color: '#eee',
@@ -1710,15 +2018,13 @@ function App() {
                                     borderRadius: '6px', padding: '5px 9px'
                                   }}
                                 >
-                                  {voiceOptions.map(voice => (
-                                    <option key={voice.id} value={voice.id}>{voice.name}</option>
-                                  ))}
+                                  <VoiceOptions voices={voiceOptions} />
                                 </select>
                                 <button
                                   className="btn-secondary"
                                   style={{ padding: '4px 12px', fontSize: '0.8em' }}
                                   onClick={handleRegenerateAudio}
-                                  disabled={isGenAudio || !regenerateVoiceId}
+                                  disabled={currentVideoIsError || isGenAudio || !regenerateVoiceId}
                                 >
                                   {isGenAudio ? '⏳ Audio đang chạy...' : '🎙️ Tạo lại toàn bộ'}
                                 </button>
@@ -1794,7 +2100,7 @@ function App() {
                                           <img
                                             src={imgSrc}
                                             alt={`${section.title} - Phương án ${i + 1}`}
-                                            crossOrigin="anonymous"
+                                            crossOrigin="use-credentials"
                                             style={{ width: '100%', borderRadius: '10px', border: '2px solid var(--accent)', display: 'block' }}
                                           />
                                           <a
@@ -1908,6 +2214,89 @@ function App() {
           )}
         </div>
       </main>
+      {publicationDialog && (
+        <div
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !publicationDialog.isSaving) {
+              setPublicationDialog(null);
+            }
+          }}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 1000,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            padding: '20px', background: 'rgba(0, 0, 0, 0.72)'
+          }}
+        >
+          <form
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="publication-dialog-title"
+            onSubmit={submitVideoPublication}
+            style={{
+              width: 'min(560px, 100%)', padding: '24px', borderRadius: '14px',
+              border: '1px solid rgba(155, 89, 182, 0.6)', background: '#151218',
+              boxShadow: '0 24px 80px rgba(0, 0, 0, 0.55)'
+            }}
+          >
+            <h3 id="publication-dialog-title" style={{ margin: '0 0 8px', color: '#fff' }}>
+              Xác nhận video đã đăng / đã lên lịch
+            </h3>
+            <p style={{ margin: '0 0 16px', color: '#aaa', lineHeight: 1.45 }}>
+              {publicationDialog.videoTitle}
+            </p>
+            <div style={{ marginBottom: '14px', color: publicationDialog.defaultChannelTitle ? '#76d7c4' : '#f5b041' }}>
+              📺 Kênh: {publicationDialog.defaultChannelTitle || 'Chưa gắn kênh — link chưa được xác minh'}
+            </div>
+            <label htmlFor="published-video-url" style={{ display: 'block', marginBottom: '8px', color: '#ddd', fontWeight: 600 }}>
+              Link chuẩn của video đã đăng hoặc đã lên lịch
+            </label>
+            <input
+              id="published-video-url"
+              type="url"
+              autoFocus
+              required
+              value={publicationDialog.publishedUrl}
+              onChange={(event) => setPublicationDialog(dialog => ({
+                ...dialog,
+                publishedUrl: event.target.value,
+                error: ''
+              }))}
+              placeholder="https://www.youtube.com/watch?v=..."
+              disabled={publicationDialog.isSaving}
+              style={{
+                width: '100%', boxSizing: 'border-box', padding: '12px 14px',
+                borderRadius: '8px', border: '1px solid #5b4768',
+                background: '#211c24', color: '#fff', fontSize: '0.95em'
+              }}
+            />
+            {publicationDialog.error && (
+              <p role="alert" style={{ margin: '12px 0 0', color: '#ff6b6b', lineHeight: 1.4 }}>
+                {publicationDialog.error}
+              </p>
+            )}
+            <p style={{ margin: '12px 0 0', color: '#888', fontSize: '0.85em', lineHeight: 1.4 }}>
+              {publicationDialog.defaultChannelTitle
+                ? 'Video đặt lịch được kiểm tra ngay bằng quyền chủ kênh, dù chưa công khai. Hệ thống chống trùng và chỉ đổi trạng thái sau khi xác nhận đúng kênh.'
+                : 'Link sẽ được lưu chưa xác minh và video vẫn chuyển sang Đã đăng. Bình luận chưa khả dụng cho đến khi link được nhập lại qua một kênh đã xác minh.'}
+            </p>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
+              <button
+                type="button"
+                className="btn-secondary"
+                disabled={publicationDialog.isSaving}
+                onClick={() => setPublicationDialog(null)}
+              >Hủy</button>
+              <button
+                type="submit"
+                className="btn-run"
+                disabled={publicationDialog.isSaving || !publicationDialog.videoId || !publicationDialog.publishedUrl.trim()}
+                style={{ width: 'auto', padding: '10px 18px' }}
+              >{publicationDialog.isSaving ? 'Đang kiểm tra...' : 'Lưu link & chuyển Đã đăng'}</button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   )
 }

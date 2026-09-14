@@ -1,13 +1,293 @@
 import unittest
 import hashlib
 import json
+import os
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from auto_yt.services import chatgpt_service, chatgpt_worker
+from auto_yt.services.chatgpt_runtime import ChatGPTAttentionRequiredError
 
 
 class ChatGptServiceTests(unittest.TestCase):
+    def test_external_app_permission_dialog_is_denied_without_app_specific_logic(self):
+        page = Mock()
+        dialog = Mock()
+        deny_button = Mock()
+        allow_button = Mock()
+        dialogs = Mock()
+        buttons = Mock()
+
+        dialogs.count.return_value = 1
+        dialogs.nth.return_value = dialog
+        dialog.is_visible.return_value = True
+        dialog.inner_text.return_value = (
+            "Search outside this project?\n"
+            "ChatGPT will use Research Connector to help answer your request."
+        )
+        dialog.locator.return_value = buttons
+        buttons.count.return_value = 2
+        buttons.nth.side_effect = [deny_button, allow_button]
+        deny_button.inner_text.return_value = "Deny"
+        allow_button.inner_text.return_value = "Allow"
+        page.locator.return_value = dialogs
+
+        dismissed = chatgpt_worker.dismiss_external_app_permission_dialog(page)
+
+        self.assertTrue(dismissed)
+        page.locator.assert_called_once_with(
+            chatgpt_worker.EXTERNAL_APP_PERMISSION_DIALOG_SELECTOR
+        )
+        deny_button.click.assert_called_once_with(
+            timeout=chatgpt_worker.EXTERNAL_APP_PERMISSION_CLICK_TIMEOUT_MS
+        )
+        allow_button.click.assert_not_called()
+
+    def test_unrelated_dialog_is_not_dismissed(self):
+        page = Mock()
+        dialog = Mock()
+        deny_button = Mock()
+        dialogs = Mock()
+
+        dialogs.count.return_value = 1
+        dialogs.nth.return_value = dialog
+        dialog.is_visible.return_value = True
+        dialog.inner_text.return_value = "Delete this conversation?"
+        dialog.locator.return_value.count.return_value = 1
+        dialog.locator.return_value.nth.return_value = deny_button
+        deny_button.inner_text.return_value = "Deny"
+        page.locator.return_value = dialogs
+
+        dismissed = chatgpt_worker.dismiss_external_app_permission_dialog(page)
+
+        self.assertFalse(dismissed)
+        deny_button.click.assert_not_called()
+
+    def test_response_wait_clears_external_app_permission_dialog(self):
+        page = Mock()
+
+        with (
+            patch.object(
+                chatgpt_worker,
+                "dismiss_external_app_permission_dialog",
+                return_value=True,
+            ) as dismiss_dialog,
+            patch.object(
+                chatgpt_worker,
+                "is_chatgpt_generation_active",
+                return_value=False,
+            ),
+            patch.object(
+                chatgpt_worker,
+                "get_new_assistant_response",
+                return_value="Generated response",
+            ),
+            patch.object(chatgpt_worker, "ASSISTANT_RESPONSE_STABLE_SECONDS", 0),
+        ):
+            result = chatgpt_worker.wait_for_assistant_response(page, -1)
+
+        self.assertEqual(result, "Generated response")
+        dismiss_dialog.assert_called_once_with(page)
+
+    def test_prompt_validation_allows_query_strings_in_source_urls(self):
+        prompt = (
+            "Mô tả video hợp lệ.\n"
+            "Kênh: youtube.com/channel/UCnFwJ4JLuBbrKObiALIFtlA?sub_confirmation=1\n"
+            "Nguồn: https://www.youtube.com/watch?v=Tf-2NkpjN7o"
+        )
+
+        chatgpt_worker.validate_prompt_text(prompt)
+
+    def test_prompt_validation_allows_question_mark_without_following_space(self):
+        chatgpt_worker.validate_prompt_text(
+            "Ý kiến người xem: Chỉ khác nhau về thời điểm mà thôi?VD như sau."
+        )
+
+    def test_prompt_validation_does_not_treat_json_viewer_text_as_corruption(self):
+        prompt = (
+            'UNTRUSTED_COMMENTS_START\n[{"comment":"thôi?VD này?cũng hợp lệ?đúng"}]'
+            "\nUNTRUSTED_COMMENTS_END"
+        )
+
+        chatgpt_worker.validate_prompt_text(prompt)
+
+    def test_prompt_validation_still_rejects_corrupted_unicode_text(self):
+        with self.assertRaisesRegex(ValueError, "corrupted Unicode"):
+            chatgpt_worker.validate_prompt_text(
+                "??y l? b?n BODY thay th? ho?n to?n cho b?n c?"
+            )
+
+    def test_prompt_submission_is_attempted_only_once_when_confirmation_times_out(self):
+        page = Mock()
+        page.url = "https://chatgpt.com/g/g-p-test/project"
+        prompt_textarea = Mock()
+        send_button = Mock()
+        page.locator.side_effect = lambda selector: Mock(
+            first=(
+                send_button
+                if selector == '[data-testid="send-button"]'
+                else prompt_textarea
+            )
+        )
+        page.wait_for_function.side_effect = [
+            None,
+            None,
+            TimeoutError("submission confirmation timeout"),
+        ]
+
+        with (
+            patch.object(
+                chatgpt_worker,
+                "wait_for_chatgpt_composer",
+                return_value=prompt_textarea,
+            ),
+            patch.object(chatgpt_worker, "is_chatgpt_conversation_url", return_value=False),
+            patch.object(chatgpt_worker, "get_latest_conversation_turn", return_value=-1),
+            patch.object(chatgpt_worker, "get_assistant_message_count", return_value=0),
+            patch.object(chatgpt_worker, "get_user_message_count", return_value=0),
+            patch.object(chatgpt_worker, "ensure_prompt_editor_integrity"),
+            self.assertRaisesRegex(RuntimeError, "No automatic resend"),
+        ):
+            chatgpt_worker.send_prompt(page, "Prompt test")
+
+        send_button.click.assert_called_once_with()
+        prompt_textarea.press.assert_not_called()
+
+    def test_composer_wait_recovers_full_page_try_again_without_new_navigation(self):
+        page = Mock()
+        page.url = "https://chatgpt.com/g/g-p-test/project"
+        prompt_textarea = Mock()
+        prompt_textarea.wait_for.side_effect = [TimeoutError(), None]
+        page.locator.return_value.first = prompt_textarea
+
+        with (
+            patch.object(
+                chatgpt_worker,
+                "get_chatgpt_load_state",
+                return_value={
+                    "editor_present": False,
+                    "conversation_turn_count": 0,
+                    "full_page_retry": True,
+                    "body_preview": "Try again",
+                },
+            ),
+            patch.object(
+                chatgpt_worker,
+                "click_chatgpt_full_page_retry",
+                return_value=True,
+            ) as click_retry,
+        ):
+            result = chatgpt_worker.wait_for_chatgpt_composer(page)
+
+        self.assertIs(result, prompt_textarea)
+        click_retry.assert_called_once_with(page)
+        page.reload.assert_not_called()
+        page.goto.assert_not_called()
+
+    def test_composer_wait_reloads_same_page_when_retry_button_does_not_recover(self):
+        page = Mock()
+        page.url = "https://chatgpt.com/g/g-p-test/c/conversation"
+        prompt_textarea = Mock()
+        prompt_textarea.wait_for.side_effect = [
+            TimeoutError(),
+            TimeoutError(),
+            None,
+        ]
+        page.locator.return_value.first = prompt_textarea
+
+        with (
+            patch.object(
+                chatgpt_worker,
+                "get_chatgpt_load_state",
+                return_value={
+                    "editor_present": False,
+                    "conversation_turn_count": 0,
+                    "full_page_retry": True,
+                    "body_preview": "Try again",
+                },
+            ),
+            patch.object(
+                chatgpt_worker,
+                "click_chatgpt_full_page_retry",
+                return_value=True,
+            ) as click_retry,
+        ):
+            result = chatgpt_worker.wait_for_chatgpt_composer(page)
+
+        self.assertIs(result, prompt_textarea)
+        click_retry.assert_called_once_with(page)
+        page.reload.assert_called_once_with(
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        page.goto.assert_not_called()
+
+    def test_composer_wait_is_bounded_and_reports_no_prompt_was_sent(self):
+        page = Mock()
+        page.url = "https://chatgpt.com/g/g-p-test/project"
+        prompt_textarea = Mock()
+        prompt_textarea.wait_for.side_effect = TimeoutError()
+        page.locator.return_value.first = prompt_textarea
+
+        with patch.object(
+            chatgpt_worker,
+            "get_chatgpt_load_state",
+            return_value={
+                "editor_present": False,
+                "conversation_turn_count": 0,
+                "full_page_retry": False,
+                "body_preview": "",
+            },
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "No prompt was sent",
+            ):
+                chatgpt_worker.wait_for_chatgpt_composer(page)
+
+        self.assertEqual(prompt_textarea.wait_for.call_count, 3)
+        self.assertEqual(page.reload.call_count, 2)
+        page.goto.assert_not_called()
+
+    def test_composer_wait_does_not_recover_when_editor_is_ready(self):
+        page = Mock()
+        prompt_textarea = Mock()
+        page.locator.return_value.first = prompt_textarea
+
+        with patch.object(
+            chatgpt_worker,
+            "get_chatgpt_load_state",
+        ) as get_state:
+            result = chatgpt_worker.wait_for_chatgpt_composer(page)
+
+        self.assertIs(result, prompt_textarea)
+        get_state.assert_not_called()
+        page.reload.assert_not_called()
+        page.goto.assert_not_called()
+
+    def test_composer_wait_stops_for_manual_login_without_reloading(self):
+        page = Mock()
+        prompt_textarea = Mock()
+        prompt_textarea.wait_for.side_effect = TimeoutError()
+        page.locator.return_value.first = prompt_textarea
+
+        with patch.object(
+            chatgpt_worker,
+            "get_chatgpt_load_state",
+            return_value={
+                "editor_present": False,
+                "conversation_turn_count": 0,
+                "full_page_retry": False,
+                "login_required": True,
+                "challenge_present": False,
+                "body_preview": "Log in",
+            },
+        ):
+            with self.assertRaises(ChatGPTAttentionRequiredError):
+                chatgpt_worker.wait_for_chatgpt_composer(page)
+
+        page.reload.assert_not_called()
+
     def test_narrative_sanitizer_removes_isolated_editorial_lines(self):
         first_paragraph = (
             "Lực lượng được tổ chức linh hoạt để thích nghi với chiến trường "
@@ -45,6 +325,53 @@ class ChatGptServiceTests(unittest.TestCase):
         )
 
         self.assertIn("Nhưng chưa hết.", result)
+
+    def test_narrative_sanitizer_removes_standalone_structural_label(self):
+        narrative = (
+            "Năm 1954, đất nước đứng trước nhiều lựa chọn có ảnh hưởng lâu dài "
+            "và câu chuyện được kể lại theo đúng trình tự lịch sử. " * 3
+        )
+
+        result = chatgpt_worker.sanitize_narrative_response(
+            f"Mở đầu\n\n{narrative}"
+        )
+
+        self.assertFalse(result.startswith("Mở đầu"))
+        self.assertIn(narrative.strip(), result)
+
+    def test_narrative_sanitizer_preserves_natural_sentence_with_label_words(self):
+        first_paragraph = (
+            "Bối cảnh lịch sử được trình bày rõ ràng để người nghe hiểu được "
+            "những quyết định quan trọng trong giai đoạn này. " * 3
+        )
+        second_paragraph = (
+            "Các sự kiện tiếp theo được nối liền theo trình tự và giữ nguyên "
+            "những dữ kiện cần thiết của câu chuyện. " * 3
+        )
+        bridge = "Mở đầu câu chuyện là một quyết định đầy bất ngờ."
+
+        result = chatgpt_worker.sanitize_narrative_response(
+            f"{first_paragraph}\n\n{bridge}\n\n{second_paragraph}"
+        )
+
+        self.assertIn(bridge, result)
+
+    def test_narrative_sanitizer_removes_editorial_lines_at_section_end(self):
+        narrative = (
+            "Điều giữ hai con người ở lại với nhau vẫn là sự tôn trọng, "
+            "khả năng lắng nghe và mong muốn cùng nhau gìn giữ gia đình. " * 3
+        )
+        editorial_note = (
+            "Chia đoạn dài thành các nhịp dễ đọc\n"
+            "Thêm câu chuyển ý giữa các luận điểm"
+        )
+
+        result = chatgpt_worker.sanitize_narrative_response(
+            f"{narrative}\n\n{editorial_note}"
+        )
+
+        self.assertNotIn(editorial_note, result)
+        self.assertIn(narrative.strip(), result)
 
     def test_narrative_sanitizer_never_erases_the_only_response_block(self):
         self.assertEqual(
@@ -119,6 +446,55 @@ class ChatGptServiceTests(unittest.TestCase):
         worker_env = run_worker.call_args.kwargs["env"]
         self.assertEqual(worker_env["PROMPT_VERSION"], "version-key")
         self.assertEqual(worker_env["VIDEO_ID"], "122")
+        source_root = Path(chatgpt_service.__file__).resolve().parents[2]
+        self.assertIn(str(source_root), worker_env["PYTHONPATH"].split(os.pathsep))
+        self.assertEqual(
+            Path(run_worker.call_args.kwargs["cwd"]),
+            source_root.parent,
+        )
+
+    def test_worker_environment_preserves_existing_python_path(self):
+        completed_process = Mock(
+            returncode=0,
+            stdout=b"Generated script",
+            stderr=b"",
+        )
+        existing_path = str(Path.cwd() / "existing-python-path")
+        with (
+            patch.dict(os.environ, {"PYTHONPATH": existing_path}),
+            patch.object(
+                chatgpt_service.subprocess,
+                "run",
+                return_value=completed_process,
+            ) as run_worker,
+        ):
+            chatgpt_service.process_prompt_via_chatgpt("transcript")
+
+        worker_paths = run_worker.call_args.kwargs["env"]["PYTHONPATH"].split(
+            os.pathsep
+        )
+        self.assertIn(existing_path, worker_paths)
+
+    def test_subprocess_attention_marker_preserves_the_error_type(self):
+        completed_process = Mock(
+            returncode=1,
+            stdout=b"",
+            stderr=(
+                b"diagnostic\n###CHATGPT_ATTENTION_REQUIRED###"
+                b"ChatGPT login expired"
+            ),
+        )
+
+        with patch.object(
+            chatgpt_service.subprocess,
+            "run",
+            return_value=completed_process,
+        ):
+            with self.assertRaisesRegex(
+                ChatGPTAttentionRequiredError,
+                "login expired",
+            ):
+                chatgpt_service.process_prompt_via_chatgpt("transcript")
 
     def test_pipeline_snapshot_is_forwarded_to_the_worker(self):
         pipeline = {

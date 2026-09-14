@@ -9,6 +9,7 @@ from auto_yt.services.chatgpt_worker import (
     select_reusable_outline_response,
     split_outline_parts,
 )
+from auto_yt.services.chatgpt_runtime import ChatGPTAttentionRequiredError
 
 
 class ImmediateThread:
@@ -223,6 +224,11 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
             patch.object(main.db, "save_video", return_value=71) as save_video,
             patch.object(
                 main.db,
+                "get_video",
+                return_value={"video_status": main.db.VIDEO_STATUS_ACTIVE},
+            ),
+            patch.object(
+                main.db,
                 "update_video_generation",
                 return_value=True,
             ) as update_generation,
@@ -255,16 +261,16 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
         self.assertEqual(job["status"], "retry_wait")
         self.assertFalse(job["result"]["complete_for_audio"])
         self.assertIn("body 2/3", job["result"]["generation_warning"])
-        save_video.assert_called_once_with(
-            "https://www.youtube.com/watch?v=generic",
-            "Title",
-            "Transcript",
-            main.INITIAL_GENERATED_SCRIPT,
-            "",
-            "version-key",
-            main.AUDIO_VOICE_ID,
-            "Giọng kiểm thử",
-        )
+        save_video.assert_called_once()
+        saved = save_video.call_args.kwargs
+        self.assertEqual(saved["url"], "https://www.youtube.com/watch?v=generic")
+        self.assertEqual(saved["generated_script"], main.INITIAL_GENERATED_SCRIPT)
+        self.assertEqual(saved["prompt_version"], "version-key")
+        self.assertEqual(saved["voice_id"], main.AUDIO_VOICE_ID)
+        self.assertEqual(saved["voice_name"], "Giọng kiểm thử")
+        self.assertEqual(saved["tts_provider_id"], "genmax")
+        self.assertEqual(saved["voice_revision"], 1)
+        self.assertIn('"provider_id": "genmax"', saved["voice_snapshot_json"])
         update_generation.assert_called_once_with(
             71,
             partial_script,
@@ -365,6 +371,119 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
         update_generation.assert_not_called()
         ensure_audio.assert_not_called()
 
+    def test_chatgpt_verification_pauses_job_without_automatic_retry(self):
+        with (
+            patch.object(main, "_try_start_chatgpt_operation", return_value=True),
+            patch.object(main, "_finish_chatgpt_operation"),
+            patch.object(main.threading, "Thread", ImmediateThread),
+            patch.object(main, "get_video_transcript", return_value="Transcript"),
+            patch.object(main, "get_video_title", return_value="Title"),
+            patch.object(
+                main,
+                "process_prompt_via_chatgpt",
+                side_effect=ChatGPTAttentionRequiredError("Login required"),
+            ),
+            patch.object(main.db, "save_video", return_value=731),
+            patch.object(main, "_ensure_audio_task") as ensure_audio,
+        ):
+            response = main.process_video(
+                main.VideoRequest(
+                    url="https://www.youtube.com/watch?v=needs-login",
+                    prompt_version="version-key",
+                )
+            )
+
+        job = main.db.get_system_job(response["job_id"])
+        self.assertEqual(job["status"], "paused")
+        self.assertEqual(
+            job["result"]["attention_required"],
+            "chatgpt_verification",
+        )
+        self.assertIn("xác minh", job["progress"])
+        self.assertEqual(job["recovery_count"], 0)
+        ensure_audio.assert_not_called()
+
+    def test_transient_chatgpt_start_failure_retries_saved_draft(self):
+        transient_error = (
+            "ChatGPT page did not become ready after bounded same-page recovery. "
+            "No prompt was sent."
+        )
+        with (
+            patch.object(main, "_try_start_chatgpt_operation", return_value=True),
+            patch.object(main, "_finish_chatgpt_operation"),
+            patch.object(main.threading, "Thread", ImmediateThread),
+            patch.object(main, "get_video_transcript", return_value="Transcript"),
+            patch.object(main, "get_video_title", return_value="Title"),
+            patch.object(
+                main,
+                "process_prompt_via_chatgpt",
+                side_effect=RuntimeError(transient_error),
+            ) as process_chatgpt,
+            patch.object(main.db, "save_video", return_value=75) as save_video,
+            patch.object(
+                main.db,
+                "get_video",
+                return_value={"video_status": main.db.VIDEO_STATUS_ACTIVE},
+            ),
+            patch.object(
+                main.db,
+                "update_video_generation",
+            ) as update_generation,
+            patch.object(main, "_schedule_video_queue_wakeup") as schedule_wakeup,
+            patch.object(main, "_ensure_audio_task") as ensure_audio,
+        ):
+            response = main.process_video(
+                main.VideoRequest(
+                    url="https://www.youtube.com/watch?v=generic",
+                    prompt_version="version-key",
+                )
+            )
+
+        job = main.db.get_system_job(response["job_id"])
+        self.assertEqual(job["status"], "retry_wait")
+        self.assertEqual(job["resume_from_step"], "chatgpt_start")
+        self.assertEqual(job["recovery_count"], 1)
+        self.assertIn("ChatGPT", job["progress"])
+        self.assertIn("No prompt was sent", job["error"])
+        save_video.assert_called_once()
+        process_chatgpt.assert_called_once()
+        update_generation.assert_not_called()
+        ensure_audio.assert_not_called()
+        schedule_wakeup.assert_any_call(main.VIDEO_RECOVERY_DELAYS_SECONDS[0])
+
+    def test_youtube_rate_limit_before_draft_is_retried_automatically(self):
+        with (
+            patch.object(main, "_try_start_chatgpt_operation", return_value=True),
+            patch.object(main, "_finish_chatgpt_operation"),
+            patch.object(main.threading, "Thread", ImmediateThread),
+            patch.object(
+                main,
+                "get_video_transcript",
+                side_effect=RuntimeError("HTTP Error 429: Too Many Requests"),
+            ),
+            patch.object(main, "get_video_title") as get_title,
+            patch.object(main, "process_prompt_via_chatgpt") as process_chatgpt,
+            patch.object(main.db, "save_video") as save_video,
+            patch.object(main, "_schedule_video_queue_wakeup") as schedule_wakeup,
+        ):
+            response = main.process_video(
+                main.VideoRequest(
+                    url="https://www.youtube.com/watch?v=rate-limited",
+                    prompt_version="version-key",
+                )
+            )
+
+        job = main.db.get_system_job(response["job_id"])
+        self.assertEqual(job["status"], "retry_wait")
+        self.assertEqual(job["resume_from_step"], "youtube_transcript")
+        self.assertEqual(job["recovery_count"], 1)
+        self.assertIn("YouTube", job["progress"])
+        self.assertIn("429", job["error"])
+        get_title.assert_not_called()
+        process_chatgpt.assert_not_called()
+        save_video.assert_not_called()
+        schedule_wakeup.assert_any_call(main.YOUTUBE_RECOVERY_DELAYS_SECONDS[0])
+
     def test_chapter_timeout_still_starts_audio_when_core_script_is_complete(self):
         recovered_script = (
             "### [INTRO]\nIntro\n\n"
@@ -401,6 +520,11 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
                 return_value=worker_result,
             ),
             patch.object(main.db, "save_video", return_value=72),
+            patch.object(
+                main.db,
+                "get_video",
+                return_value={"video_status": main.db.VIDEO_STATUS_ACTIVE},
+            ),
             patch.object(
                 main.db,
                 "update_video_generation",

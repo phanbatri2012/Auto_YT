@@ -21,6 +21,9 @@ from auto_yt.paths import DATA_DIR
 
 
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
+MAX_LISTED_VIDEOS = 500
+MAX_SELECTED_VIDEOS = 500
+MAX_VIDEO_FILESIZE_BYTES = 20 * 1024 * 1024 * 1024
 WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{index}" for index in range(1, 10)),
@@ -64,7 +67,7 @@ def ensure_ffmpeg_directory() -> str:
 def validate_youtube_url(value: str) -> str:
     url = str(value or "").strip()
     parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() not in YOUTUBE_HOSTS:
+    if parsed.scheme != "https" or parsed.netloc.lower() not in YOUTUBE_HOSTS:
         raise ValueError("Hãy nhập đúng link video hoặc kênh YouTube.")
     return url
 
@@ -144,7 +147,7 @@ def list_youtube_videos(url: str) -> list[dict]:
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
-        "nocheckcertificate": True,
+        "playlistend": MAX_LISTED_VIDEOS,
     }
     try:
         with YoutubeDL(options) as downloader:
@@ -156,7 +159,7 @@ def list_youtube_videos(url: str) -> list[dict]:
         raise YouTubeDownloaderError("YouTube không trả về video nào.")
 
     entries = info.get("entries") if isinstance(info, dict) else None
-    raw_videos = list(entries or [info])
+    raw_videos = list(entries or [info])[:MAX_LISTED_VIDEOS]
     videos = []
     seen_ids = set()
     for position, entry in enumerate(raw_videos, start=1):
@@ -245,6 +248,10 @@ class DownloadJobManager:
             raise ValueError("Thư mục lưu không hợp lệ.")
         if not videos:
             raise ValueError("Hãy chọn ít nhất một video để tải.")
+        if len(videos) > MAX_SELECTED_VIDEOS:
+            raise ValueError(
+                f"Mỗi lượt chỉ được tải tối đa {MAX_SELECTED_VIDEOS} video."
+            )
 
         normalized_videos = []
         for fallback_position, video in enumerate(videos, start=1):
@@ -300,9 +307,11 @@ class DownloadJobManager:
         ).start()
         return job_id
 
-    def list_jobs(self, limit: int = 100) -> list[dict]:
+    def list_jobs(self, limit: int | None = 100) -> list[dict]:
         with self._lock:
-            job_ids = list(self._jobs.keys())[-max(1, min(int(limit), 500)):]
+            job_ids = list(self._jobs.keys())
+            if limit is not None:
+                job_ids = job_ids[-max(1, min(int(limit), 500)):]
         return [job for job_id in reversed(job_ids) if (job := self.get(job_id))]
 
     def get(self, job_id: str) -> dict | None:
@@ -516,7 +525,7 @@ class DownloadJobManager:
             "overwrites": False,
             "quiet": True,
             "no_warnings": True,
-            "nocheckcertificate": True,
+            "max_filesize": MAX_VIDEO_FILESIZE_BYTES,
             "progress_hooks": [progress_hook],
             "postprocessor_hooks": [postprocessor_hook],
         }

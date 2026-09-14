@@ -241,6 +241,11 @@ class LongAudioTests(unittest.TestCase):
             completed_task["audio_url"],
             "voice-id",
             "Giọng thử nghiệm",
+            {
+                "tts_provider_id": "genmax",
+                "voice_revision": 1,
+                "voice_snapshot_json": "{}",
+            },
         )
         self.assertEqual(result["audio_task"]["status"], "completed")
 
@@ -491,6 +496,18 @@ class LongAudioTests(unittest.TestCase):
     def test_implausibly_short_audio_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "incomplete audio"):
             audio_utils.validate_spoken_duration("từ " * 600, 30)
+
+    def test_implausibly_long_audio_is_rejected_when_provider_requests_it(self):
+        with self.assertRaisesRegex(RuntimeError, "implausibly long audio"):
+            audio_utils.validate_spoken_duration(
+                "từ " * 600,
+                600,
+                minimum_words_per_minute=105,
+                provider_name="OmniVoice",
+            )
+
+    def test_legacy_duration_check_keeps_accepting_slow_audio(self):
+        audio_utils.validate_spoken_duration("từ " * 600, 600)
 
     @staticmethod
     def _build_test_mp3(audio_frame_count: int) -> tuple[bytes, int]:

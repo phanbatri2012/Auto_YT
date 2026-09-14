@@ -56,6 +56,57 @@ class AudioReviewTests(unittest.TestCase):
         self.assertEqual(report["errors"], [])
         self.assertGreater(report["metrics"]["word_count"], 0)
 
+    def test_review_removes_detected_editorial_artifacts_before_approval(self):
+        narrative = (
+            "Điều giữ hai con người ở lại với nhau vẫn là sự tôn trọng, "
+            "khả năng lắng nghe và mong muốn cùng nhau gìn giữ gia đình. " * 3
+        )
+        editorial_note = (
+            "Chia đoạn dài thành các nhịp dễ đọc\n"
+            "Thêm câu chuyển ý giữa các luận điểm"
+        )
+        script = (
+            f"### [INTRO]\n{narrative}\n\n"
+            f"### [BODY]\n{narrative}\n\n{narrative}\n\n"
+            f"{editorial_note}\n\n"
+            f"### [OUTRO]\n{narrative}\n\n"
+            "### [METADATA & QUIZ]\nTIÊU ĐỀ: Video kiểm tra"
+        )
+        database.update_script(self.video_id, script)
+
+        review = main._prepare_audio_review(self.video_id)
+        saved_script = database.get_video(self.video_id)["generated_script"]
+
+        self.assertEqual(review["status"], "pending")
+        self.assertNotIn(editorial_note, saved_script)
+        self.assertNotIn(
+            "editorial_artifact",
+            {item["code"] for item in review["report"]["warnings"]},
+        )
+
+    def test_review_removes_standalone_structural_labels_before_approval(self):
+        narrative = (
+            "Nội dung được viết thành văn xuôi liền mạch, đủ dấu câu và giữ "
+            "đúng các dữ kiện quan trọng của câu chuyện. " * 3
+        )
+        script = (
+            f"### [INTRO]\nMở đầu\n\n{narrative}\n\n"
+            f"### [BODY]\n{narrative}\n\n"
+            f"### [OUTRO]\n{narrative}\n\n"
+            "### [METADATA & QUIZ]\nTIÊU ĐỀ: Video kiểm tra"
+        )
+        database.update_script(self.video_id, script)
+
+        review = main._prepare_audio_review(self.video_id)
+        saved_script = database.get_video(self.video_id)["generated_script"]
+
+        self.assertEqual(review["status"], "pending")
+        self.assertNotIn("### [INTRO]\nMở đầu", saved_script)
+        self.assertNotIn(
+            "editorial_artifact",
+            {item["code"] for item in review["report"]["warnings"]},
+        )
+
     def test_missing_section_and_corrupted_unicode_are_blocking(self):
         report = audit_script_for_audio(
             "### [INTRO]\nN?i dung ?? l?i\n\n### [BODY]\nNội dung"

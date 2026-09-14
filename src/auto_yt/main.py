@@ -1,15 +1,27 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Literal, Optional
 import asyncio
+import html
 import json
 import math
 import threading
 import time
 import uuid
-from auto_yt.paths import ACCOUNT_PATH, AUDIO_DIR, DATA_DIR, CHROME_USER_DATA_DIR, gpt_profile_dir, PROMPTS_PATH, THUMBNAILS_DIR
+import datetime
+from auto_yt.paths import AUDIO_DIR, DATA_DIR, CHROME_USER_DATA_DIR, gpt_profile_dir, PROMPTS_PATH, THUMBNAILS_DIR
 from auto_yt.default_prompts import DEFAULT_PROMPTS_DATA
 import shutil
 import sys
@@ -27,10 +39,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from auto_yt.services.youtube_service import get_video_transcript, get_video_title
 from auto_yt.services.chatgpt_service import process_prompt_via_chatgpt
+from auto_yt.services.chatgpt_runtime import ChatGPTAttentionRequiredError
 from auto_yt.services.chatgpt_worker import sanitize_generated_script
 import auto_yt.services.database as db
 import auto_yt.services.audio_utils as audio_utils
-import auto_yt.services.tts_service as tts
+import auto_yt.services.tts_registry as tts
 from auto_yt.services.audio_review import (
     audit_script_for_audio,
     get_audio_script,
@@ -38,6 +51,13 @@ from auto_yt.services.audio_review import (
 )
 from auto_yt.services import voice_config
 from auto_yt.services import chatgpt_projects
+from auto_yt.services import youtube_comments
+from auto_yt.services import (
+    account_store,
+    api_security,
+    chatgpt_browser_service,
+    security_logging,
+)
 from auto_yt.services.generation_checkpoint import (
     clear_checkpoint,
     load_checkpoint,
@@ -48,6 +68,7 @@ from auto_yt.services.youtube_downloader import (
     is_youtube_channel_url,
     list_youtube_videos,
     select_download_directory,
+    validate_youtube_url,
 )
 import re
 
@@ -58,11 +79,24 @@ _video_queue_state_lock = threading.Lock()
 _video_queue_worker_active = False
 _video_queue_wakeup_timer: threading.Timer | None = None
 _video_queue_wakeup_at = 0.0
+_comment_queue_state_lock = threading.Lock()
+_comment_queue_worker_active = False
+_comment_queue_wakeup_timer: threading.Timer | None = None
+_comment_sync_stop_event = threading.Event()
+_comment_sync_thread: threading.Thread | None = None
+_tts_preview_cleanup_stop_event = threading.Event()
+_tts_preview_cleanup_thread: threading.Thread | None = None
+_tts_preview_sync_locks: dict[str, threading.Lock] = {}
+_tts_preview_sync_locks_guard = threading.Lock()
+_youtube_oauth_states: dict[str, dict] = {}
+_youtube_oauth_states_lock = threading.Lock()
 _prompts_config_lock = threading.Lock()
+_tts_config_lock = threading.Lock()
 _chatgpt_profile_lock = threading.Lock()
 _chatgpt_state_lock = threading.Lock()
 _chatgpt_operation = ""
 _chatgpt_prompt_version = ""
+_chatgpt_video_id: int | None = None
 CHATGPT_BUSY_ERROR = (
     "ChatGPT đang bận với tác vụ khác. Hãy đợi tác vụ hiện tại hoàn tất."
 )
@@ -76,7 +110,39 @@ INITIAL_GENERATED_SCRIPT = (
     "### [THUMBNAIL KHÔNG CHỮ]\n"
 )
 MAX_THUMBNAIL_IMAGES_PER_RESPONSE = 2
+MAX_ACTIVE_VIDEO_JOBS = 100
+TTS_PREVIEW_MAX_CHARACTERS = 200
+TTS_PREVIEW_REQUEST_MAX_CHARACTERS = 1000
+TTS_PREVIEW_RETENTION = datetime.timedelta(hours=24)
+TTS_PREVIEW_CLEANUP_INTERVAL_SECONDS = 60 * 60
 VIDEO_RECOVERY_DELAYS_SECONDS = (30, 120, 300)
+YOUTUBE_RECOVERY_DELAYS_SECONDS = (120, 300, 900)
+TRANSIENT_YOUTUBE_ERROR_MARKERS = (
+    "http error 429",
+    "status code 429",
+    "too many requests",
+    "http error 500",
+    "http error 502",
+    "http error 503",
+    "http error 504",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "connection reset",
+    "remote end closed connection",
+    "service unavailable",
+    "bad gateway",
+    "network is unreachable",
+)
+TRANSIENT_CHATGPT_START_ERROR_MARKERS = (
+    "chatgpt page did not become ready after bounded same-page recovery",
+    "chatgpt project did not become ready after bounded bootstrap recovery",
+    "could not find the prompt textarea after",
+)
+MANAGED_MEDIA_URL_PATTERN = re.compile(
+    r"/api/(?P<kind>thumbnails|audio)/"
+    r"(?P<filename>[A-Za-z0-9][A-Za-z0-9_.-]*)"
+)
 
 
 def _normalize_thumbnail_urls(value, fallback_url: str = "") -> list[str]:
@@ -91,25 +157,31 @@ def _normalize_thumbnail_urls(value, fallback_url: str = "") -> list[str]:
 def _try_start_chatgpt_operation(
     operation: str,
     prompt_version: str = "",
+    video_id: int | None = None,
 ) -> bool:
-    global _chatgpt_operation, _chatgpt_prompt_version
+    global _chatgpt_operation, _chatgpt_prompt_version, _chatgpt_video_id
     if not _chatgpt_profile_lock.acquire(blocking=False):
         return False
     with _chatgpt_state_lock:
         _chatgpt_operation = operation
         _chatgpt_prompt_version = str(prompt_version or "").strip()
+        _chatgpt_video_id = int(video_id) if video_id is not None else None
     return True
 
 
 def _finish_chatgpt_operation() -> None:
-    global _chatgpt_operation, _chatgpt_prompt_version
+    global _chatgpt_operation, _chatgpt_prompt_version, _chatgpt_video_id
     with _chatgpt_state_lock:
         _chatgpt_operation = ""
         _chatgpt_prompt_version = ""
+        _chatgpt_video_id = None
     _chatgpt_profile_lock.release()
     queue_kicker = globals().get("_kick_video_queue")
     if queue_kicker:
         queue_kicker()
+    comment_queue_kicker = globals().get("_kick_comment_queue")
+    if comment_queue_kicker:
+        comment_queue_kicker()
 
 
 def _get_chatgpt_operation() -> str:
@@ -121,11 +193,45 @@ def _get_chatgpt_state() -> tuple[str, str]:
     with _chatgpt_state_lock:
         return _chatgpt_operation, _chatgpt_prompt_version
 
+
+def _set_chatgpt_video_id(video_id: int) -> None:
+    global _chatgpt_video_id
+    with _chatgpt_state_lock:
+        _chatgpt_video_id = int(video_id)
+
+
+def _get_chatgpt_video_id() -> int | None:
+    with _chatgpt_state_lock:
+        return _chatgpt_video_id
+
 class AccountData(BaseModel):
     email: str = ""
     password: str = ""
     totp_secret: str = ""
+    headless: Optional[bool] = None
+
+
+class AccountStatus(BaseModel):
+    email: str = ""
     headless: bool = True
+    password_configured: bool = False
+    totp_configured: bool = False
+
+
+class BrowserAutomationData(BaseModel):
+    worker_headless: bool = True
+    game_mode: bool = False
+
+
+class ChatGPTBrowserServiceStatus(BaseModel):
+    running: bool = False
+    connected: bool = False
+    process_alive: bool = False
+    state: str = "stopped"
+    pid: Optional[int] = None
+    started_at: str = ""
+    window_visible: bool = False
+    message: str = ""
 
 class PromptPipelineData(BaseModel):
     metadata: bool = True
@@ -140,6 +246,7 @@ class PromptVersion(BaseModel):
     prompts: dict
     project_url: str = chatgpt_projects.DEFAULT_CHATGPT_PROJECT_URL
     default_voice_id: str = ""
+    default_youtube_channel_id: str = Field(default="", max_length=100)
     pipeline: PromptPipelineData = Field(default_factory=PromptPipelineData)
 
 class PromptsData(BaseModel):
@@ -159,6 +266,10 @@ class PromptDefaultVoiceData(BaseModel):
     voice_id: str = ""
 
 
+class PromptDefaultYoutubeChannelData(BaseModel):
+    channel_id: str = Field(default="", max_length=100)
+
+
 class PromptFieldData(BaseModel):
     value: str
 
@@ -172,74 +283,143 @@ class VoiceConfigData(BaseModel):
     active_voice_id: str
     voices: List[VoiceOptionData]
 
-DEFAULT_GPT_ACCOUNT_KEY = "gpt_account1"
-DEFAULT_GPT_PROFILE = "PROFILE_GPT_1"
 
-def _extract_gpt_account(data: dict) -> dict:
-    if DEFAULT_GPT_ACCOUNT_KEY in data and isinstance(data[DEFAULT_GPT_ACCOUNT_KEY], dict):
-        return data[DEFAULT_GPT_ACCOUNT_KEY]
-    if "email" in data:
-        return data
-    return {}
+class TTSProviderUpdate(BaseModel):
+    enabled: Optional[bool] = None
 
-def _save_account_payload(account: dict) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    existing = {}
-    if ACCOUNT_PATH.exists():
-        try:
-            existing = json.loads(ACCOUNT_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    
-    # Merge with existing gpt_account1 to preserve session_cookie etc.
-    current_account = _extract_gpt_account(existing)
-    current_account.update(account)
-    
-    existing[DEFAULT_GPT_ACCOUNT_KEY] = current_account
-    ACCOUNT_PATH.write_text(
-        json.dumps(existing, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+
+class GenmaxCredentialData(BaseModel):
+    api_key: str = Field(min_length=16, max_length=512)
+
+
+class TTSVoiceCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    provider_id: str = Field(min_length=2, max_length=64)
+    provider_voice_id: str = Field(min_length=1, max_length=256)
+    config: dict = Field(default_factory=dict)
+
+
+class TTSVoiceUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    provider_voice_id: Optional[str] = Field(
+        default=None, min_length=1, max_length=256
+    )
+    status: Optional[Literal["active", "archived", "unavailable"]] = None
+    config: Optional[dict] = None
+
+
+class TTSDefaultVoiceData(BaseModel):
+    voice_id: str = Field(min_length=1, max_length=200)
+
+
+class TTSVoiceTestData(BaseModel):
+    text: str = Field(
+        default="Xin chào, đây là bản thử giọng của hệ thống Auto YT.",
+        min_length=1,
+        max_length=500,
+    )
+    confirm_billable: bool = False
+
+
+class TTSPreviewCreateData(BaseModel):
+    voice_id: str = Field(min_length=1, max_length=200)
+    text: str = Field(
+        min_length=1,
+        max_length=TTS_PREVIEW_REQUEST_MAX_CHARACTERS,
     )
 
-app = FastAPI(title="Auto_YT API")
+DEFAULT_GPT_PROFILE = "PROFILE_GPT_1"
+
+def _save_account_payload(account: dict) -> None:
+    current_account = account_store.load_account()
+    previous_email = str(current_account.get("email") or "").strip()
+    next_email = str(account.get("email") or "").strip()
+    for key, value in account.items():
+        if value is None:
+            continue
+        if key in {"password", "totp_secret"} and not value:
+            continue
+        current_account[key] = value
+    if previous_email and next_email != previous_email:
+        current_account["session_cookie"] = []
+    account_store.save_account(current_account)
+
+app = FastAPI(
+    title="Auto_YT API",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_error(_request: Request, exc: Exception):
+    error_id = security_logging.report_exception("unhandled_api_error", exc)
+    return JSONResponse(
+        {"detail": f"Lỗi nội bộ. Mã lỗi: {error_id}."},
+        status_code=500,
+    )
+
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["127.0.0.1", "localhost", "testserver"],
+)
+app.middleware("http")(api_security.protect_loopback_api)
 
 # Configure CORS for Vite React frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Content-Type", api_security.CSRF_HEADER_NAME],
 )
+
+
+@app.get("/health")
+def get_health():
+    return {"status": "ok"}
+
+
+def _resolve_media_file(
+    root: Path,
+    filename: str,
+    suffix: str | tuple[str, ...],
+) -> Path:
+    allowed_suffixes = (suffix,) if isinstance(suffix, str) else suffix
+    if (
+        Path(filename).name != filename
+        or Path(filename).suffix.lower() not in allowed_suffixes
+    ):
+        raise HTTPException(status_code=400, detail="Invalid media filename")
+    resolved_root = root.resolve()
+    file_path = (resolved_root / filename).resolve()
+    try:
+        file_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid media filename") from exc
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Media file not found")
+    return file_path
 
 @app.get("/api/thumbnails/{filename}")
 async def serve_thumbnail(filename: str):
     """Serve locally downloaded thumbnail images."""
-    file_path = THUMBNAILS_DIR / filename
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Thumbnail not found")
-    
-    response = FileResponse(str(file_path), media_type="image/png")
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    return response
+    file_path = _resolve_media_file(THUMBNAILS_DIR, filename, ".png")
+    return FileResponse(str(file_path), media_type="image/png")
 
 
 @app.get("/api/audio/{filename}")
 async def serve_audio(filename: str):
-    """Serve a locally merged long-form audio file."""
-    if Path(filename).name != filename or not filename.lower().endswith(".mp3"):
-        raise HTTPException(status_code=400, detail="Invalid audio filename")
-    file_path = AUDIO_DIR / filename
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Audio not found")
-    response = FileResponse(str(file_path), media_type="audio/mpeg")
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    return response
+    """Serve locally materialized audio without exposing arbitrary paths."""
+    file_path = _resolve_media_file(AUDIO_DIR, filename, (".mp3", ".wav"))
+    media_type = "audio/wav" if file_path.suffix.lower() == ".wav" else "audio/mpeg"
+    return FileResponse(str(file_path), media_type=media_type)
 
 class VideoRequest(BaseModel):
-    url: str
-    prompt_version: Optional[str] = None
-    voice_id: Optional[str] = None
+    url: str = Field(min_length=1, max_length=2048)
+    prompt_version: Optional[str] = Field(default=None, max_length=120)
+    voice_id: Optional[str] = Field(default=None, max_length=200)
 
 class VideoResponse(BaseModel):
     success: bool
@@ -264,25 +444,714 @@ class ApproveAudioReviewRequest(BaseModel):
     voice_id: Optional[str] = None
 
 
+class UpdateVideoJobRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+    prompt_version: str = Field(min_length=1, max_length=120)
+    voice_id: str = Field(min_length=1, max_length=200)
+
+
+class BulkJobActionRequest(BaseModel):
+    action: Literal["retry", "pause", "resume", "cancel"]
+    mode: Literal["explicit", "all_matching"] = "explicit"
+    job_ids: List[str] = Field(default_factory=list, max_length=5000)
+    excluded_job_ids: List[str] = Field(default_factory=list, max_length=5000)
+    status: Literal["all", "active", "error"] = "all"
+    job_type: str = Field(default="all", max_length=100)
+    search: str = Field(default="", max_length=300)
+    snapshot_at: str = Field(default="", max_length=100)
+
+
 class AudioDurationRequest(BaseModel):
     duration_seconds: float
 
 
+class VideoStatusRequest(BaseModel):
+    status: Literal["active", "error"]
+
+
 class YouTubeLinkRequest(BaseModel):
-    url: str
+    url: str = Field(min_length=1, max_length=2048)
 
 
 class YouTubeDownloadVideoRequest(BaseModel):
-    id: str
-    title: str
-    url: str
+    id: str = Field(min_length=1, max_length=100)
+    title: str = Field(default="", max_length=500)
+    url: str = Field(min_length=1, max_length=2048)
     position: Optional[int] = None
 
 
 class YouTubeDownloadRequest(BaseModel):
-    destination: str
-    videos: List[YouTubeDownloadVideoRequest]
+    destination: str = Field(min_length=1, max_length=32767)
+    videos: List[YouTubeDownloadVideoRequest] = Field(min_length=1, max_length=500)
     number_folders: bool = False
+
+
+class YouTubeOAuthConfigRequest(BaseModel):
+    client_id: str = Field(min_length=1, max_length=512)
+    client_name: str = Field(default="", max_length=120)
+    client_secret: str = Field(default="", max_length=2048)
+    redirect_uri: str = Field(
+        default=youtube_comments.DEFAULT_REDIRECT_URI,
+        max_length=2048,
+    )
+
+
+class YouTubeChannelSettingsRequest(BaseModel):
+    reply_instruction: str = Field(default="", max_length=4000)
+    auto_mode: Literal["manual", "draft_only", "auto_publish"] = "draft_only"
+    daily_reply_limit: int = Field(default=50, ge=1, le=500)
+    reply_interval_minutes: int = Field(default=5, ge=1, le=120)
+    quarter_hour_reply_limit: int = Field(default=3, ge=1, le=30)
+    hourly_reply_limit: int = Field(default=10, ge=1, le=200)
+    video_half_hour_reply_limit: int = Field(default=3, ge=1, le=30)
+    backlog_daily_reply_limit: int = Field(default=20, ge=1, le=200)
+    reply_window_start: str = Field(
+        default="08:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$"
+    )
+    reply_window_end: str = Field(
+        default="22:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$"
+    )
+    reply_paused: bool = False
+    auto_sync: bool = True
+    sync_interval_minutes: int = Field(default=10, ge=2, le=1440)
+
+
+class VideoPublicationRequest(BaseModel):
+    channel_id: Optional[int] = Field(default=None, gt=0)
+    published_url: str = Field(min_length=1, max_length=2048)
+
+
+class CommentVideoImportPreviewRequest(BaseModel):
+    channel_id: int = Field(gt=0)
+    published_url: str = Field(default="", max_length=2048)
+
+
+class CommentVideoImportRequest(BaseModel):
+    channel_id: int = Field(gt=0)
+    prompt_version: str = Field(min_length=1, max_length=200)
+    youtube_video_ids: List[str] = Field(min_length=1, max_length=5000)
+
+
+class CommentIdsRequest(BaseModel):
+    comment_ids: List[str] = Field(min_length=1, max_length=100)
+
+
+class CommentUpdateRequest(BaseModel):
+    draft_reply: Optional[str] = Field(default=None, max_length=2000)
+    status: Optional[Literal["new", "draft_ready", "skipped"]] = None
+
+
+def _require_actionable_video(video_id: int) -> dict:
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    if video.get("video_status") == db.VIDEO_STATUS_ERROR:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Video đang ở trạng thái Lỗi và đã bị loại khỏi các chức năng "
+                "tự động. Hãy khôi phục trạng thái trước."
+            ),
+        )
+    return video
+
+
+@app.get("/api/youtube-comments/oauth/config")
+def get_youtube_oauth_config():
+    items = youtube_comments.list_oauth_configs()
+    config = next((item for item in items if item.get("active")), None) or {}
+    return {
+        "client_id": config.get("client_id", ""),
+        "client_name": config.get("client_name", ""),
+        "client_secret_configured": bool(config.get("client_secret_configured")),
+        "redirect_uri": config.get("redirect_uri") or youtube_comments.DEFAULT_REDIRECT_URI,
+        "items": items,
+    }
+
+
+@app.post("/api/youtube-comments/oauth/config")
+def save_youtube_oauth_config(request: YouTubeOAuthConfigRequest):
+    try:
+        return youtube_comments.save_oauth_config(
+            request.client_id,
+            request.client_secret,
+            request.redirect_uri,
+            request.client_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/youtube-comments/oauth/start")
+def start_youtube_oauth(
+    client_id: str = Query(default="", max_length=512),
+    expected_channel_id: str = Query(default="", max_length=200),
+):
+    try:
+        config = youtube_comments.load_oauth_config(client_id)
+    except youtube_comments.YouTubeCommentsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    expected_channel_id = (
+        str(expected_channel_id or "").strip()
+        if isinstance(expected_channel_id, str)
+        else ""
+    )
+    expected_channel = None
+    if expected_channel_id:
+        expected_channel = db.get_youtube_channel_by_channel_id(expected_channel_id)
+        if not expected_channel:
+            raise HTTPException(status_code=404, detail="Kênh YouTube cần kết nối lại không tồn tại.")
+    state = youtube_comments.create_oauth_state()
+    code_verifier, code_challenge = youtube_comments.create_pkce_pair()
+    with _youtube_oauth_states_lock:
+        now = time.time()
+        expired_states = [
+            key
+            for key, value in _youtube_oauth_states.items()
+            if float(value.get("expires_at") or 0) < now
+        ]
+        for expired_state in expired_states:
+            _youtube_oauth_states.pop(expired_state, None)
+        _youtube_oauth_states[state] = {
+            "expires_at": now + 600,
+            "code_verifier": code_verifier,
+            "oauth_config": config,
+            "expected_channel_id": expected_channel_id,
+            "expected_channel_title": str((expected_channel or {}).get("title") or ""),
+        }
+    try:
+        authorization_url = youtube_comments.build_authorization_url(
+            state,
+            config=config,
+            code_challenge=code_challenge,
+        )
+    except youtube_comments.YouTubeCommentsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"authorization_url": authorization_url}
+
+
+@app.get("/api/youtube-comments/oauth/callback", response_class=HTMLResponse)
+def finish_youtube_oauth(code: str = "", state: str = "", error: str = ""):
+    if error:
+        return HTMLResponse(
+            f"<h2>Không thể kết nối YouTube</h2><p>{html.escape(error)}</p>",
+            status_code=400,
+        )
+    with _youtube_oauth_states_lock:
+        oauth_state = _youtube_oauth_states.pop(state, {})
+    if not state or float(oauth_state.get("expires_at") or 0) < time.time():
+        return HTMLResponse(
+            "<h2>Phiên kết nối đã hết hạn</h2><p>Hãy đóng cửa sổ và thử lại.</p>",
+            status_code=400,
+        )
+    try:
+        tokens = youtube_comments.exchange_authorization_code(
+            code,
+            config=dict(oauth_state.get("oauth_config") or {}),
+            code_verifier=str(oauth_state.get("code_verifier") or ""),
+        )
+        access_token = str(tokens.get("access_token") or "")
+        if not access_token:
+            raise youtube_comments.YouTubeCommentsError("Google không trả về access token.")
+        channels = youtube_comments.get_authenticated_channels(access_token)
+        if not channels:
+            raise youtube_comments.YouTubeCommentsError(
+                "Tài khoản này không có kênh YouTube có thể quản lý."
+            )
+        expected_channel_id = str(oauth_state.get("expected_channel_id") or "").strip()
+        if expected_channel_id:
+            matching_channel = next(
+                (
+                    channel
+                    for channel in channels
+                    if str(channel.get("channel_id") or "") == expected_channel_id
+                ),
+                None,
+            )
+            if not matching_channel:
+                expected_title = str(
+                    oauth_state.get("expected_channel_title") or expected_channel_id
+                )
+                raise youtube_comments.YouTubeCommentsError(
+                    "Tài khoản Google vừa chọn không quản lý đúng kênh "
+                    f"'{expected_title}'. Dữ liệu kênh cũ được giữ nguyên."
+                )
+            channels = [matching_channel]
+        encrypted_access = youtube_comments.encrypt_secret(access_token)
+        encrypted_refresh = youtube_comments.encrypt_secret(
+            str(tokens.get("refresh_token") or "")
+        )
+        for channel in channels:
+            db.save_youtube_channel(
+                **channel,
+                access_token_encrypted=encrypted_access,
+                refresh_token_encrypted=encrypted_refresh,
+                token_expiry=youtube_comments.token_expiry(tokens.get("expires_in")),
+                scope=str(tokens.get("scope") or youtube_comments.YOUTUBE_SCOPE),
+                oauth_client_id=str(
+                    dict(oauth_state.get("oauth_config") or {}).get("client_id") or ""
+                ),
+            )
+    except Exception as exc:
+        error_id = security_logging.report_exception("youtube_oauth_callback", exc)
+        return HTMLResponse(
+            "<h2>Kết nối YouTube thất bại</h2>"
+            f"<p>Không thể hoàn tất kết nối. Mã lỗi: {html.escape(error_id)}.</p>",
+            status_code=400,
+        )
+    return HTMLResponse(
+        "<h2>Đã kết nối YouTube thành công</h2>"
+        "<p>Bạn có thể đóng cửa sổ này và quay lại Auto_YT.</p>"
+        "<script>setTimeout(() => window.close(), 1200)</script>"
+    )
+
+
+@app.get("/api/youtube-comments/channels")
+def list_youtube_comment_channels():
+    return {"items": db.list_youtube_channels()}
+
+
+@app.patch("/api/youtube-comments/channels/{channel_db_id}")
+def update_youtube_comment_channel(
+    channel_db_id: int, request: YouTubeChannelSettingsRequest
+):
+    channel = db.update_youtube_channel(
+        channel_db_id,
+        reply_instruction=request.reply_instruction.strip(),
+        auto_mode=request.auto_mode,
+        daily_reply_limit=request.daily_reply_limit,
+        reply_interval_minutes=request.reply_interval_minutes,
+        quarter_hour_reply_limit=request.quarter_hour_reply_limit,
+        hourly_reply_limit=request.hourly_reply_limit,
+        video_half_hour_reply_limit=request.video_half_hour_reply_limit,
+        backlog_daily_reply_limit=request.backlog_daily_reply_limit,
+        reply_window_start=request.reply_window_start,
+        reply_window_end=request.reply_window_end,
+        reply_paused=int(request.reply_paused),
+        auto_sync=int(request.auto_sync),
+        sync_interval_minutes=request.sync_interval_minutes,
+    )
+    if not channel:
+        raise HTTPException(status_code=404, detail="Không tìm thấy kênh YouTube.")
+    if not request.reply_paused:
+        _kick_comment_queue()
+    return channel
+
+
+@app.delete("/api/youtube-comments/channels/{channel_db_id}")
+def disconnect_youtube_comment_channel(channel_db_id: int):
+    channel = db.get_youtube_channel(channel_db_id, include_tokens=True)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Không tìm thấy kênh YouTube.")
+    try:
+        encrypted_token = (
+            channel.get("refresh_token_encrypted")
+            or channel.get("access_token_encrypted")
+            or ""
+        )
+        youtube_comments.revoke_token(youtube_comments.decrypt_secret(encrypted_token))
+    except youtube_comments.YouTubeCommentsError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Chưa thể thu hồi quyền Google; kênh vẫn được giữ để thử lại an toàn.",
+        ) from exc
+    if not db.delete_youtube_channel(channel_db_id):
+        raise HTTPException(status_code=404, detail="Không tìm thấy kênh YouTube.")
+    cleared_prompt_versions = _clear_prompt_default_youtube_channel_id(
+        channel.get("channel_id", "")
+    )
+    return {
+        "success": True,
+        "cleared_prompt_versions": cleared_prompt_versions,
+    }
+
+
+@app.get("/api/videos/{video_id}/publications")
+def get_video_publications(video_id: int):
+    if not db.get_video(video_id):
+        raise HTTPException(status_code=404, detail="Video not found")
+    return {"items": db.list_video_publications(video_id)}
+
+
+@app.get("/api/video-publications")
+def get_all_video_publications():
+    return {"items": db.list_video_publications()}
+
+
+@app.post("/api/videos/{video_id}/publications")
+def add_video_publication(video_id: int, request: VideoPublicationRequest):
+    video = _require_actionable_video(video_id)
+    try:
+        youtube_video_id = youtube_comments.extract_youtube_video_id(
+            request.published_url
+        )
+        channel_db_id = request.channel_id
+        if channel_db_id is None:
+            default_channel_id = _get_prompt_default_youtube_channel_id(
+                video.get("prompt_version", "")
+            )
+            default_channel = (
+                db.get_youtube_channel_by_channel_id(default_channel_id)
+                if default_channel_id
+                else None
+            )
+            channel_db_id = int(default_channel["id"]) if default_channel else None
+        details = {}
+        if channel_db_id is not None:
+            channel, access_token = _get_youtube_access_token(channel_db_id)
+            details = youtube_comments.get_video_details(access_token, youtube_video_id)
+            if details["channel_id"] != channel["channel_id"]:
+                actual_channel = str(
+                    details.get("channel_title")
+                    or details.get("channel_id")
+                    or "kênh khác"
+                ).strip()
+                raise ValueError(
+                    f"Link này thuộc kênh '{actual_channel}', không phải kênh "
+                    f"'{channel['title']}'. Video đặt lịch vẫn kiểm tra được trước giờ công khai; "
+                    "hãy kiểm tra lại đúng link hoặc kênh mặc định của bộ prompt."
+                )
+        publication = db.save_video_publication(
+            video_id=video_id,
+            youtube_channel_id=channel_db_id,
+            youtube_video_id=youtube_video_id,
+            published_url=f"https://www.youtube.com/watch?v={youtube_video_id}",
+            published_title=details.get("title", ""),
+            published_at=(
+                details.get("scheduled_publish_at") or details.get("published_at", "")
+            ),
+        )
+        publication["privacy_status"] = details.get("privacy_status", "")
+        publication["scheduled_publish_at"] = details.get("scheduled_publish_at", "")
+        publication["is_scheduled"] = bool(details.get("is_scheduled"))
+    except (ValueError, youtube_comments.YouTubeCommentsError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return publication
+
+
+def _video_candidates_by_youtube_id() -> dict[str, dict]:
+    candidates: dict[str, dict] = {}
+    for video in db.list_video_identity_candidates():
+        try:
+            youtube_video_id = youtube_comments.extract_youtube_video_id(
+                video.get("url", "")
+            )
+        except ValueError:
+            continue
+        candidates.setdefault(youtube_video_id, video)
+    return candidates
+
+
+def _comment_import_inventory_item(
+    remote_video: dict,
+    *,
+    channel_db_id: int,
+    publications_by_youtube_id: dict[str, dict],
+    candidates_by_youtube_id: dict[str, dict],
+) -> dict:
+    youtube_video_id = remote_video["youtube_video_id"]
+    publication = publications_by_youtube_id.get(youtube_video_id)
+    candidate = candidates_by_youtube_id.get(youtube_video_id)
+    linked_video = publication or candidate
+    video_status = str((linked_video or {}).get("video_status") or db.VIDEO_STATUS_ACTIVE)
+    has_chat = bool(str((linked_video or {}).get("chat_url") or "").strip())
+    if video_status == db.VIDEO_STATUS_ERROR:
+        status = "skipped_error"
+        eligible = False
+    elif (
+        publication
+        and publication.get("youtube_channel_id") is not None
+        and int(publication["youtube_channel_id"]) != int(channel_db_id)
+    ):
+        status = "channel_conflict"
+        eligible = False
+    elif publication and publication.get("youtube_channel_id") is None:
+        status = "needs_channel"
+        eligible = True
+    elif publication:
+        status = "existing_chat" if has_chat else "needs_chat"
+        eligible = not has_chat
+    elif candidate:
+        status = "needs_link" if has_chat else "needs_link_and_chat"
+        eligible = True
+    else:
+        status = "new"
+        eligible = True
+    return {
+        "youtube_video_id": youtube_video_id,
+        "published_url": f"https://www.youtube.com/watch?v={youtube_video_id}",
+        "title": html.unescape(str(remote_video.get("title") or youtube_video_id)),
+        "published_at": remote_video.get("published_at", ""),
+        "thumbnail_url": remote_video.get("thumbnail_url", ""),
+        "status": status,
+        "eligible": eligible,
+        "existing_video_id": int(linked_video["video_id"])
+        if publication
+        else int(candidate["id"]) if candidate else None,
+        "has_chat": has_chat,
+    }
+
+
+def _load_comment_import_remote_videos(
+    channel_db_id: int,
+    published_url: str = "",
+) -> tuple[dict, str, list[dict]]:
+    channel, access_token = _get_youtube_access_token(channel_db_id)
+    normalized_url = str(published_url or "").strip()
+    if normalized_url:
+        youtube_video_id = youtube_comments.extract_youtube_video_id(normalized_url)
+        remote_videos = youtube_comments.get_videos_details(
+            access_token,
+            [youtube_video_id],
+        )
+        if not remote_videos:
+            raise ValueError("Không tìm thấy video trên YouTube.")
+    else:
+        remote_videos = youtube_comments.list_channel_videos(
+            access_token,
+            channel["channel_id"],
+            max_videos=5000,
+        )
+    if any(
+        str(video.get("channel_id") or "") != str(channel["channel_id"])
+        for video in remote_videos
+    ):
+        raise ValueError("Có video không thuộc kênh YouTube đã chọn.")
+    return channel, access_token, remote_videos
+
+
+@app.post("/api/youtube-comments/import-preview")
+def preview_comment_video_import(request: CommentVideoImportPreviewRequest):
+    try:
+        channel, _, remote_videos = _load_comment_import_remote_videos(
+            request.channel_id,
+            request.published_url,
+        )
+        publications_by_id = {
+            item["youtube_video_id"]: item
+            for item in db.list_video_publication_identities()
+        }
+        candidates_by_id = _video_candidates_by_youtube_id()
+        items = [
+            _comment_import_inventory_item(
+                remote_video,
+                channel_db_id=request.channel_id,
+                publications_by_youtube_id=publications_by_id,
+                candidates_by_youtube_id=candidates_by_id,
+            )
+            for remote_video in remote_videos
+        ]
+    except (ValueError, youtube_comments.YouTubeCommentsError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    counts: dict[str, int] = {"total": len(items), "eligible": 0}
+    for item in items:
+        counts[item["status"]] = counts.get(item["status"], 0) + 1
+        if item["eligible"]:
+            counts["eligible"] += 1
+    return {"channel": channel, "items": items, "counts": counts}
+
+
+@app.post("/api/youtube-comments/import")
+def start_comment_video_import(request: CommentVideoImportRequest):
+    normalized_ids = list(
+        dict.fromkeys(str(video_id or "").strip() for video_id in request.youtube_video_ids)
+    )
+    normalized_ids = [video_id for video_id in normalized_ids if video_id]
+    try:
+        with _prompts_config_lock:
+            prompts_config = _read_prompts_config()
+            prompt = _get_prompt_version(prompts_config, request.prompt_version)
+        channel, access_token = _get_youtube_access_token(request.channel_id)
+        expected_channel_id = str(
+            prompt.get("default_youtube_channel_id") or ""
+        ).strip()
+        if expected_channel_id and expected_channel_id != str(channel["channel_id"]):
+            raise ValueError("Bộ prompt đã chọn thuộc một kênh YouTube khác.")
+        remote_videos = youtube_comments.get_videos_details(access_token, normalized_ids)
+        remote_by_id = {item["youtube_video_id"]: item for item in remote_videos}
+        missing_ids = [video_id for video_id in normalized_ids if video_id not in remote_by_id]
+        if missing_ids:
+            raise ValueError(
+                f"Không tìm thấy {len(missing_ids)} video đã chọn trên YouTube."
+            )
+        if any(
+            str(video.get("channel_id") or "") != str(channel["channel_id"])
+            for video in remote_videos
+        ):
+            raise ValueError("Có video không thuộc kênh YouTube đã chọn.")
+
+        publications_by_id = {
+            item["youtube_video_id"]: item
+            for item in db.list_video_publication_identities()
+        }
+        candidates_by_id = _video_candidates_by_youtube_id()
+        result = {
+            "requested": len(normalized_ids),
+            "created": 0,
+            "linked": 0,
+            "already_ready": 0,
+            "queued": 0,
+            "duplicate_jobs": 0,
+            "skipped_error": 0,
+            "job_ids": [],
+        }
+        for youtube_video_id in normalized_ids:
+            remote_video = remote_by_id[youtube_video_id]
+            inventory_item = _comment_import_inventory_item(
+                remote_video,
+                channel_db_id=request.channel_id,
+                publications_by_youtube_id=publications_by_id,
+                candidates_by_youtube_id=candidates_by_id,
+            )
+            if not inventory_item["eligible"]:
+                if inventory_item["status"] == "existing_chat":
+                    result["already_ready"] += 1
+                else:
+                    result["skipped_error"] += 1
+                continue
+            reservation = db.reserve_comment_import_video(
+                youtube_channel_id=request.channel_id,
+                youtube_video_id=youtube_video_id,
+                published_url=inventory_item["published_url"],
+                title=remote_video.get("title", "") or youtube_video_id,
+                description=remote_video.get("description", ""),
+                published_at=remote_video.get("published_at", ""),
+                prompt_version=request.prompt_version,
+                existing_video_id=inventory_item.get("existing_video_id"),
+            )
+            video = reservation["video"]
+            if reservation["created_video"]:
+                result["created"] += 1
+            if reservation["created_publication"] or reservation.get("assigned_channel"):
+                result["linked"] += 1
+            if str(video.get("chat_url") or "").strip():
+                result["already_ready"] += 1
+                continue
+            if db.has_active_system_job_for_video("comment_video_import", video["id"]):
+                result["duplicate_jobs"] += 1
+                continue
+            job = _create_comment_system_job(
+                "comment_video_import",
+                title=remote_video.get("title", "") or youtube_video_id,
+                payload={
+                    "youtube_video_id": youtube_video_id,
+                    "published_url": inventory_item["published_url"],
+                    "description": remote_video.get("description", ""),
+                },
+                video_id=video["id"],
+                prompt_version=(video.get("prompt_version") or request.prompt_version),
+            )
+            result["job_ids"].append(job["id"])
+            result["queued"] += 1
+        if result["queued"]:
+            _kick_comment_queue()
+        return {"success": True, **result}
+    except (ValueError, youtube_comments.YouTubeCommentsError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/videos/{video_id}/publications/{publication_id}")
+def remove_video_publication(video_id: int, publication_id: int):
+    publications = db.list_video_publications(video_id)
+    if not any(item["id"] == publication_id for item in publications):
+        raise HTTPException(status_code=404, detail="Không tìm thấy link đã đăng.")
+    db.delete_video_publication(publication_id)
+    return {"success": True}
+
+
+@app.get("/api/youtube-comments")
+def get_youtube_comments(
+    channel_id: Optional[int] = None,
+    video_id: Optional[int] = Query(default=None, ge=1),
+    status: Optional[str] = None,
+    search: str = Query(default="", max_length=200),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    items = db.list_youtube_comments(
+        channel_db_id=channel_id,
+        video_id=video_id,
+        status=status,
+        search_query=search,
+        limit=limit,
+    )
+    counts: dict[str, int] = {}
+    for item in db.list_youtube_comments(
+        channel_db_id=channel_id,
+        video_id=video_id,
+        limit=500,
+    ):
+        counts[item["status"]] = counts.get(item["status"], 0) + 1
+    return {"items": items, "counts": counts}
+
+
+@app.post("/api/youtube-comments/sync/{channel_db_id}")
+def sync_youtube_comments(channel_db_id: int):
+    channel = db.get_youtube_channel(channel_db_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Không tìm thấy kênh YouTube.")
+    existing_job = next(
+        (
+            job
+            for job in db.list_system_jobs(limit=500, job_type="comment_sync")
+            if int((job.get("payload") or {}).get("channel_id") or 0) == channel_db_id
+            and job.get("status") in {"queued", "running", "retry_wait", "paused"}
+        ),
+        None,
+    )
+    if existing_job:
+        return {"success": True, "job_id": existing_job["id"], "duplicate": True}
+    job = _create_comment_system_job(
+        "comment_sync",
+        title=channel["title"],
+        payload={"channel_id": channel_db_id},
+    )
+    _kick_comment_queue()
+    return {"success": True, "job_id": job["id"]}
+
+
+@app.post("/api/youtube-comments/draft")
+def draft_youtube_comment_replies(request: CommentIdsRequest):
+    jobs = _enqueue_comment_draft_jobs(request.comment_ids)
+    if not jobs:
+        raise HTTPException(
+            status_code=400,
+            detail="Không có bình luận hợp lệ hoặc video còn thiếu Chat Gốc.",
+        )
+    _kick_comment_queue()
+    return {"success": True, "job_ids": [job["id"] for job in jobs]}
+
+
+@app.post("/api/youtube-comments/publish")
+def publish_youtube_comment_replies(request: CommentIdsRequest):
+    jobs = _enqueue_comment_publish_jobs(request.comment_ids)
+    if not jobs:
+        raise HTTPException(status_code=400, detail="Không có bản nháp hợp lệ để đăng.")
+    _kick_comment_queue()
+    return {"success": True, "job_ids": [job["id"] for job in jobs]}
+
+
+@app.patch("/api/youtube-comments/{comment_id}")
+def update_youtube_comment_reply(comment_id: str, request: CommentUpdateRequest):
+    changes = {}
+    if request.draft_reply is not None:
+        try:
+            reply = youtube_comments.validate_comment_reply(request.draft_reply)
+        except youtube_comments.YouTubeCommentsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        changes["draft_reply"] = reply
+        changes["status"] = "draft_ready"
+        changes["risk_level"] = "reviewed"
+        changes["risk_reason"] = "Đã được người dùng xem và chỉnh sửa."
+        changes["error"] = ""
+    elif request.status is not None:
+        changes["status"] = request.status
+        changes["error"] = ""
+    else:
+        raise HTTPException(status_code=400, detail="Không có thay đổi.")
+    updated = db.update_youtube_comment(comment_id, **changes)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Không tìm thấy bình luận.")
+    return updated
 
 
 @app.post("/api/youtube-download/list")
@@ -413,8 +1282,19 @@ def _prepare_audio_review(video_id: int) -> dict:
     video = db.get_video(video_id)
     if not video:
         raise RuntimeError("Video không tồn tại.")
+    if video.get("video_status") == db.VIDEO_STATUS_ERROR:
+        raise RuntimeError(
+            "Video đang ở trạng thái Lỗi; bỏ qua bước kiểm duyệt và tạo audio."
+        )
 
-    report = audit_script_for_audio(video.get("generated_script", ""))
+    script_text = video.get("generated_script", "")
+    sanitized_script = sanitize_generated_script(script_text)
+    if sanitized_script != script_text:
+        if not db.update_script(video_id, sanitized_script):
+            raise RuntimeError("Không thể lưu kịch bản đã làm sạch.")
+        script_text = sanitized_script
+
+    report = audit_script_for_audio(script_text)
     previous_review = db.get_audio_review(video_id)
     same_approved_script = (
         previous_review
@@ -484,7 +1364,11 @@ def _auto_review_and_create_audio(
             )
         return review, task, ""
     except Exception as exc:
-        return review, db.get_audio_task(video_id), str(exc) or repr(exc)
+        return (
+            review,
+            db.get_audio_task(video_id),
+            security_logging.redact_sensitive(exc) or "Tạo audio thất bại.",
+        )
 
 
 def _require_audio_review_approval(video_id: int) -> dict:
@@ -507,6 +1391,8 @@ def _audio_task_response(task: dict) -> dict:
         "error": task.get("error", ""),
         "voice_id": task.get("voice_id", ""),
         "voice_name": task.get("voice_name", ""),
+        "tts_provider_id": task.get("tts_provider_id", "genmax"),
+        "voice_revision": int(task.get("voice_revision") or 1),
         "updated_at": task["updated_at"],
         "segment_count": len(segments),
         "completed_segments": sum(
@@ -534,6 +1420,7 @@ def _save_audio_url(
     audio_url: str,
     voice_id: str = "",
     voice_name: str = "",
+    voice_fields: dict | None = None,
 ) -> str:
     video = db.get_video(video_id)
     if not video:
@@ -554,7 +1441,12 @@ def _save_audio_url(
     if updated_script != script:
         db.update_script(video_id, updated_script)
     if voice_id:
-        db.update_video_voice(video_id, voice_id, voice_name)
+        db.update_video_voice(
+            video_id,
+            voice_id,
+            voice_name,
+            **(voice_fields or {}),
+        )
     return updated_script
 
 
@@ -571,6 +1463,11 @@ def _sync_audio_task(video_id: int) -> dict:
 
 
 def _sync_audio_task_unlocked(video_id: int) -> dict:
+    video = db.get_video(video_id)
+    if not video:
+        raise RuntimeError("Video không còn tồn tại.")
+    if video.get("video_status") == db.VIDEO_STATUS_ERROR:
+        raise RuntimeError("Video đang ở trạng thái Lỗi; bỏ qua đồng bộ audio.")
     stored_task = db.get_audio_task(video_id)
     if not stored_task:
         raise RuntimeError("Không tìm thấy audio task.")
@@ -579,27 +1476,99 @@ def _sync_audio_task_unlocked(video_id: int) -> dict:
     if segments:
         return _sync_batch_audio_task(stored_task, segments)
 
-    remote_task = tts.get_tts_task(stored_task["task_id"])
+    provider_id = stored_task.get("tts_provider_id") or "genmax"
+    script_for_tts = apply_tts_filters(
+        get_clean_script_for_tts(video["generated_script"])
+    )
+    stored_snapshot = _voice_snapshot_from_record(stored_task)
+    if stored_snapshot:
+        current_request_hash = tts.get_generation_request_hash(
+            script_for_tts,
+            stored_task.get("voice_id") or stored_snapshot.get("voice_id") or "",
+            stored_snapshot,
+        )
+        if current_request_hash != stored_task["request_hash"]:
+            return db.upsert_audio_task(
+                video_id=video_id,
+                request_hash=stored_task["request_hash"],
+                task_id=stored_task["task_id"],
+                status="failed",
+                audio_url="",
+                error=(
+                    "Kịch bản hoặc cấu hình giọng đã thay đổi sau khi gửi job; "
+                    "audio cũ không được gắn vào video."
+                ),
+                segments_json="",
+                voice_id=stored_task.get("voice_id", ""),
+                voice_name=stored_task.get("voice_name", ""),
+                **_stored_voice_persistence_fields(stored_task),
+            )
+    remote_task = tts.get_tts_task(stored_task["task_id"], provider_id)
     status = remote_task.get("status", stored_task["status"])
     audio_url = (remote_task.get("result") or {}).get("audio_url", "")
     error = remote_task.get("error") or remote_task.get("detail_error") or ""
 
     duration_seconds = None
     if status == "completed":
-        if not audio_url:
-            status = "failed"
-            error = "Task Genmax completed without an audio URL."
-        else:
-            try:
+        try:
+            if provider_id == voice_config.OMNIVOICE_PROVIDER_ID:
+                snapshot_config = (
+                    stored_snapshot.get("config")
+                    if stored_snapshot and isinstance(stored_snapshot.get("config"), dict)
+                    else {}
+                )
+                quality_managed = int(snapshot_config.get("engine_revision") or 1) >= 2
+                minimum_wpm = (
+                    float(snapshot_config.get("min_words_per_minute") or 105)
+                    if quality_managed
+                    else None
+                )
+                reported_duration = (remote_task.get("result") or {}).get(
+                    "duration_seconds"
+                )
+                if reported_duration is not None:
+                    audio_utils.validate_spoken_duration(
+                        script_for_tts,
+                        float(reported_duration),
+                        minimum_words_per_minute=minimum_wpm,
+                        provider_name="OmniVoice",
+                    )
+                audio_url, duration_seconds = tts.materialize_audio(
+                    remote_task,
+                    video_id,
+                    stored_task["request_hash"],
+                )
+                audio_utils.validate_spoken_duration(
+                    script_for_tts,
+                    duration_seconds,
+                    minimum_words_per_minute=minimum_wpm,
+                    provider_name="OmniVoice",
+                )
+            elif not audio_url:
+                raise audio_utils.AudioContentError(
+                    "Task Genmax completed without an audio URL."
+                )
+            else:
                 duration_seconds = audio_utils.get_remote_mp3_duration(audio_url)
                 audio_utils.validate_spoken_duration(
                     remote_task.get("text", ""),
                     duration_seconds,
                 )
-            except audio_utils.AudioContentError as exc:
-                status = "failed"
-                audio_url = ""
-                error = str(exc)
+        except (
+            audio_utils.AudioContentError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            if provider_id == voice_config.OMNIVOICE_PROVIDER_ID:
+                tts.discard_materialized_audio(
+                    video_id,
+                    stored_task["request_hash"],
+                )
+            status = "failed"
+            audio_url = ""
+            error = security_logging.redact_sensitive(exc)
 
     task = db.upsert_audio_task(
         video_id=video_id,
@@ -611,6 +1580,7 @@ def _sync_audio_task_unlocked(video_id: int) -> dict:
         segments_json="",
         voice_id=stored_task.get("voice_id", ""),
         voice_name=stored_task.get("voice_name", ""),
+        **_stored_voice_persistence_fields(stored_task),
     )
     if status == "completed":
         _save_audio_url(
@@ -618,6 +1588,7 @@ def _sync_audio_task_unlocked(video_id: int) -> dict:
             audio_url,
             task.get("voice_id", ""),
             task.get("voice_name", ""),
+            _stored_voice_persistence_fields(task),
         )
         db.update_audio_duration(video_id, duration_seconds)
     return task
@@ -635,12 +1606,20 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
         if not task_id:
             continue
         try:
-            remote_task = tts.get_tts_task(task_id)
+            remote_task = tts.get_tts_task(
+                task_id,
+                stored_task.get("tts_provider_id") or "genmax",
+            )
         except Exception as exc:
             # Preserve progress from every other segment. A transient failure
             # must not discard a whole polling cycle and leave the UI stale.
-            sync_errors.append((segment.get("index", 0), str(exc)))
-            segment["error"] = f"Tạm thời chưa đồng bộ được: {exc}"
+            sync_errors.append(
+                (segment.get("index", 0), security_logging.redact_sensitive(exc))
+            )
+            segment["error"] = (
+                "Tạm thời chưa đồng bộ được: "
+                + security_logging.redact_sensitive(exc)
+            )
             continue
         segment["status"] = remote_task.get("status", segment["status"])
         segment["audio_url"] = (
@@ -693,12 +1672,17 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
             current_request_hash = tts.get_generation_request_hash(
                 script_for_tts,
                 task_voice_id,
+                _voice_snapshot_from_record(stored_task),
             )
             if current_request_hash != stored_task["request_hash"]:
                 raise audio_utils.AudioContentError(
                     "The script changed while audio was being generated."
                 )
-            chunks = tts.split_text_for_tts(script_for_tts)
+            chunks = tts.split_text_for_tts(
+                script_for_tts,
+                voice_id=task_voice_id,
+                voice_snapshot=_voice_snapshot_from_record(stored_task),
+            )
             duration_seconds = audio_utils.merge_remote_mp3_files(
                 [segment["audio_url"] for segment in segments],
                 output_path,
@@ -711,7 +1695,7 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
         except audio_utils.AudioContentError as exc:
             output_path.unlink(missing_ok=True)
             status = "failed"
-            error = str(exc)
+            error = security_logging.redact_sensitive(exc)
 
     task = db.upsert_audio_task(
         video_id=video_id,
@@ -723,6 +1707,7 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
         segments_json=json.dumps(segments, ensure_ascii=False),
         voice_id=task_voice_id,
         voice_name=task_voice_name,
+        **_stored_voice_persistence_fields(stored_task),
     )
     if status == "completed":
         _save_audio_url(
@@ -730,6 +1715,7 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
             audio_url,
             task_voice_id,
             task_voice_name,
+            _stored_voice_persistence_fields(task),
         )
     return task
 
@@ -737,6 +1723,12 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
 def _watch_audio_task(video_id: int) -> None:
     try:
         while True:
+            video = db.get_video(video_id)
+            if (
+                not video
+                or video.get("video_status") == db.VIDEO_STATUS_ERROR
+            ):
+                return
             try:
                 task = _sync_audio_task(video_id)
                 if task["status"] in {
@@ -757,6 +1749,12 @@ def _watch_audio_task(video_id: int) -> None:
 
 
 def _start_audio_watcher(video_id: int) -> None:
+    video = db.get_video(video_id)
+    if (
+        not video
+        or video.get("video_status") == db.VIDEO_STATUS_ERROR
+    ):
+        return
     with _audio_watchers_lock:
         watcher = _audio_watchers.get(video_id)
         if watcher and watcher.is_alive():
@@ -775,6 +1773,7 @@ def _segment_from_remote(
     text: str,
     remote_task: dict,
     voice_id: str,
+    voice_snapshot: dict | None = None,
 ) -> dict:
     status = remote_task.get("status", "pending")
     audio_url = (remote_task.get("result") or {}).get("audio_url", "")
@@ -782,7 +1781,7 @@ def _segment_from_remote(
         status = "processing"
     return {
         "index": index,
-        "text_hash": tts.get_request_hash(text, voice_id),
+        "text_hash": tts.get_request_hash(text, voice_id, voice_snapshot),
         "characters": len(text),
         "task_id": remote_task["id"],
         "status": status,
@@ -799,9 +1798,15 @@ def _store_batch_audio_task(
     segments: list[dict],
     voice_id: str,
     voice_name: str,
+    voice_snapshot: dict | None = None,
     status: str = "pending",
     error: str = "",
 ) -> dict:
+    voice = (
+        _voice_from_snapshot(voice_snapshot)
+        if voice_snapshot
+        else voice_config.get_voice(voice_id)
+    )
     return db.upsert_audio_task(
         video_id=video_id,
         request_hash=request_hash,
@@ -811,6 +1816,7 @@ def _store_batch_audio_task(
         segments_json=json.dumps(segments, ensure_ascii=False),
         voice_id=voice_id,
         voice_name=voice_name,
+        **_voice_persistence_fields(voice),
     )
 
 
@@ -821,6 +1827,7 @@ def _ensure_batch_audio_task(
     stored_task: dict | None,
     voice_id: str = AUDIO_VOICE_ID,
     voice_name: str = "",
+    voice_snapshot: dict | None = None,
 ) -> dict:
     existing_segments = _get_audio_segments(stored_task) if stored_task else []
     existing_by_index = {
@@ -836,6 +1843,7 @@ def _ensure_batch_audio_task(
                 stored_task["audio_url"],
                 voice_id,
                 voice_name,
+                _stored_voice_persistence_fields(stored_task),
             )
             return stored_task
         if stored_task["status"] == "failed" and all(
@@ -847,7 +1855,11 @@ def _ensure_batch_audio_task(
             return stored_task
 
     # Fail closed: history must be checked before any new paid segment is sent.
-    remote_matches = tts.find_matching_tasks(chunks, voice_id)
+    remote_matches = (
+        tts.find_matching_tasks(chunks, voice_id, voice_snapshot)
+        if voice_snapshot
+        else tts.find_matching_tasks(chunks, voice_id)
+    )
     segments = []
     for index, chunk in enumerate(chunks):
         existing_segment = existing_by_index.get(index)
@@ -857,12 +1869,18 @@ def _ensure_batch_audio_task(
         remote_task = remote_matches.get(chunk)
         if remote_task:
             segments.append(
-                _segment_from_remote(index, chunk, remote_task, voice_id)
+                _segment_from_remote(
+                    index,
+                    chunk,
+                    remote_task,
+                    voice_id,
+                    voice_snapshot,
+                )
             )
         else:
             segments.append({
                 "index": index,
-                "text_hash": tts.get_request_hash(chunk, voice_id),
+                "text_hash": tts.get_request_hash(chunk, voice_id, voice_snapshot),
                 "characters": len(chunk),
                 "task_id": "",
                 "status": "not_submitted",
@@ -876,14 +1894,23 @@ def _ensure_batch_audio_task(
         segments,
         voice_id,
         voice_name,
+        voice_snapshot,
     )
     try:
         for segment in segments:
             if segment["task_id"]:
                 continue
-            submitted_task = tts.submit_tts_task(
-                chunks[segment["index"]],
-                voice_id,
+            submitted_task = (
+                tts.submit_tts_task(
+                    chunks[segment["index"]],
+                    voice_id,
+                    voice_snapshot,
+                )
+                if voice_snapshot
+                else tts.submit_tts_task(
+                    chunks[segment["index"]],
+                    voice_id,
+                )
             )
             segment.update(
                 _segment_from_remote(
@@ -891,6 +1918,7 @@ def _ensure_batch_audio_task(
                     chunks[segment["index"]],
                     submitted_task,
                     voice_id,
+                    voice_snapshot,
                 )
             )
             task = _store_batch_audio_task(
@@ -899,6 +1927,7 @@ def _ensure_batch_audio_task(
                 segments,
                 voice_id,
                 voice_name,
+                voice_snapshot,
             )
     except Exception as exc:
         missing_count = sum(not segment.get("task_id") for segment in segments)
@@ -908,6 +1937,7 @@ def _ensure_batch_audio_task(
             segments,
             voice_id,
             voice_name,
+            voice_snapshot=voice_snapshot,
             status=AUDIO_INTERRUPTED_STATUS,
             error=(
                 f"Không thể gửi tiếp audio: {exc}. "
@@ -936,6 +1966,8 @@ def _ensure_audio_task(
     video = db.get_video(video_id)
     if not video:
         raise RuntimeError("Video không tồn tại.")
+    if video.get("video_status") == db.VIDEO_STATUS_ERROR:
+        raise RuntimeError("Video đang ở trạng thái Lỗi; không tạo audio.")
     _require_audio_review_approval(video_id)
 
     existing_task = db.get_audio_task(video_id)
@@ -962,6 +1994,34 @@ def _ensure_audio_task(
             voice_name = voice_config.get_voice(voice_id)["name"]
         except ValueError:
             voice_name = "Giọng đã lưu"
+    stored_snapshot = None
+    if not requested_voice_id:
+        if existing_task and existing_task.get("voice_id") == voice_id:
+            stored_snapshot = _voice_snapshot_from_record(existing_task)
+        if stored_snapshot is None and video.get("voice_id") == voice_id:
+            stored_snapshot = _voice_snapshot_from_record(video)
+    if stored_snapshot:
+        selected_voice = _voice_from_snapshot(stored_snapshot)
+    else:
+        try:
+            selected_voice = voice_config.get_voice(voice_id)
+        except ValueError:
+            # Videos created before schema v2 may point at a historical Genmax
+            # voice no longer present in the editable catalog. Preserve that
+            # provider/remote ID instead of silently switching to the default.
+            selected_voice = {
+                "id": voice_id,
+                "name": voice_name or "Giọng đã lưu",
+            }
+    selected_voice = _normalize_voice_record(
+        selected_voice,
+        fallback_id=voice_id,
+        fallback_name=voice_name,
+    )
+    if requested_voice_id and selected_voice.get("status") != "active":
+        raise RuntimeError("Giọng đọc đã chọn hiện không hoạt động.")
+    voice_snapshot = voice_config.build_voice_snapshot(selected_voice)
+    voice_fields = _voice_persistence_fields(selected_voice)
 
     script_for_tts = get_clean_script_for_tts(video["generated_script"])
     if not script_for_tts:
@@ -970,10 +2030,15 @@ def _ensure_audio_task(
         )
 
     filtered_script = apply_tts_filters(script_for_tts)
-    chunks = tts.split_text_for_tts(filtered_script)
+    chunks = tts.split_text_for_tts(
+        filtered_script,
+        voice_id=voice_id,
+        voice_snapshot=voice_snapshot,
+    )
     request_hash = tts.get_generation_request_hash(
         filtered_script,
         voice_id,
+        voice_snapshot,
     )
 
     with _audio_submit_lock:
@@ -991,6 +2056,7 @@ def _ensure_audio_task(
                         stored_task["audio_url"],
                         voice_id,
                         voice_name,
+                        voice_fields,
                     )
                 elif stored_task["status"] in {"pending", "processing"}:
                     _start_audio_watcher(video_id)
@@ -1008,6 +2074,7 @@ def _ensure_audio_task(
                 ),
                 voice_id,
                 voice_name,
+                voice_snapshot,
             )
 
         shared_task = db.get_audio_task_by_request_hash(request_hash)
@@ -1022,6 +2089,7 @@ def _ensure_audio_task(
                 segments_json="",
                 voice_id=voice_id,
                 voice_name=voice_name,
+                **voice_fields,
             )
             if task["status"] == "completed":
                 _save_audio_url(
@@ -1029,12 +2097,17 @@ def _ensure_audio_task(
                     task["audio_url"],
                     voice_id,
                     voice_name,
+                    voice_fields,
                 )
             elif task["status"] in {"pending", "processing"}:
                 _start_audio_watcher(video_id)
             return task
 
-        remote_task = tts.find_matching_task(filtered_script, voice_id)
+        remote_task = tts.find_matching_task(
+            filtered_script,
+            voice_id,
+            voice_snapshot,
+        )
         if remote_task:
             status = remote_task.get("status", "pending")
             audio_url = (remote_task.get("result") or {}).get("audio_url", "")
@@ -1049,11 +2122,16 @@ def _ensure_audio_task(
                 segments_json="",
                 voice_id=voice_id,
                 voice_name=voice_name,
+                **voice_fields,
             )
             _start_audio_watcher(video_id)
             return task
 
-        submitted_task = tts.submit_tts_task(filtered_script, voice_id)
+        submitted_task = tts.submit_tts_task(
+            filtered_script,
+            voice_id,
+            voice_snapshot,
+        )
         task = db.upsert_audio_task(
             video_id=video_id,
             request_hash=request_hash,
@@ -1062,17 +2140,983 @@ def _ensure_audio_task(
             segments_json="",
             voice_id=voice_id,
             voice_name=voice_name,
+            **voice_fields,
         )
         _start_audio_watcher(video_id)
         return task
 
 
+COMMENT_JOB_TYPES = (
+    "comment_sync",
+    "comment_draft",
+    "comment_publish",
+    "comment_video_import",
+)
+COMMENT_JOB_LABELS = {
+    "comment_sync": "Đồng bộ bình luận",
+    "comment_draft": "Soạn trả lời bình luận",
+    "comment_publish": "Đăng trả lời bình luận",
+    "comment_video_import": "Khởi tạo Chat cho video cũ",
+}
+
+
+def _get_youtube_access_token(channel_db_id: int) -> tuple[dict, str]:
+    channel = db.get_youtube_channel(channel_db_id, include_tokens=True)
+    if not channel:
+        raise youtube_comments.YouTubeCommentsError("Không tìm thấy kênh YouTube.")
+    token = youtube_comments.access_token_for_channel(
+        channel,
+        lambda channel_id, encrypted_token, expiry, oauth_client_id: db.update_youtube_channel(
+            channel_id,
+            access_token_encrypted=encrypted_token,
+            token_expiry=expiry,
+            oauth_client_id=oauth_client_id,
+        ),
+    )
+    return channel, token
+
+
+def _create_comment_system_job(
+    job_type: str,
+    *,
+    title: str,
+    payload: dict,
+    video_id: int | None = None,
+    prompt_version: str = "",
+) -> dict:
+    job = db.create_system_job(
+        job_id=f"{job_type}-{uuid.uuid4().hex}",
+        job_type=job_type,
+        title=title,
+        payload=payload,
+        prompt_version=prompt_version,
+    )
+    if video_id is not None:
+        job = db.update_system_job(job["id"], video_id=video_id)
+    return job
+
+
+def _reconcile_existing_youtube_reply(
+    comment: dict,
+    channel: dict,
+    access_token: str,
+) -> bool:
+    """Mark a comment replied when the managed channel already answered it.
+
+    YouTube only embeds a subset of replies in ``commentThreads.list``.  The
+    paginated ``comments.list(parentId=...)`` lookup is therefore the source of
+    truth used at every boundary that could otherwise create a duplicate.
+    """
+    if comment.get("status") == "replied" or comment.get("reply_youtube_id"):
+        return True
+    existing_reply = youtube_comments.find_channel_reply(
+        access_token,
+        comment["comment_id"],
+        channel["channel_id"],
+    )
+    if not existing_reply:
+        return False
+    db.update_youtube_comment(
+        comment["comment_id"],
+        status="replied",
+        reply_youtube_id=existing_reply.get("reply_id") or "",
+        reply_text=existing_reply.get("text") or "",
+        reply_published_at=existing_reply.get("published_at") or db.utc_now(),
+        error="",
+    )
+    return True
+
+
+def _enqueue_comment_draft_jobs(comment_ids: list[str]) -> list[dict]:
+    active_owners = _active_comment_draft_owners()
+    comments = db.get_youtube_comments(
+        list(dict.fromkeys(comment_ids))[: youtube_comments.MAX_SYNC_COMMENTS]
+    )
+    grouped: dict[int, list[dict]] = {}
+    for comment in comments:
+        comment_id = comment["comment_id"]
+        if comment_id in active_owners:
+            if comment.get("status") != "replied" and not comment.get("reply_youtube_id"):
+                db.update_youtube_comment(comment_id, status="drafting", error="")
+            continue
+        if (
+            comment.get("status") in {"drafting", "scheduled", "publishing", "replied"}
+            or comment.get("reply_youtube_id")
+        ):
+            continue
+        if not comment.get("can_reply"):
+            db.update_youtube_comment(
+                comment["comment_id"], status="error", error="Kênh không có quyền trả lời bình luận này."
+            )
+            continue
+        if not comment.get("chat_url"):
+            db.update_youtube_comment(
+                comment["comment_id"],
+                status="error",
+                error="Video chưa có Chat Gốc nên không thể soạn câu trả lời đúng ngữ cảnh.",
+            )
+            continue
+        grouped.setdefault(int(comment["video_id"]), []).append(comment)
+
+    jobs: list[dict] = []
+    for video_id, video_comments in grouped.items():
+        for start in range(0, len(video_comments), youtube_comments.MAX_COMMENT_BATCH_SIZE):
+            batch = video_comments[
+                start : start + youtube_comments.MAX_COMMENT_BATCH_SIZE
+            ]
+            batch_ids = [comment["comment_id"] for comment in batch]
+            for comment_id in batch_ids:
+                db.update_youtube_comment(comment_id, status="drafting", error="")
+            jobs.append(
+                _create_comment_system_job(
+                    "comment_draft",
+                    title=batch[0].get("video_title") or f"Video #{video_id}",
+                    payload={"comment_ids": batch_ids},
+                    video_id=video_id,
+                    prompt_version=batch[0].get("prompt_version") or "",
+                )
+            )
+    return jobs
+
+
+def _active_comment_draft_owners() -> dict[str, str]:
+    """Map each comment to its oldest active draft job.
+
+    Comment status is a UI projection and can be reset by synchronization. Job
+    payload ownership is the durable idempotency boundary that prevents two
+    ChatGPT prompts for the same YouTube comment.
+    """
+    owners: dict[str, str] = {}
+    for active_job in db.list_active_system_jobs("comment_draft"):
+        for comment_id in (active_job.get("payload") or {}).get("comment_ids") or []:
+            normalized_id = str(comment_id or "").strip()
+            if normalized_id:
+                owners.setdefault(normalized_id, active_job["id"])
+    return owners
+
+
+def _reconcile_active_comment_draft_job_duplicates() -> int:
+    """Collapse legacy overlapping jobs without calling ChatGPT or YouTube."""
+    owned_comment_ids: set[str] = set()
+    reconciled = 0
+    for active_job in db.list_active_system_jobs("comment_draft"):
+        payload = dict(active_job.get("payload") or {})
+        requested_ids = list(
+            dict.fromkeys(
+                str(comment_id or "").strip()
+                for comment_id in payload.get("comment_ids") or []
+                if str(comment_id or "").strip()
+            )
+        )
+        unique_ids = [
+            comment_id
+            for comment_id in requested_ids
+            if comment_id not in owned_comment_ids
+        ]
+        owned_comment_ids.update(unique_ids)
+        if unique_ids == requested_ids:
+            continue
+        if unique_ids:
+            payload["comment_ids"] = unique_ids
+            db.update_system_job(active_job["id"], payload_json=payload)
+        else:
+            db.update_system_job(
+                active_job["id"],
+                status="done",
+                progress="Đã hợp nhất vào job soạn bình luận cũ hơn",
+                result_json={"drafted": 0, "duplicate_job": True},
+                error="",
+                finished_at=db.utc_now(),
+                next_retry_at="",
+            )
+        reconciled += 1
+    return reconciled
+
+
+def _enqueue_comment_publish_jobs(comment_ids: list[str]) -> list[dict]:
+    jobs = []
+    for comment in db.get_youtube_comments(list(dict.fromkeys(comment_ids))):
+        if (
+            comment.get("status") in {"scheduled", "publishing", "replied"}
+            or comment.get("reply_youtube_id")
+        ):
+            continue
+        if comment.get("status") == "reconcile_required":
+            # A previous publish request may already have reached YouTube.
+            # Only a later sync is allowed to reconcile it; blindly queuing a
+            # second insert risks posting the same reply twice.
+            continue
+        if not str(comment.get("draft_reply") or "").strip():
+            db.update_youtube_comment(
+                comment["comment_id"],
+                status="error",
+                error="Chưa có bản nháp để đăng.",
+            )
+            continue
+        if comment.get("risk_level") not in {"low", "reviewed", ""}:
+            db.update_youtube_comment(
+                comment["comment_id"],
+                status="review_required",
+                error=comment.get("risk_reason") or "Bình luận cần được duyệt thủ công.",
+            )
+            continue
+        try:
+            youtube_comments.validate_comment_reply(comment["draft_reply"])
+        except youtube_comments.YouTubeCommentsError as exc:
+            db.update_youtube_comment(
+                comment["comment_id"],
+                status="review_required",
+                risk_level="review_required",
+                risk_reason=security_logging.redact_sensitive(exc),
+                error=security_logging.redact_sensitive(exc),
+            )
+            continue
+        db.update_youtube_comment(comment["comment_id"], status="scheduled", error="")
+        jobs.append(
+            _create_comment_system_job(
+                "comment_publish",
+                title=comment.get("video_title") or comment["comment_id"],
+                payload={
+                    "comment_ids": [comment["comment_id"]],
+                    "channel_id": comment.get("youtube_channel_id"),
+                },
+                video_id=comment.get("video_id"),
+                prompt_version=comment.get("prompt_version") or "",
+            )
+        )
+    return jobs
+
+
+def _execute_comment_sync_job(job: dict) -> None:
+    channel_db_id = int((job.get("payload") or {}).get("channel_id") or 0)
+    channel, access_token = _get_youtube_access_token(channel_db_id)
+    db.update_system_job(job["id"], progress="Đang đọc bình luận mới từ YouTube")
+    remote_comments = youtube_comments.list_channel_comment_threads(
+        access_token, channel["channel_id"]
+    )
+    matched_ids: list[str] = []
+    ignored = 0
+    for remote_comment in remote_comments:
+        if remote_comment.get("author_channel_id") == channel["channel_id"]:
+            ignored += 1
+            continue
+        publication = db.get_video_publication_by_youtube_id(
+            remote_comment["youtube_video_id"]
+        )
+        if (
+            not publication
+            or publication.get("video_status") == db.VIDEO_STATUS_ERROR
+            or publication.get("youtube_channel_id") is None
+            or int(publication["youtube_channel_id"]) != channel_db_id
+        ):
+            ignored += 1
+            continue
+        risk_level, risk_reason = youtube_comments.assess_comment_risk(
+            remote_comment.get("text") or ""
+        )
+        priority, priority_reason, should_auto_reply = (
+            youtube_comments.assess_auto_reply_priority(
+                remote_comment.get("text") or "",
+                remote_comment.get("comment_id") or "",
+            )
+        )
+        remote_comment["risk_level"] = risk_level
+        remote_comment["risk_reason"] = risk_reason
+        remote_comment["auto_reply_priority"] = priority
+        remote_comment["auto_reply_reason"] = priority_reason
+        saved = db.upsert_youtube_comment(publication["id"], remote_comment)
+        if (
+            risk_level == "review_required"
+            and saved.get("status") in {"new", "error"}
+        ):
+            saved = db.update_youtube_comment(
+                saved["comment_id"],
+                status="review_required",
+                error=risk_reason,
+            )
+        # ``commentThreads.list`` may omit older replies from its embedded
+        # subset.  Fully enumerate the thread before treating a comment with
+        # replies as unanswered.  Ambiguous previous publishes are always
+        # reconciled, even if the summary count is stale.
+        if (
+            saved.get("status") != "replied"
+            and not saved.get("reply_youtube_id")
+            and (
+                saved.get("status") == "reconcile_required"
+                or int(remote_comment.get("total_reply_count") or 0) > 0
+            )
+            and _reconcile_existing_youtube_reply(saved, channel, access_token)
+        ):
+            saved = db.get_youtube_comments([saved["comment_id"]])[0]
+        if (
+            risk_level == "low"
+            and saved.get("can_reply")
+            and saved.get("status") in {"new", "error"}
+        ):
+            if should_auto_reply:
+                matched_ids.append(saved["comment_id"])
+            else:
+                db.update_youtube_comment(
+                    saved["comment_id"],
+                    status="skipped",
+                    error="",
+                )
+    db.update_youtube_channel(channel_db_id, last_sync_at=db.utc_now(), status="connected")
+    mode = channel.get("auto_mode") or "draft_only"
+    auto_draft_limit = min(
+        youtube_comments.MAX_AUTO_DRAFT_COMMENTS_PER_SYNC,
+        int(channel.get("daily_reply_limit") or 50),
+    )
+    prioritized_comments = sorted(
+        db.get_youtube_comments(matched_ids),
+        key=lambda item: int(item.get("auto_reply_priority") or 0),
+        reverse=True,
+    )
+    draft_jobs = (
+        _enqueue_comment_draft_jobs(
+            [item["comment_id"] for item in prioritized_comments[:auto_draft_limit]]
+        )
+        if mode != "manual"
+        else []
+    )
+    db.update_system_job(
+        job["id"],
+        status="done",
+        progress=(
+            f"Đã đồng bộ {len(matched_ids)} bình luận; bỏ qua {ignored} video chưa liên kết"
+        ),
+        result_json={"matched": len(matched_ids), "ignored": ignored, "draft_jobs": len(draft_jobs)},
+        finished_at=db.utc_now(),
+        error="",
+    )
+
+
+def _execute_comment_draft_job(job: dict) -> bool:
+    requested_ids = [
+        str(comment_id or "").strip()
+        for comment_id in (job.get("payload") or {}).get("comment_ids") or []
+        if str(comment_id or "").strip()
+    ]
+    active_owners = _active_comment_draft_owners()
+    owned_ids = [
+        comment_id
+        for comment_id in requested_ids
+        if active_owners.get(comment_id) in {None, job["id"]}
+    ]
+    if not owned_ids:
+        db.update_system_job(
+            job["id"],
+            status="done",
+            progress="Đã bỏ qua job trùng; bình luận thuộc job cũ hơn",
+            result_json={"drafted": 0, "duplicate_job": True},
+            finished_at=db.utc_now(),
+            error="",
+        )
+        return True
+
+    comments = db.get_youtube_comments(owned_ids)
+    if not comments:
+        raise RuntimeError("Các bình luận của job không còn tồn tại.")
+
+    # Re-check YouTube immediately before spending a ChatGPT turn.  This also
+    # protects old queued jobs when the owner answered manually after the last
+    # channel sync.
+    channel_credentials: dict[int, tuple[dict, str]] = {}
+    unanswered_comments: list[dict] = []
+    for comment in comments:
+        if comment.get("status") == "replied" or comment.get("reply_youtube_id"):
+            continue
+        channel_db_id = int(comment["youtube_channel_id"])
+        if channel_db_id not in channel_credentials:
+            channel_credentials[channel_db_id] = _get_youtube_access_token(channel_db_id)
+        channel, access_token = channel_credentials[channel_db_id]
+        if not _reconcile_existing_youtube_reply(comment, channel, access_token):
+            unanswered_comments.append(comment)
+    comments = unanswered_comments
+    if not comments:
+        db.update_system_job(
+            job["id"],
+            status="done",
+            progress="Các bình luận đã được trả lời trên YouTube; không soạn trùng",
+            result_json={"drafted": 0, "already_replied": True},
+            finished_at=db.utc_now(),
+            error="",
+        )
+        return True
+
+    chat_urls = {comment.get("chat_url") for comment in comments}
+    video_ids = {comment.get("video_id") for comment in comments}
+    if len(chat_urls) != 1 or len(video_ids) != 1 or not next(iter(chat_urls)):
+        raise RuntimeError("Một job chỉ được dùng đúng một Chat Gốc của một video.")
+    if not _try_start_chatgpt_operation(
+        "comment-reply",
+        comments[0].get("prompt_version") or "",
+        comments[0].get("video_id"),
+    ):
+        db.update_system_job(
+            job["id"],
+            status="queued",
+            progress="ChatGPT đang bận; bình luận vẫn chờ đúng thứ tự",
+            started_at="",
+        )
+        return False
+    try:
+        db.update_system_job(job["id"], progress="ChatGPT đang soạn câu trả lời theo Chat Gốc")
+        from auto_yt.services.chatgpt_worker import generate_comment_replies
+
+        replies = generate_comment_replies(
+            comments[0]["chat_url"],
+            comments,
+            comments[0].get("reply_instruction") or "",
+            db.list_recent_channel_reply_texts(
+                int(comments[0]["youtube_channel_id"]), limit=20
+            ),
+        )
+        auto_publish_ids = []
+        for comment in comments:
+            reply = replies[comment["comment_id"]]
+            requires_review = comment.get("risk_level") == "review_required"
+            db.update_youtube_comment(
+                comment["comment_id"],
+                status="review_required" if requires_review else "draft_ready",
+                draft_reply=reply,
+                error=comment.get("risk_reason") if requires_review else "",
+            )
+            if comment.get("auto_mode") == "auto_publish" and not requires_review:
+                auto_publish_ids.append(comment["comment_id"])
+        publish_jobs = _enqueue_comment_publish_jobs(auto_publish_ids)
+        db.update_system_job(
+            job["id"],
+            status="done",
+            progress=f"Đã soạn {len(replies)} câu trả lời",
+            result_json={"drafted": len(replies), "publish_jobs": len(publish_jobs)},
+            finished_at=db.utc_now(),
+            error="",
+        )
+        return True
+    finally:
+        _finish_chatgpt_operation()
+
+
+def _parse_utc_datetime(value: str) -> datetime.datetime | None:
+    try:
+        parsed = datetime.datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _move_into_channel_reply_window(
+    value: datetime.datetime, channel: dict
+) -> datetime.datetime:
+    local_value = value.astimezone()
+    start_hour, start_minute = map(
+        int, str(channel.get("reply_window_start") or "08:00").split(":")
+    )
+    end_hour, end_minute = map(
+        int, str(channel.get("reply_window_end") or "22:00").split(":")
+    )
+    start_time = datetime.time(start_hour, start_minute)
+    end_time = datetime.time(end_hour, end_minute)
+    if start_time == end_time:
+        return value
+
+    today = local_value.date()
+    if start_time < end_time:
+        start = datetime.datetime.combine(today, start_time, local_value.tzinfo)
+        end = datetime.datetime.combine(today, end_time, local_value.tzinfo)
+        if local_value < start:
+            return start.astimezone(datetime.timezone.utc)
+        if local_value >= end:
+            next_start = datetime.datetime.combine(
+                today + datetime.timedelta(days=1), start_time, local_value.tzinfo
+            )
+            return next_start.astimezone(datetime.timezone.utc)
+        return value
+
+    # An overnight window such as 20:00-02:00.
+    if end_time <= local_value.time() < start_time:
+        start = datetime.datetime.combine(today, start_time, local_value.tzinfo)
+        return start.astimezone(datetime.timezone.utc)
+    return value
+
+
+def _next_comment_publish_time(
+    comment: dict,
+    channel: dict,
+    now: datetime.datetime | None = None,
+) -> tuple[datetime.datetime, str]:
+    """Calculate the next policy-compliant slot without consuming API quota."""
+    now = (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(
+        datetime.timezone.utc
+    )
+    candidate = _move_into_channel_reply_window(now, channel)
+    reasons: list[str] = []
+    if candidate > now:
+        reasons.append("ngoài khung giờ hoạt động")
+    if channel.get("reply_paused"):
+        candidate = max(candidate, now + datetime.timedelta(minutes=15))
+        candidate = _move_into_channel_reply_window(candidate, channel)
+        reasons.append("kênh đang tạm dừng")
+        return candidate, ", ".join(reasons)
+
+    activity_since = (now - datetime.timedelta(days=2)).isoformat()
+    activity = db.list_channel_reply_activity(int(channel["id"]), activity_since)
+    parsed_activity = [
+        (item, replied_at)
+        for item in activity
+        if (replied_at := _parse_utc_datetime(item.get("replied_at") or ""))
+        and replied_at <= now
+    ]
+
+    def apply_rolling_limit(
+        minutes: int,
+        limit: int,
+        label: str,
+        predicate=lambda _item: True,
+    ) -> None:
+        nonlocal candidate
+        cutoff = now - datetime.timedelta(minutes=minutes)
+        recent = [
+            replied_at
+            for item, replied_at in parsed_activity
+            if replied_at > cutoff and predicate(item)
+        ]
+        if len(recent) >= max(1, limit):
+            candidate = max(candidate, min(recent) + datetime.timedelta(minutes=minutes))
+            reasons.append(label)
+
+    if parsed_activity:
+        newest_reply = max(replied_at for _, replied_at in parsed_activity)
+        interval = datetime.timedelta(
+            minutes=max(1, int(channel.get("reply_interval_minutes") or 5))
+        )
+        if newest_reply + interval > candidate:
+            candidate = newest_reply + interval
+            reasons.append("giãn cách giữa hai câu trả lời")
+    apply_rolling_limit(
+        15,
+        int(channel.get("quarter_hour_reply_limit") or 3),
+        "giới hạn 15 phút",
+    )
+    apply_rolling_limit(
+        60,
+        int(channel.get("hourly_reply_limit") or 10),
+        "giới hạn theo giờ",
+    )
+    apply_rolling_limit(
+        30,
+        int(channel.get("video_half_hour_reply_limit") or 3),
+        "giãn nhịp trên cùng video",
+        lambda item: int(item.get("video_id") or 0) == int(comment.get("video_id") or 0),
+    )
+
+    local_now = now.astimezone()
+    local_day_start = datetime.datetime.combine(
+        local_now.date(), datetime.time.min, local_now.tzinfo
+    ).astimezone(datetime.timezone.utc)
+    replies_today = [
+        item for item, replied_at in parsed_activity if replied_at >= local_day_start
+    ]
+    daily_limit = max(1, int(channel.get("daily_reply_limit") or 50))
+    next_local_start = datetime.datetime.combine(
+        local_now.date() + datetime.timedelta(days=1),
+        datetime.time.min,
+        local_now.tzinfo,
+    ).astimezone(datetime.timezone.utc)
+    if len(replies_today) >= daily_limit:
+        candidate = max(candidate, next_local_start)
+        reasons.append("đủ giới hạn trong ngày")
+
+    comment_published_at = _parse_utc_datetime(comment.get("published_at") or "")
+    if comment_published_at and comment_published_at < local_day_start:
+        backlog_today = 0
+        for item in replies_today:
+            original_published = _parse_utc_datetime(
+                item.get("comment_published_at") or ""
+            )
+            if original_published and original_published < local_day_start:
+                backlog_today += 1
+        if backlog_today >= max(
+            1, int(channel.get("backlog_daily_reply_limit") or 20)
+        ):
+            candidate = max(candidate, next_local_start)
+            reasons.append("đủ hạn mức xử lý bình luận cũ")
+
+    candidate = _move_into_channel_reply_window(candidate, channel)
+    return candidate, ", ".join(dict.fromkeys(reasons)) or "đến lượt đăng"
+
+
+def _execute_comment_video_import_job(job: dict) -> bool:
+    video_id = int(job.get("video_id") or 0)
+    video = db.get_video(video_id)
+    if not video:
+        raise RuntimeError("Video nhập cũ không còn tồn tại.")
+    if video.get("video_status") == db.VIDEO_STATUS_ERROR:
+        raise RuntimeError("Video đã được đánh dấu Lỗi; bỏ qua khởi tạo Chat.")
+    if str(video.get("chat_url") or "").strip():
+        db.update_system_job(
+            job["id"],
+            status="done",
+            progress="Video đã có Chat riêng; không tạo trùng",
+            result_json={"chat_url": video["chat_url"], "duplicate": True},
+            finished_at=db.utc_now(),
+            error="",
+        )
+        return True
+
+    payload = job.get("payload") or {}
+    published_url = str(
+        payload.get("published_url") or video.get("url") or ""
+    ).strip()
+    transcript = str(video.get("transcript") or "").strip()
+    if not transcript:
+        db.update_system_job(job["id"], progress="Đang lấy transcript video cũ")
+        transcript = get_video_transcript(published_url).strip()
+        if not transcript:
+            raise RuntimeError("YouTube không trả về transcript cho video cũ.")
+        video = db.update_comment_import_context(
+            video_id,
+            transcript=transcript,
+            description=str(payload.get("description") or ""),
+        ) or video
+
+    prompt_version = str(
+        video.get("prompt_version") or job.get("prompt_version") or ""
+    ).strip()
+    if not prompt_version:
+        raise RuntimeError("Video cũ chưa được gắn với bộ prompt.")
+    if not _try_start_chatgpt_operation(
+        "comment-video-import",
+        prompt_version,
+        video_id,
+    ):
+        db.update_system_job(
+            job["id"],
+            status="queued",
+            progress="ChatGPT đang bận; video cũ vẫn chờ đúng thứ tự",
+            started_at="",
+        )
+        return False
+    try:
+        current = db.get_video(video_id) or video
+        if str(current.get("chat_url") or "").strip():
+            chat_url = current["chat_url"]
+        else:
+            db.update_system_job(
+                job["id"],
+                progress="Đang tạo Chat riêng từ tiêu đề, mô tả và transcript",
+            )
+            from auto_yt.services.chatgpt_worker import initialize_comment_video_chat
+
+            chat_url = initialize_comment_video_chat(
+                title=current.get("title") or job.get("title") or "",
+                description=(
+                    current.get("description")
+                    or payload.get("description")
+                    or ""
+                ),
+                transcript=current.get("transcript") or transcript,
+                prompt_version=prompt_version,
+            )
+            current = db.set_video_chat_url_if_empty(video_id, chat_url)
+            chat_url = str((current or {}).get("chat_url") or chat_url)
+        db.update_system_job(
+            job["id"],
+            status="done",
+            progress="Đã tạo Chat riêng cho video cũ",
+            result_json={"chat_url": chat_url},
+            finished_at=db.utc_now(),
+            error="",
+        )
+        return True
+    finally:
+        _finish_chatgpt_operation()
+
+
+def _execute_comment_publish_job(job: dict) -> None:
+    comments = db.get_youtube_comments((job.get("payload") or {}).get("comment_ids") or [])
+    if len(comments) != 1:
+        raise RuntimeError("Mỗi job đăng chỉ được chứa một bình luận.")
+    comment = comments[0]
+    if comment.get("status") == "replied" or comment.get("reply_youtube_id"):
+        db.update_system_job(
+            job["id"], status="done", progress="Câu trả lời đã tồn tại; không đăng trùng",
+            finished_at=db.utc_now(), error="",
+        )
+        return
+    channel = db.get_youtube_channel(int(comment["youtube_channel_id"]))
+    if not channel:
+        raise RuntimeError("Kênh YouTube không còn tồn tại.")
+    publish_at, schedule_reason = _next_comment_publish_time(comment, channel)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if publish_at > now + datetime.timedelta(seconds=1):
+        db.update_youtube_comment(comment["comment_id"], status="scheduled", error="")
+        db.update_system_job(
+            job["id"],
+            status="retry_wait",
+            progress=f"Đã hẹn đăng: {schedule_reason}",
+            next_retry_at=publish_at.isoformat(),
+            started_at="",
+            finished_at="",
+            error="",
+        )
+        return
+
+    channel, access_token = _get_youtube_access_token(int(comment["youtube_channel_id"]))
+    # Last idempotency guard: a manual/channel reply may have appeared after
+    # drafting or after the most recent sync.  Fail closed on lookup errors and
+    # never call comments.insert until the full reply thread was checked.
+    if _reconcile_existing_youtube_reply(comment, channel, access_token):
+        db.update_system_job(
+            job["id"],
+            status="done",
+            progress="Câu trả lời đã tồn tại trên YouTube; không đăng trùng",
+            result_json={"published": False, "already_replied": True},
+            finished_at=db.utc_now(),
+            error="",
+        )
+        return
+    db.update_youtube_comment(comment["comment_id"], status="publishing", error="")
+    db.update_system_job(job["id"], progress="Đang đăng câu trả lời lên YouTube")
+    try:
+        safe_reply = youtube_comments.validate_comment_reply(comment["draft_reply"])
+        result = youtube_comments.publish_reply(
+            access_token,
+            comment["comment_id"],
+            safe_reply,
+        )
+    except Exception as exc:
+        db.update_youtube_comment(
+            comment["comment_id"],
+            status="reconcile_required",
+            error=(
+                "Không xác định YouTube đã nhận câu trả lời hay chưa. "
+                "Hãy đồng bộ lại trước khi thử đăng lại. "
+                + security_logging.redact_sensitive(exc)
+            ),
+        )
+        raise
+    db.update_youtube_comment(
+        comment["comment_id"],
+        status="replied",
+        reply_youtube_id=result.get("reply_id") or "",
+        reply_text=result.get("text") or comment["draft_reply"],
+        reply_published_at=result.get("published_at") or db.utc_now(),
+        error="",
+    )
+    db.update_system_job(
+        job["id"], status="done", progress="Đã đăng câu trả lời",
+        result_json=result, finished_at=db.utc_now(), error="",
+    )
+
+
+def _comment_queue_worker() -> None:
+    global _comment_queue_worker_active
+    try:
+        while True:
+            job = next(
+                (
+                    claimed
+                    for job_type in COMMENT_JOB_TYPES
+                    if (claimed := db.claim_next_system_job(job_type)) is not None
+                ),
+                None,
+            )
+            if not job:
+                return
+            try:
+                if job["job_type"] == "comment_sync":
+                    _execute_comment_sync_job(job)
+                elif job["job_type"] == "comment_draft":
+                    if not _execute_comment_draft_job(job):
+                        return
+                elif job["job_type"] == "comment_publish":
+                    _execute_comment_publish_job(job)
+                elif not _execute_comment_video_import_job(job):
+                    return
+            except Exception as exc:
+                if isinstance(exc, ChatGPTAttentionRequiredError):
+                    db.update_system_job(
+                        job["id"],
+                        status="paused",
+                        progress="Cần xác minh phiên ChatGPT trước khi tiếp tục",
+                        result_json={
+                            "attention_required": "chatgpt_verification",
+                        },
+                        error=security_logging.redact_sensitive(exc),
+                        next_retry_at="",
+                        finished_at="",
+                    )
+                    return
+                safe_error = security_logging.safe_user_error(
+                    "comment_queue_job",
+                    exc,
+                    "Tác vụ bình luận thất bại.",
+                )
+                latest = db.get_system_job(job["id"])
+                if latest and latest.get("status") == "running":
+                    if (
+                        job.get("job_type") == "comment_sync"
+                        and bool((job.get("payload") or {}).get("automatic"))
+                    ):
+                        # Automatic sync must not create a fresh failed job every
+                        # minute while YouTube or the local network is unhealthy.
+                        # Keep one durable job and back it off exponentially.
+                        attempt = max(1, int(latest.get("attempt") or 1))
+                        delay_minutes = min(360, 5 * (2 ** min(attempt - 1, 7)))
+                        db.schedule_system_job_recovery(
+                            job["id"],
+                            resume_from_step="đồng bộ bình luận YouTube",
+                            delay_seconds=delay_minutes * 60,
+                            error=safe_error,
+                        )
+                    else:
+                        db.update_system_job(
+                            job["id"], status="error", progress="Tác vụ bình luận thất bại",
+                            error=safe_error, finished_at=db.utc_now(),
+                        )
+                for comment_id in (job.get("payload") or {}).get("comment_ids", []):
+                    comment = db.get_youtube_comments([comment_id])
+                    if comment and comment[0].get("status") not in {"replied", "reconcile_required"}:
+                        db.update_youtube_comment(comment_id, status="error", error=safe_error)
+    finally:
+        with _comment_queue_state_lock:
+            _comment_queue_worker_active = False
+
+
+def _kick_comment_queue() -> None:
+    global _comment_queue_worker_active
+    with _comment_queue_state_lock:
+        if _comment_queue_worker_active:
+            return
+        if not any(db.has_claimable_system_jobs(job_type) for job_type in COMMENT_JOB_TYPES):
+            return
+        _comment_queue_worker_active = True
+    threading.Thread(target=_comment_queue_worker, daemon=True).start()
+
+
+def _channel_sync_job_exists(channel_db_id: int) -> bool:
+    return any(
+        int((job.get("payload") or {}).get("channel_id") or 0) == channel_db_id
+        and job.get("status") in {"queued", "running", "retry_wait", "paused"}
+        for job in db.list_system_jobs(limit=500, job_type="comment_sync")
+    )
+
+
+def _enqueue_due_comment_syncs() -> int:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    created = 0
+    for channel in db.list_youtube_channels():
+        if not channel.get("auto_sync") or channel.get("status") != "connected":
+            continue
+        last_sync_text = str(channel.get("last_sync_at") or "")
+        try:
+            last_sync = datetime.datetime.fromisoformat(last_sync_text)
+            if last_sync.tzinfo is None:
+                last_sync = last_sync.replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            last_sync = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+        interval = datetime.timedelta(
+            minutes=max(2, int(channel.get("sync_interval_minutes") or 10))
+        )
+        if now - last_sync < interval or _channel_sync_job_exists(channel["id"]):
+            continue
+        _create_comment_system_job(
+            "comment_sync",
+            title=channel["title"],
+            payload={"channel_id": channel["id"], "automatic": True},
+        )
+        created += 1
+    if created:
+        _kick_comment_queue()
+    return created
+
+
+def _comment_sync_scheduler() -> None:
+    while not _comment_sync_stop_event.wait(60):
+        try:
+            _enqueue_due_comment_syncs()
+            # Scheduled publish jobs become claimable as their due time passes,
+            # even when no new channel sync was created in this cycle.
+            _kick_comment_queue()
+        except Exception:
+            # Individual failures remain visible as persistent jobs; the
+            # scheduler itself must stay alive for every other channel.
+            continue
+
+
+def _start_omnivoice_worker_safely() -> None:
+    try:
+        tts.ensure_omnivoice_worker_running()
+    except Exception as exc:
+        # OmniVoice is optional and must not take Genmax or the web app down.
+        # Do not print credentials, request payloads or local sample contents.
+        message = security_logging.redact_sensitive(str(exc))
+        print(f"OmniVoice worker is unavailable: {message}", file=sys.stderr)
+
+
 @app.on_event("startup")
 def resume_background_jobs() -> None:
+    global _comment_sync_thread, _tts_preview_cleanup_thread
+    # Migrate any legacy plaintext credentials before background workers can
+    # consume them. Secrets remain decrypted only in the current process.
+    account_store.load_account(migrate=True)
+    tts.migrate_api_key_storage()
+    try:
+        omnivoice_provider = voice_config.get_provider(
+            voice_config.OMNIVOICE_PROVIDER_ID
+        )
+    except ValueError:
+        omnivoice_provider = {"enabled": False}
+    if omnivoice_provider.get("enabled", True):
+        # The API process is lightweight: the GPU model stays unloaded until
+        # an OmniVoice job arrives.  Start it off the FastAPI startup thread so
+        # a missing local dependency cannot block Genmax or the web app.
+        threading.Thread(
+            target=_start_omnivoice_worker_safely,
+            daemon=True,
+            name="omnivoice-api-startup",
+        ).start()
+    browser_status = chatgpt_browser_service.start_browser_service()
+    if not browser_status.get("connected"):
+        print(
+            "ChatGPT Browser Service is unavailable; ChatGPT jobs will pause "
+            f"instead of opening a new window: {browser_status.get('message', '')}",
+            file=sys.stderr,
+        )
     for task in db.get_active_audio_tasks():
         _start_audio_watcher(task["video_id"])
     db.recover_interrupted_system_jobs("video_generation")
+    for job_type in COMMENT_JOB_TYPES:
+        db.recover_interrupted_system_jobs(job_type)
+    _reconcile_active_comment_draft_job_duplicates()
+    db.pause_queued_attention_jobs()
     _kick_video_queue()
+    _kick_comment_queue()
+    _comment_sync_stop_event.clear()
+    _enqueue_due_comment_syncs()
+    if _comment_sync_thread is None or not _comment_sync_thread.is_alive():
+        _comment_sync_thread = threading.Thread(
+            target=_comment_sync_scheduler,
+            daemon=True,
+            name="youtube-comment-sync",
+        )
+        _comment_sync_thread.start()
+    _tts_preview_cleanup_stop_event.clear()
+    _cleanup_expired_tts_previews()
+    if (
+        _tts_preview_cleanup_thread is None
+        or not _tts_preview_cleanup_thread.is_alive()
+    ):
+        _tts_preview_cleanup_thread = threading.Thread(
+            target=_tts_preview_cleanup_scheduler,
+            daemon=True,
+            name="tts-preview-cleanup",
+        )
+        _tts_preview_cleanup_thread.start()
 
 
 @app.on_event("shutdown")
@@ -1083,6 +3127,9 @@ def stop_video_queue_wakeup_timer() -> None:
             _video_queue_wakeup_timer.cancel()
         _video_queue_wakeup_timer = None
         _video_queue_wakeup_at = 0.0
+    _comment_sync_stop_event.set()
+    _tts_preview_cleanup_stop_event.set()
+    chatgpt_browser_service.stop_browser_service()
 
 
 class VideoJobCanceled(RuntimeError):
@@ -1114,25 +3161,54 @@ def _raise_if_video_job_canceled(job_id: str) -> None:
         raise VideoJobCanceled("Job đã được người dùng yêu cầu dừng.")
 
 
+def _is_transient_youtube_error(error: BaseException | str) -> bool:
+    normalized_error = str(error).casefold()
+    return any(
+        marker in normalized_error
+        for marker in TRANSIENT_YOUTUBE_ERROR_MARKERS
+    )
+
+
+def _is_transient_chatgpt_start_error(error: BaseException | str) -> bool:
+    normalized_error = str(error).casefold()
+    return any(
+        marker in normalized_error
+        for marker in TRANSIENT_CHATGPT_START_ERROR_MARKERS
+    )
+
+
 def _schedule_automatic_video_recovery(
     job_id: str,
     video_id: int | None,
     error: str,
     result: dict | None,
+    *,
+    resume_from_step: str = "",
 ) -> bool:
-    if video_id is None:
-        return False
-    checkpoint = load_checkpoint(video_id)
-    resume_from_step = str(checkpoint.get("current_step") or "").strip()
-    if not checkpoint or not resume_from_step or resume_from_step == "complete":
-        return False
+    if video_id is not None:
+        video = db.get_video(video_id)
+        if not video or video.get("video_status") == db.VIDEO_STATUS_ERROR:
+            return False
+    resume_from_step = str(resume_from_step or "").strip()
+    if not resume_from_step:
+        if video_id is None:
+            return False
+        checkpoint = load_checkpoint(video_id)
+        resume_from_step = str(checkpoint.get("current_step") or "").strip()
+        if not checkpoint or not resume_from_step or resume_from_step == "complete":
+            return False
 
     job = db.get_system_job(job_id)
     recovery_count = int((job or {}).get("recovery_count") or 0)
-    if recovery_count >= len(VIDEO_RECOVERY_DELAYS_SECONDS):
+    recovery_delays = (
+        YOUTUBE_RECOVERY_DELAYS_SECONDS
+        if resume_from_step == "youtube_transcript"
+        else VIDEO_RECOVERY_DELAYS_SECONDS
+    )
+    if recovery_count >= len(recovery_delays):
         return False
 
-    delay_seconds = VIDEO_RECOVERY_DELAYS_SECONDS[recovery_count]
+    delay_seconds = recovery_delays[recovery_count]
     recovered_job = db.schedule_system_job_recovery(
         job_id,
         resume_from_step=resume_from_step,
@@ -1142,14 +3218,26 @@ def _schedule_automatic_video_recovery(
     )
     if not recovered_job:
         return False
-    recovered_job = db.update_system_job(
-        job_id,
-        progress=(
+    if resume_from_step == "youtube_transcript":
+        progress = (
+            f"YouTube tạm giới hạn truy cập; tự thử lại sau {delay_seconds} giây "
+            f"(lần {recovered_job['recovery_count']}/{len(recovery_delays)})"
+        )
+    elif resume_from_step == "chatgpt_start":
+        progress = (
+            f"ChatGPT tạm thời chưa sẵn sàng; tự thử lại bản nháp sau "
+            f"{delay_seconds} giây "
+            f"(lần {recovered_job['recovery_count']}/{len(recovery_delays)})"
+        )
+    else:
+        progress = (
             f"Đã lưu checkpoint; tự phục hồi bước {resume_from_step} sau "
             f"{delay_seconds} giây "
-            f"(lần {recovered_job['recovery_count']}/"
-            f"{len(VIDEO_RECOVERY_DELAYS_SECONDS)})"
-        ),
+            f"(lần {recovered_job['recovery_count']}/{len(recovery_delays)})"
+        )
+    recovered_job = db.update_system_job(
+        job_id,
+        progress=progress,
     )
     _sync_legacy_job(recovered_job)
     _schedule_video_queue_wakeup(delay_seconds)
@@ -1162,7 +3250,24 @@ def _execute_video_job(job: dict) -> None:
     request_url = str(payload.get("url") or "").strip()
     prompt_version = str(job.get("prompt_version") or payload.get("prompt_version") or "")
     voice_id = str(job.get("voice_id") or payload.get("voice_id") or "")
-    voice_name = str(payload.get("voice_name") or "")
+    voice_name = str(job.get("voice_name") or payload.get("voice_name") or "")
+    voice_snapshot = payload.get("voice_snapshot")
+    if not isinstance(voice_snapshot, dict):
+        voice_snapshot = _voice_snapshot_from_record(job)
+    if not voice_snapshot:
+        try:
+            voice_snapshot = voice_config.build_voice_snapshot(
+                voice_config.get_voice(voice_id)
+            )
+        except ValueError:
+            voice_snapshot = {
+                "voice_id": voice_id,
+                "voice_name": voice_name,
+                "provider_id": job.get("tts_provider_id") or "genmax",
+                "provider_voice_id": voice_id,
+                "voice_revision": int(job.get("voice_revision") or 1),
+                "config": {},
+            }
     pipeline = chatgpt_projects.normalize_prompt_pipeline(
         payload.get("pipeline")
         if "pipeline" in payload
@@ -1173,6 +3278,9 @@ def _execute_video_job(job: dict) -> None:
     title = ""
     completed_script_before_restart = ""
 
+    if video_id is not None:
+        _set_chatgpt_video_id(video_id)
+
     def update(message: str) -> None:
         _update_video_job(job_id, progress=message)
 
@@ -1182,6 +3290,10 @@ def _execute_video_job(job: dict) -> None:
             existing_video = db.get_video(video_id)
             if not existing_video:
                 raise RuntimeError(f"Không tìm thấy bản nháp video #{video_id} để tiếp tục.")
+            if existing_video.get("video_status") == db.VIDEO_STATUS_ERROR:
+                raise VideoJobCanceled(
+                    "Video đang ở trạng thái Lỗi nên không được xử lý tiếp."
+                )
             full_transcript = existing_video["transcript"]
             title = existing_video["title"]
             existing_script = existing_video.get("generated_script", "")
@@ -1200,16 +3312,26 @@ def _execute_video_job(job: dict) -> None:
             title = get_video_title(request_url)
             update("Đang lưu bản nháp an toàn")
             video_id = db.save_video(
-                request_url,
-                title,
-                full_transcript,
-                INITIAL_GENERATED_SCRIPT,
-                "",
-                prompt_version,
-                voice_id,
-                voice_name,
+                url=request_url,
+                title=title,
+                transcript=full_transcript,
+                generated_script=INITIAL_GENERATED_SCRIPT,
+                prompt_version=prompt_version,
+                voice_id=voice_id,
+                voice_name=voice_name,
+                tts_provider_id=voice_snapshot.get("provider_id") or "genmax",
+                voice_revision=int(voice_snapshot.get("voice_revision") or 1),
+                voice_snapshot_json=json.dumps(voice_snapshot, ensure_ascii=False),
             )
-            _update_video_job(job_id, video_id=video_id, title=title)
+            _set_chatgpt_video_id(video_id)
+            _update_video_job(
+                job_id,
+                video_id=video_id,
+                title=title,
+                recovery_count=0,
+                resume_from_step="",
+                next_retry_at="",
+            )
 
         _raise_if_video_job_canceled(job_id)
         if completed_script_before_restart:
@@ -1350,12 +3472,36 @@ def _execute_video_job(job: dict) -> None:
             job_id,
             status="canceled",
             progress="Đã dừng tại điểm an toàn",
-            error=str(exc),
+            error=security_logging.redact_sensitive(exc),
             cancel_requested=0,
             finished_at=db.utc_now(),
         )
     except Exception as exc:
-        error_message = str(exc) or repr(exc)
+        if isinstance(exc, ChatGPTAttentionRequiredError):
+            _update_video_job(
+                job_id,
+                status="paused",
+                progress="Cần xác minh phiên ChatGPT trước khi tiếp tục",
+                result_json={
+                    "attention_required": "chatgpt_verification",
+                    "video_id": video_id,
+                },
+                error=security_logging.redact_sensitive(exc),
+                cancel_requested=0,
+                next_retry_at="",
+                finished_at="",
+            )
+            return
+        error_message = security_logging.redact_sensitive(exc) or "Tạo video thất bại."
+        if video_id is None and _is_transient_youtube_error(exc):
+            if _schedule_automatic_video_recovery(
+                job_id,
+                None,
+                error_message,
+                None,
+                resume_from_step="youtube_transcript",
+            ):
+                return
         if (
             "Could not retrieve a transcript" in error_message
             or "Subtitles are disabled" in error_message
@@ -1365,6 +3511,7 @@ def _execute_video_job(job: dict) -> None:
             )
 
         recovered_result = None
+        checkpoint = {}
         if video_id is not None:
             checkpoint = load_checkpoint(video_id)
             if checkpoint:
@@ -1397,6 +3544,20 @@ def _execute_video_job(job: dict) -> None:
             error_message = (
                 f"{error_message} Bản nháp video #{video_id} đã được lưu ở Dashboard."
             )
+
+        if (
+            video_id is not None
+            and not checkpoint
+            and _is_transient_chatgpt_start_error(exc)
+            and _schedule_automatic_video_recovery(
+                job_id,
+                video_id,
+                error_message,
+                None,
+                resume_from_step="chatgpt_start",
+            )
+        ):
+            return
 
         if recovered_result and _schedule_automatic_video_recovery(
             job_id,
@@ -1435,6 +3596,7 @@ def _drain_video_queue() -> None:
             if not _try_start_chatgpt_operation(
                 "video",
                 job.get("prompt_version", ""),
+                job.get("video_id"),
             ):
                 blocked_by_chatgpt = True
                 _update_video_job(
@@ -1445,7 +3607,7 @@ def _drain_video_queue() -> None:
                 return
             _execute_video_job(job)
             current_job = db.get_system_job(job["id"])
-            if current_job and current_job["status"] == "retry_wait":
+            if current_job and current_job["status"] in {"retry_wait", "paused"}:
                 return
     finally:
         with _video_queue_state_lock:
@@ -1530,21 +3692,29 @@ def process_video(request: VideoRequest):
     )
     try:
         selected_voice = voice_config.get_voice(requested_voice_id)
+        if selected_voice.get("status", "active") != "active":
+            raise ValueError("Giọng đọc đã chọn hiện không hoạt động.")
     except ValueError as exc:
         if not request.voice_id:
             # A voice may have been removed after it was assigned to this
             # prompt version. Fall back safely to the global default.
-            selected_voice = voice_config.get_voice()
+            selected_voice = voice_config.get_voice(include_inactive=False)
         else:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+    selected_voice = _normalize_voice_record(
+        selected_voice,
+        fallback_id=requested_voice_id,
+    )
 
-    normalized_url = request.url.strip()
-    if not normalized_url:
-        raise HTTPException(status_code=400, detail="YouTube URL is required")
-    for existing_job in db.list_system_jobs(
+    try:
+        normalized_url = validate_youtube_url(request.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    video_jobs = db.list_system_jobs(
         limit=500,
         job_type="video_generation",
-    ):
+    )
+    for existing_job in video_jobs:
         existing_payload = existing_job.get("payload") or {}
         if (
             existing_job["status"] in {"queued", "running", "retry_wait", "paused"}
@@ -1566,7 +3736,21 @@ def process_video(request: VideoRequest):
                 "duplicate": True,
             }
 
+    active_video_jobs = sum(
+        job.get("status") in {"queued", "running", "retry_wait", "paused"}
+        for job in video_jobs
+    )
+    if active_video_jobs >= MAX_ACTIVE_VIDEO_JOBS:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Hàng đợi đã đạt giới hạn an toàn "
+                f"{MAX_ACTIVE_VIDEO_JOBS} video. Hãy chờ bớt job trước khi thêm."
+            ),
+        )
+
     job_id = uuid.uuid4().hex[:12]
+    voice_snapshot = voice_config.build_voice_snapshot(selected_voice)
     job = db.create_system_job(
         job_id=job_id,
         job_type="video_generation",
@@ -1576,10 +3760,15 @@ def process_video(request: VideoRequest):
             "prompt_version": resolved_prompt_version,
             "voice_id": selected_voice["id"],
             "voice_name": selected_voice["name"],
+            "voice_snapshot": voice_snapshot,
             "pipeline": pipeline,
         },
         prompt_version=resolved_prompt_version,
         voice_id=selected_voice["id"],
+        voice_name=selected_voice["name"],
+        tts_provider_id=selected_voice["provider_id"],
+        voice_revision=selected_voice["revision"],
+        voice_snapshot_json=json.dumps(voice_snapshot, ensure_ascii=False),
     )
     _sync_legacy_job(job)
     _kick_video_queue()
@@ -1591,12 +3780,77 @@ def process_video(request: VideoRequest):
     }
 
 
+def _voice_persistence_fields(voice: dict) -> dict:
+    snapshot = voice_config.build_voice_snapshot(voice)
+    return {
+        "tts_provider_id": snapshot["provider_id"],
+        "voice_revision": snapshot["voice_revision"],
+        "voice_snapshot_json": json.dumps(snapshot, ensure_ascii=False),
+    }
+
+
+def _stored_voice_persistence_fields(record: dict) -> dict:
+    return {
+        "tts_provider_id": record.get("tts_provider_id") or "genmax",
+        "voice_revision": int(record.get("voice_revision") or 1),
+        "voice_snapshot_json": record.get("voice_snapshot_json") or "{}",
+    }
+
+
+def _voice_snapshot_from_record(record: dict) -> dict | None:
+    serialized = record.get("voice_snapshot_json") or ""
+    if not serialized:
+        return None
+    try:
+        snapshot = json.loads(serialized)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(snapshot, dict) or not snapshot.get("provider_voice_id"):
+        return None
+    return snapshot
+
+
+def _voice_from_snapshot(snapshot: dict) -> dict:
+    return {
+        "id": snapshot.get("voice_id") or "",
+        "name": snapshot.get("voice_name") or "Giọng đã lưu",
+        "provider_id": snapshot.get("provider_id") or "genmax",
+        "provider_voice_id": snapshot.get("provider_voice_id") or snapshot.get("voice_id") or "",
+        "status": "active",
+        "revision": int(snapshot.get("voice_revision") or 1),
+        "config": snapshot.get("config") or {},
+    }
+
+
+def _normalize_voice_record(
+    voice: dict,
+    *,
+    fallback_id: str = "",
+    fallback_name: str = "",
+) -> dict:
+    """Normalize legacy/test voice rows into the provider-aware v2 shape."""
+    voice_id = str(voice.get("id") or fallback_id).strip()
+    provider_id = str(
+        voice.get("provider_id") or voice_config.GENMAX_PROVIDER_ID
+    ).strip().casefold()
+    return {
+        **voice,
+        "id": voice_id,
+        "name": str(voice.get("name") or fallback_name or "Giọng đã lưu").strip(),
+        "provider_id": provider_id,
+        "provider_voice_id": str(
+            voice.get("provider_voice_id") or voice_id
+        ).strip(),
+        "status": str(voice.get("status") or "active").strip().casefold(),
+        "revision": max(1, int(voice.get("revision") or 1)),
+        "config": voice.get("config") or {},
+    }
+
+
 @app.post("/api/videos/{video_id}/continue-generation")
 def continue_video_generation(video_id: int):
     """Resume a power-interrupted ChatGPT workflow in its original chat."""
-    video = db.get_video(video_id)
-    if not video:
-        raise HTTPException(status_code=404, detail="Video not found")
+    video = _require_actionable_video(video_id)
 
     checkpoint = load_checkpoint(video_id)
     if not checkpoint or not checkpoint.get("chat_url"):
@@ -1623,7 +3877,11 @@ def continue_video_generation(video_id: int):
             "error": None,
         }
 
-    if not _try_start_chatgpt_operation("continue-video", prompt_version):
+    if not _try_start_chatgpt_operation(
+        "continue-video",
+        prompt_version,
+        video_id,
+    ):
         with _jobs_lock:
             _jobs[job_id].update({
                 "status": "error",
@@ -1730,7 +3988,10 @@ def continue_video_generation(video_id: int):
                     },
                 })
         except Exception as exc:
-            error_message = str(exc) or repr(exc)
+            error_message = (
+                security_logging.redact_sensitive(exc)
+                or "Tiếp tục video thất bại."
+            )
             with _jobs_lock:
                 _jobs[job_id].update({
                     "status": "error",
@@ -1752,47 +4013,81 @@ def continue_video_generation(video_id: int):
 
 def _system_job_center_item(job: dict, queue_position: int | None) -> dict:
     payload = job.get("payload") or {}
+    status = job["status"]
+    video_id = job.get("video_id")
+    title = (
+        job.get("generated_title")
+        or job.get("original_title")
+        or job.get("title")
+        or payload.get("url", "")
+    )
     return {
         "id": job["id"],
         "raw_id": job["id"],
         "type": job["job_type"],
-        "type_label": "Tạo video",
-        "status": job["status"],
-        "title": (
-            job.get("generated_title")
-            or job.get("original_title")
-            or job.get("title")
-            or payload.get("url", "")
+        "type_label": (
+            "Tạo video"
+            if job["job_type"] == "video_generation"
+            else COMMENT_JOB_LABELS.get(job["job_type"], job["job_type"])
         ),
-        "original_title": job.get("original_title") or job.get("title", ""),
-        "generated_title": job.get("generated_title", ""),
+        "status": status,
+        "title": html.unescape(str(title or "")),
+        "original_title": html.unescape(
+            str(job.get("original_title") or job.get("title", ""))
+        ),
+        "generated_title": html.unescape(str(job.get("generated_title", ""))),
         "video_url": job.get("video_url") or payload.get("url", ""),
         "progress": job.get("progress", ""),
         "error": job.get("error", ""),
-        "video_id": job.get("video_id"),
+        "video_id": video_id,
         "prompt_version": job.get("prompt_version", ""),
         "voice_id": job.get("voice_id", ""),
-        "pipeline": chatgpt_projects.normalize_prompt_pipeline(
-            payload.get("pipeline")
+        "voice_name": job.get("voice_name", ""),
+        "tts_provider_id": job.get("tts_provider_id") or "genmax",
+        "voice_revision": int(job.get("voice_revision") or 1),
+        "pipeline": (
+            chatgpt_projects.normalize_prompt_pipeline(payload.get("pipeline"))
+            if job["job_type"] == "video_generation"
+            else None
         ),
         "queue_position": queue_position,
         "attempt": job.get("attempt", 0),
         "recovery_count": job.get("recovery_count", 0),
-        "recovery_limit": len(VIDEO_RECOVERY_DELAYS_SECONDS),
+        "recovery_limit": (
+            len(VIDEO_RECOVERY_DELAYS_SECONDS)
+            if job["job_type"] == "video_generation"
+            else 0
+        ),
         "resume_from_step": job.get("resume_from_step", ""),
         "next_retry_at": job.get("next_retry_at", ""),
         "created_at": job.get("created_at", ""),
         "updated_at": job.get("updated_at", ""),
         "started_at": job.get("started_at", ""),
         "finished_at": job.get("finished_at", ""),
-        "can_cancel": job["status"] in {"queued", "running", "retry_wait", "paused"},
-        "can_retry": job["status"] in {"error", "canceled"},
-        "can_pause": job["status"] in {"queued", "retry_wait"},
-        "can_resume": job["status"] == "paused",
+        "can_cancel": (
+            status in {"queued", "retry_wait", "paused"}
+            or (job["job_type"] == "video_generation" and status == "running")
+        ),
+        "can_retry": (
+            status in {"error", "canceled"}
+            and job["job_type"] != "comment_publish"
+        ),
+        "can_pause": status in {"queued", "retry_wait"},
+        "can_resume": status == "paused",
+        "can_edit": job["job_type"] == "video_generation" and (
+            status in {"error", "canceled"}
+            or (status in {"queued", "paused"} and video_id is None)
+        ),
+        "can_delete": status != "running",
+        "attention_required": (
+            (job.get("result") or {}).get("attention_required", "")
+        ),
     }
 
 
 def _audio_job_center_item(task: dict) -> dict:
+    provider_id = task.get("tts_provider_id") or "genmax"
+    provider_name = "OmniVoice" if provider_id == "omnivoice" else "Genmax"
     status_map = {
         "pending": "queued",
         "processing": "running",
@@ -1802,8 +4097,8 @@ def _audio_job_center_item(task: dict) -> dict:
     }
     status = status_map.get(task.get("status"), task.get("status", "error"))
     progress_map = {
-        "pending": "Đang chờ Genmax",
-        "processing": "Genmax đang tạo audio",
+        "pending": f"Đang chờ {provider_name}",
+        "processing": f"{provider_name} đang tạo audio",
         "completed": "Audio hoàn thành",
         "failed": "Tạo audio thất bại",
         "interrupted": "Audio bị gián đoạn",
@@ -1822,6 +4117,9 @@ def _audio_job_center_item(task: dict) -> dict:
         "error": task.get("error", ""),
         "video_id": task["video_id"],
         "voice_id": task.get("voice_id", ""),
+        "voice_name": task.get("voice_name", ""),
+        "tts_provider_id": provider_id,
+        "voice_revision": int(task.get("voice_revision") or 1),
         "created_at": task.get("created_at", ""),
         "updated_at": task.get("updated_at", ""),
         "can_cancel": False,
@@ -1911,6 +4209,47 @@ def _download_job_center_item(job: dict) -> dict:
     }
 
 
+def _checkpoint_references_media(filename: str) -> bool:
+    checkpoint_dir = DATA_DIR / "generation_checkpoints"
+    if not checkpoint_dir.exists():
+        return False
+    for checkpoint_file in checkpoint_dir.glob("video_*.json"):
+        try:
+            if filename in checkpoint_file.read_text(encoding="utf-8"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _delete_unreferenced_managed_media(*payloads) -> tuple[int, list[str]]:
+    serialized_payloads = json.dumps(payloads, ensure_ascii=False, default=str)
+    media_files = {
+        (match.group("kind"), match.group("filename"))
+        for match in MANAGED_MEDIA_URL_PATTERN.finditer(serialized_payloads)
+    }
+    deleted_count = 0
+    warnings = []
+    for media_kind, filename in media_files:
+        if db.is_managed_media_filename_referenced(filename):
+            continue
+        if _checkpoint_references_media(filename):
+            continue
+        root = THUMBNAILS_DIR if media_kind == "thumbnails" else AUDIO_DIR
+        expected_suffix = ".png" if media_kind == "thumbnails" else ".mp3"
+        if Path(filename).name != filename or Path(filename).suffix.lower() != expected_suffix:
+            continue
+        file_path = root / filename
+        try:
+            file_path.unlink()
+            deleted_count += 1
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            warnings.append(f"Không thể xóa tệp {filename}: {exc}")
+    return deleted_count, warnings
+
+
 def _job_matches_video_search(item: dict, query: str) -> bool:
     normalized_query = db.normalize_search_text(query)
     if not normalized_query:
@@ -1931,54 +4270,64 @@ def _job_matches_video_search(item: dict, query: str) -> bool:
     return normalized_query in searchable
 
 
-@app.get("/api/jobs")
-def list_jobs(
-    limit: int = 100,
-    job_type: Optional[str] = None,
-    search: Optional[str] = None,
-):
-    requested_limit = max(1, min(limit, 500))
-    normalized_search = db.normalize_search_text(search or "")[:300]
-    source_limit = 500 if normalized_search else requested_limit
+JOB_CENTER_ACTIONS = ("retry", "pause", "resume", "cancel")
+JOB_CENTER_SYSTEM_JOB_TYPES = ("video_generation", *COMMENT_JOB_TYPES)
+
+
+def _job_supports_action(item: dict, action: str) -> bool:
+    capability = "can_cancel" if action == "cancel" else f"can_{action}"
+    return bool(item.get(capability))
+
+
+def _job_is_selectable(item: dict) -> bool:
+    return any(_job_supports_action(item, action) for action in JOB_CENTER_ACTIONS)
+
+
+def _collect_job_center_items(job_type: str | None = None) -> list[dict]:
+    normalized_type = str(job_type or "").strip()
+    if normalized_type == "all":
+        normalized_type = ""
     items: list[dict] = []
 
-    if job_type in {None, "video_generation"}:
+    requested_system_type = (
+        normalized_type if normalized_type in JOB_CENTER_SYSTEM_JOB_TYPES else None
+    )
+    if not normalized_type or requested_system_type:
         system_jobs = db.list_system_jobs(
-            limit=source_limit,
-            job_type="video_generation",
+            limit=None,
+            job_type=requested_system_type,
         )
-        queued_jobs = sorted(
-            (job for job in system_jobs if job["status"] == "queued"),
-            key=lambda job: job["created_at"],
-        )
-        queue_positions = {
-            job["id"]: index for index, job in enumerate(queued_jobs, start=1)
-        }
+        queue_positions: dict[str, int] = {}
+        queued_counts: dict[str, int] = {}
+        for job in sorted(system_jobs, key=lambda item: item["created_at"]):
+            if job["status"] != "queued":
+                continue
+            job_type_key = job["job_type"]
+            queued_counts[job_type_key] = queued_counts.get(job_type_key, 0) + 1
+            queue_positions[job["id"]] = queued_counts[job_type_key]
         items.extend(
             _system_job_center_item(job, queue_positions.get(job["id"]))
             for job in system_jobs
         )
 
-    if job_type in {None, "audio"}:
+    if normalized_type in {"", "audio"}:
         items.extend(
             _audio_job_center_item(task)
-            for task in db.list_audio_tasks(limit=source_limit)
+            for task in db.list_audio_tasks(limit=None)
         )
-
-    if job_type in {None, "audio_review"}:
+    if normalized_type in {"", "audio_review"}:
         items.extend(
             _audio_review_job_center_item(review)
-            for review in db.list_audio_reviews(limit=source_limit)
+            for review in db.list_audio_reviews(limit=None)
         )
-
-    if job_type in {None, "youtube_download"}:
+    if normalized_type in {"", "youtube_download"}:
         items.extend(
             _download_job_center_item(job)
-            for job in download_jobs.list_jobs(limit=source_limit)
+            for job in download_jobs.list_jobs(limit=None)
         )
 
     operation, prompt_version = _get_chatgpt_state()
-    if operation and operation != "video" and job_type in {None, "chatgpt"}:
+    if operation and operation != "video" and normalized_type in {"", "chatgpt"}:
         items.append({
             "id": "chatgpt:current",
             "raw_id": "current",
@@ -1994,94 +4343,437 @@ def list_jobs(
             "can_cancel": False,
             "can_retry": False,
         })
+    return items
 
-    if normalized_search:
-        items = [item for item in items if _job_matches_video_search(item, normalized_search)]
 
-    items.sort(
+def _job_matches_status_filter(item: dict, status: str) -> bool:
+    if status == "active":
+        return item["status"] in {"queued", "running", "retry_wait", "paused"}
+    if status == "error":
+        return item["status"] in {"error", "review_blocked"}
+    return True
+
+
+def _job_matches_snapshot(item: dict, snapshot_at: str) -> bool:
+    created_at = str(item.get("created_at") or "").strip()
+    return not snapshot_at or not created_at or created_at <= snapshot_at
+
+
+def _filter_job_center_items(
+    items: list[dict],
+    *,
+    status: str = "all",
+    search: str = "",
+    snapshot_at: str = "",
+) -> list[dict]:
+    normalized_search = db.normalize_search_text(search)[:300]
+    return [
+        item
+        for item in items
+        if _job_matches_status_filter(item, status)
+        and _job_matches_snapshot(item, snapshot_at)
+        and (
+            not normalized_search
+            or _job_matches_video_search(item, normalized_search)
+        )
+    ]
+
+
+def _sort_job_center_items(items: list[dict]) -> list[dict]:
+    return sorted(
+        items,
         key=lambda item: (
             item["status"] in {"queued", "running", "retry_wait", "paused"},
             item.get("updated_at") or item.get("created_at") or "",
         ),
         reverse=True,
     )
-    items = items[:requested_limit]
-    for item in items:
+
+
+@app.get("/api/jobs")
+def list_jobs(
+    limit: int = 100,
+    offset: int = 0,
+    job_type: Optional[str] = None,
+    status: Literal["all", "active", "error"] = "all",
+    search: Optional[str] = None,
+):
+    requested_limit = max(1, min(int(limit), 500))
+    requested_offset = max(0, int(offset))
+    snapshot_at = db.utc_now()
+    all_items = _collect_job_center_items(job_type)
+    counted_items = _filter_job_center_items(
+        all_items,
+        search=search or "",
+        snapshot_at=snapshot_at,
+    )
+    filtered_items = _sort_job_center_items(
+        _filter_job_center_items(counted_items, status=status)
+    )
+    action_counts = {
+        action: sum(_job_supports_action(item, action) for item in filtered_items)
+        for action in JOB_CENTER_ACTIONS
+    }
+    paged_items = filtered_items[
+        requested_offset:requested_offset + requested_limit
+    ]
+    for item in paged_items:
         item.pop("download_videos", None)
     return {
-        "items": items,
+        "items": paged_items,
         "counts": {
-            "total": len(items),
+            "total": len(counted_items),
             "active": sum(
                 item["status"] in {"queued", "running", "retry_wait", "paused"}
-                for item in items
+                for item in counted_items
             ),
             "error": sum(
-                item["status"] in {"error", "review_blocked"} for item in items
+                item["status"] in {"error", "review_blocked"}
+                for item in counted_items
             ),
         },
+        "filtered_total": len(filtered_items),
+        "selectable_total": sum(_job_is_selectable(item) for item in filtered_items),
+        "action_counts": action_counts,
+        "snapshot_at": snapshot_at,
+    }
+
+
+class JobCenterItemNotFoundError(LookupError):
+    pass
+
+
+class JobCenterActionNotAllowedError(ValueError):
+    pass
+
+
+def _kick_job_queues(job_types: set[str]) -> None:
+    if "video_generation" in job_types:
+        _kick_video_queue()
+    if any(job_type in COMMENT_JOB_TYPES for job_type in job_types):
+        _kick_comment_queue()
+
+
+def _run_system_job_center_action(
+    job_id: str,
+    action: str,
+    *,
+    kick_queues: bool,
+) -> dict:
+    job = db.get_system_job(job_id)
+    if not job:
+        raise JobCenterItemNotFoundError("Không tìm thấy job.")
+    current_item = _system_job_center_item(
+        job,
+        db.get_system_job_queue_position(job_id),
+    )
+    if not _job_supports_action(current_item, action):
+        raise JobCenterActionNotAllowedError(
+            "Job không hỗ trợ thao tác này ở trạng thái hiện tại."
+        )
+    if action == "retry":
+        updated_job = db.retry_system_job(job_id)
+    elif action == "pause":
+        updated_job = db.pause_system_job(job_id)
+    elif action == "resume":
+        updated_job = db.resume_system_job(job_id)
+    else:
+        updated_job = db.request_cancel_system_job(job_id)
+    if not updated_job:
+        raise JobCenterItemNotFoundError("Không tìm thấy job.")
+    _sync_legacy_job(updated_job)
+    if kick_queues:
+        _kick_job_queues({str(job["job_type"])})
+    return _system_job_center_item(
+        updated_job,
+        db.get_system_job_queue_position(job_id),
+    )
+
+
+def _run_job_center_action(item: dict, action: str) -> dict:
+    if item.get("type") in JOB_CENTER_SYSTEM_JOB_TYPES:
+        return _run_system_job_center_action(
+            str(item["raw_id"]),
+            action,
+            kick_queues=False,
+        )
+    if item.get("type") != "youtube_download":
+        raise JobCenterActionNotAllowedError(
+            "Loại job này không có thao tác hàng loạt."
+        )
+    current_job = download_jobs.get(str(item["raw_id"]))
+    if not current_job:
+        raise JobCenterItemNotFoundError("Không tìm thấy job tải YouTube.")
+    current_item = _download_job_center_item(current_job)
+    if not _job_supports_action(current_item, action):
+        raise JobCenterActionNotAllowedError(
+            "Job không hỗ trợ thao tác này ở trạng thái hiện tại."
+        )
+    download_action = "stop" if action == "cancel" else action
+    updated_job = getattr(download_jobs, download_action)(str(item["raw_id"]))
+    return _download_job_center_item(updated_job)
+
+
+def _normalize_job_snapshot(snapshot_at: str) -> str:
+    normalized = str(snapshot_at or "").strip()
+    if not normalized:
+        raise ValueError("Thiếu thời điểm snapshot của danh sách job.")
+    try:
+        parsed = datetime.datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError("Thời điểm snapshot của danh sách job không hợp lệ.") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("Thời điểm snapshot của danh sách job phải có múi giờ.")
+    return parsed.astimezone(datetime.timezone.utc).isoformat()
+
+
+def _resolve_bulk_job_selection(
+    request: BulkJobActionRequest,
+) -> tuple[list[dict], list[str], int]:
+    if request.mode == "explicit":
+        requested_ids = list(
+            dict.fromkeys(str(job_id or "").strip() for job_id in request.job_ids)
+        )
+        requested_ids = [job_id for job_id in requested_ids if job_id]
+        if not requested_ids:
+            raise ValueError("Hãy chọn ít nhất một job.")
+        items_by_id = {
+            item["id"]: item for item in _collect_job_center_items()
+        }
+        selected_items = [
+            items_by_id[job_id]
+            for job_id in requested_ids
+            if job_id in items_by_id
+        ]
+        missing_ids = [
+            job_id for job_id in requested_ids if job_id not in items_by_id
+        ]
+        return selected_items, missing_ids, len(requested_ids)
+
+    snapshot_at = _normalize_job_snapshot(request.snapshot_at)
+    excluded_ids = {
+        str(job_id or "").strip()
+        for job_id in request.excluded_job_ids
+        if str(job_id or "").strip()
+    }
+    selected_items = _filter_job_center_items(
+        _collect_job_center_items(request.job_type),
+        status=request.status,
+        search=request.search,
+        snapshot_at=snapshot_at,
+    )
+    selected_items = [
+        item
+        for item in selected_items
+        if item["id"] not in excluded_ids and _job_is_selectable(item)
+    ]
+    return selected_items, [], len(selected_items)
+
+
+@app.post("/api/jobs/bulk-action")
+def bulk_job_action(request: BulkJobActionRequest):
+    try:
+        selected_items, missing_ids, requested_count = (
+            _resolve_bulk_job_selection(request)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    skipped_by_reason: dict[str, int] = {}
+    failures = [
+        {"job_id": job_id, "error": "Không tìm thấy job."}
+        for job_id in missing_ids
+    ]
+    eligible_count = sum(
+        _job_supports_action(item, request.action) for item in selected_items
+    )
+    succeeded_count = 0
+    changed_system_job_types: set[str] = set()
+    for item in selected_items:
+        if not _job_supports_action(item, request.action):
+            reason = "Không tương thích với thao tác đã chọn."
+            skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
+            continue
+        try:
+            _run_job_center_action(item, request.action)
+            succeeded_count += 1
+            if item.get("type") in JOB_CENTER_SYSTEM_JOB_TYPES:
+                changed_system_job_types.add(str(item["type"]))
+        except (JobCenterActionNotAllowedError, ValueError) as exc:
+            reason = str(exc)
+            skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
+        except JobCenterItemNotFoundError as exc:
+            failures.append({"job_id": item["id"], "error": str(exc)})
+        except Exception as exc:
+            failures.append({
+                "job_id": item["id"],
+                "error": (
+                    security_logging.redact_sensitive(exc)
+                    or "Thao tác job thất bại."
+                ),
+            })
+    if changed_system_job_types:
+        _kick_job_queues(changed_system_job_types)
+    skipped_count = sum(skipped_by_reason.values())
+    return {
+        "success": True,
+        "requested": requested_count,
+        "matched": len(selected_items),
+        "eligible": eligible_count,
+        "succeeded": succeeded_count,
+        "skipped": skipped_count,
+        "failed": len(failures),
+        "skipped_by_reason": skipped_by_reason,
+        "failures": failures,
     }
 
 
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
-    job = db.get_system_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    updated_job = db.request_cancel_system_job(job_id)
-    _sync_legacy_job(updated_job)
-    _kick_video_queue()
+    try:
+        updated_job = _run_system_job_center_action(
+            job_id,
+            "cancel",
+            kick_queues=True,
+        )
+    except JobCenterItemNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (JobCenterActionNotAllowedError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {
         "success": True,
-        "job": _system_job_center_item(
-            updated_job,
-            db.get_system_job_queue_position(job_id),
-        ),
+        "job": updated_job,
     }
 
 
-@app.post("/api/jobs/{job_id}/retry")
-def retry_job(job_id: str):
+@app.patch("/api/jobs/{job_id}")
+def update_video_job(job_id: str, request: UpdateVideoJobRequest):
+    job = db.get_system_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["job_type"] != "video_generation":
+        raise HTTPException(status_code=409, detail="Chỉ có thể sửa job tạo video.")
+
     try:
-        updated_job = db.retry_system_job(job_id)
+        normalized_url = validate_youtube_url(request.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    with _prompts_config_lock:
+        prompt_data = _read_prompts_config()
+        prompt_version = request.prompt_version.strip()
+        prompt_config = _get_prompt_version(prompt_data, prompt_version)
+        pipeline = chatgpt_projects.normalize_prompt_pipeline(
+            prompt_config.get("pipeline")
+        )
+    try:
+        selected_voice = _normalize_voice_record(
+            voice_config.get_voice(
+                request.voice_id,
+                include_inactive=False,
+            ),
+            fallback_id=request.voice_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    voice_snapshot = voice_config.build_voice_snapshot(selected_voice)
+    payload = dict(job.get("payload") or {})
+    payload.update({
+        "url": normalized_url,
+        "prompt_version": prompt_version,
+        "voice_id": selected_voice["id"],
+        "voice_name": selected_voice["name"],
+        "voice_snapshot": voice_snapshot,
+        "pipeline": pipeline,
+    })
+    try:
+        updated_job = db.update_editable_video_job(
+            job_id,
+            title=normalized_url,
+            payload=payload,
+            prompt_version=prompt_version,
+            voice_id=selected_voice["id"],
+            voice_name=selected_voice["name"],
+            tts_provider_id=selected_voice["provider_id"],
+            voice_revision=selected_voice["revision"],
+            voice_snapshot_json=json.dumps(voice_snapshot, ensure_ascii=False),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not updated_job:
         raise HTTPException(status_code=404, detail="Job not found")
     _sync_legacy_job(updated_job)
     _kick_video_queue()
+    _kick_comment_queue()
     return {
         "success": True,
         "job": _system_job_center_item(
             updated_job,
             db.get_system_job_queue_position(job_id),
         ),
+    }
+
+
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: str):
+    try:
+        deleted_job = db.delete_system_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not deleted_job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    with _jobs_lock:
+        _jobs.pop(job_id, None)
+    _kick_video_queue()
+    _kick_comment_queue()
+    return {"success": True}
+
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_job(job_id: str):
+    try:
+        updated_job = _run_system_job_center_action(
+            job_id,
+            "retry",
+            kick_queues=True,
+        )
+    except JobCenterItemNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (JobCenterActionNotAllowedError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "success": True,
+        "job": updated_job,
     }
 
 
 @app.post("/api/jobs/{job_id}/pause")
 def pause_job(job_id: str):
     try:
-        updated_job = db.pause_system_job(job_id)
-    except ValueError as exc:
+        _run_system_job_center_action(
+            job_id,
+            "pause",
+            kick_queues=True,
+        )
+    except JobCenterItemNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (JobCenterActionNotAllowedError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if not updated_job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    _sync_legacy_job(updated_job)
-    _kick_video_queue()
     return {"success": True}
 
 
 @app.post("/api/jobs/{job_id}/resume")
 def resume_job(job_id: str):
     try:
-        updated_job = db.resume_system_job(job_id)
-    except ValueError as exc:
+        _run_system_job_center_action(
+            job_id,
+            "resume",
+            kick_queues=True,
+        )
+    except JobCenterItemNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (JobCenterActionNotAllowedError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if not updated_job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    _sync_legacy_job(updated_job)
-    _kick_video_queue()
     return {"success": True}
 
 
@@ -2102,11 +4794,15 @@ def get_job(job_id: str):
 @app.get("/api/chatgpt-status")
 def get_chatgpt_status():
     operation, prompt_version = _get_chatgpt_state()
-    return {
+    status = {
         "busy": _chatgpt_profile_lock.locked(),
         "operation": operation,
         "prompt_version": prompt_version,
     }
+    video_id = _get_chatgpt_video_id()
+    if video_id is not None:
+        status["video_id"] = video_id
+    return status
 
 
 @app.get("/api/videos")
@@ -2116,6 +4812,7 @@ def get_videos(
     is_published: Optional[int] = None,
     prompt_version: Optional[str] = None,
     search: Optional[str] = None,
+    video_status: Optional[Literal["active", "error"]] = None,
 ):
     res = db.get_all_videos(
         limit=limit,
@@ -2123,9 +4820,17 @@ def get_videos(
         is_published=is_published,
         prompt_version=prompt_version,
         search_query=search,
+        video_status=video_status,
     )
+    with _prompts_config_lock:
+        prompt_data = _read_prompts_config()
+    channels_by_id = {
+        channel["channel_id"]: channel
+        for channel in db.list_youtube_channels()
+    }
     for v in res.get("items", []):
         v["has_checkpoint"] = bool(load_checkpoint(v["id"]))
+        _add_video_default_youtube_channel(v, prompt_data, channels_by_id)
     return res
 
 class GenerateThumbnailsRequest(BaseModel):
@@ -2166,13 +4871,12 @@ def replace_metadata_section(
 async def generate_metadata_endpoint(req: GenerateMetadataRequest):
     from auto_yt.services.chatgpt_worker import generate_metadata_only
 
-    video = db.get_video(req.video_id)
-    if not video:
-        raise HTTPException(status_code=404, detail="Video not found")
+    video = _require_actionable_video(req.video_id)
 
     if not _try_start_chatgpt_operation(
         "metadata",
         video.get("prompt_version", ""),
+        req.video_id,
     ):
         return {"success": False, "error": CHATGPT_BUSY_ERROR}
 
@@ -2185,9 +4889,7 @@ async def generate_metadata_endpoint(req: GenerateMetadataRequest):
                 video.get("prompt_version", ""),
             ),
         )
-        latest_video = db.get_video(req.video_id)
-        if not latest_video:
-            raise RuntimeError("Video not found")
+        latest_video = _require_actionable_video(req.video_id)
         updated_script = replace_metadata_section(
             latest_video["generated_script"],
             metadata,
@@ -2202,7 +4904,10 @@ async def generate_metadata_endpoint(req: GenerateMetadataRequest):
         }
     except Exception as exc:
         print(f"Error in generate_metadata_endpoint: {exc}", file=sys.stderr)
-        return {"success": False, "error": str(exc)}
+        return {
+            "success": False,
+            "error": security_logging.redact_sensitive(exc),
+        }
     finally:
         _finish_chatgpt_operation()
 
@@ -2211,13 +4916,12 @@ async def generate_metadata_endpoint(req: GenerateMetadataRequest):
 async def generate_chapters_endpoint(req: GenerateChaptersRequest):
     from auto_yt.services.chatgpt_worker import generate_chapters_only
 
-    video = db.get_video(req.video_id)
-    if not video:
-        raise HTTPException(status_code=404, detail="Video not found")
+    video = _require_actionable_video(req.video_id)
 
     if not _try_start_chatgpt_operation(
         "chapters",
         video.get("prompt_version", ""),
+        req.video_id,
     ):
         return {"success": False, "error": CHATGPT_BUSY_ERROR}
 
@@ -2244,9 +4948,7 @@ async def generate_chapters_endpoint(req: GenerateChaptersRequest):
     finally:
         _finish_chatgpt_operation()
 
-    latest_video = db.get_video(req.video_id)
-    if not latest_video:
-        raise HTTPException(status_code=404, detail="Video not found")
+    latest_video = _require_actionable_video(req.video_id)
     script = latest_video["generated_script"]
     chapter_section = f"### [CHAPTERS]\n{chapters}"
     if "### [CHAPTERS]" in script:
@@ -2280,11 +4982,10 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
     resolved_chat_url = ""
     resolved_prompt_version = ""
     if req.video_id:
-        video = db.get_video(req.video_id)
-        if video:
-            resolved_chat_url = video.get("chat_url", "")
-            resolved_prompt_version = video.get("prompt_version", "")
-            print(f"Using chat_url from DB: {resolved_chat_url}")
+        video = _require_actionable_video(req.video_id)
+        resolved_chat_url = video.get("chat_url", "")
+        resolved_prompt_version = video.get("prompt_version", "")
+        print(f"Using chat_url from DB: {resolved_chat_url}")
     if not resolved_prompt_version:
         with _prompts_config_lock:
             resolved_prompt_version = _read_prompts_config().get(
@@ -2295,6 +4996,7 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
     if not _try_start_chatgpt_operation(
         "thumbnails",
         resolved_prompt_version,
+        req.video_id,
     ):
         return {"success": False, "error": CHATGPT_BUSY_ERROR}
 
@@ -2356,7 +5058,7 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
         
         # If video_id provided, patch the stored script to add image URLs
         if req.video_id:
-            video = db.get_video(req.video_id)
+            video = _require_actionable_video(req.video_id)
             if video:
                 script = video["generated_script"]
                 import re
@@ -2424,8 +5126,7 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
 
 @app.get("/api/videos/{video_id}/audio-review")
 def get_audio_review(video_id: int):
-    if not db.get_video(video_id):
-        raise HTTPException(status_code=404, detail="Video not found")
+    _require_actionable_video(video_id)
     review = _prepare_audio_review(video_id)
     return {"success": True, "audio_review": _audio_review_response(review)}
 
@@ -2440,9 +5141,7 @@ def approve_audio_review(
             status_code=400,
             detail="Phải xác nhận Genmax có thể trừ credit khi tạo audio.",
         )
-    video = db.get_video(video_id)
-    if not video:
-        raise HTTPException(status_code=404, detail="Video not found")
+    video = _require_actionable_video(video_id)
 
     review = _prepare_audio_review(video_id)
     report = review.get("report") or {}
@@ -2478,7 +5177,7 @@ def approve_audio_review(
         current_task = db.get_audio_task(video_id)
         return {
             "success": False,
-            "error": str(exc),
+            "error": security_logging.redact_sensitive(exc),
             "audio_review": _audio_review_response(approved_review),
             "audio_task": (
                 _audio_task_response(current_task) if current_task else None
@@ -2494,9 +5193,7 @@ def approve_audio_review(
 @app.post("/api/videos/{video_id}/generate-audio")
 def generate_audio_for_video(video_id: int):
     """Automatically audit, approve and safely start the Genmax workflow."""
-    video = db.get_video(video_id)
-    if not video:
-        raise HTTPException(status_code=404, detail="Video not found")
+    video = _require_actionable_video(video_id)
 
     script = video["generated_script"]
     if "### [AUDIO]" in script:
@@ -2587,6 +5284,7 @@ def get_audio_status(video_id: int):
                 task["audio_url"],
                 task.get("voice_id", ""),
                 task.get("voice_name", ""),
+                _stored_voice_persistence_fields(task),
             )
         return {"success": True, "audio_task": _audio_task_response(task)}
 
@@ -2621,15 +5319,7 @@ def regenerate_audio_for_video(
     video_id: int,
     request: RegenerateAudioRequest,
 ):
-    if not request.confirm_credit_charge:
-        raise HTTPException(
-            status_code=400,
-            detail="Phải xác nhận Genmax sẽ trừ credit cho toàn bộ audio mới.",
-        )
-
-    video = db.get_video(video_id)
-    if not video:
-        raise HTTPException(status_code=404, detail="Video not found")
+    video = _require_actionable_video(video_id)
     review = _automatically_approve_audio_review(video_id)
     if review.get("status") != "approved":
         raise HTTPException(
@@ -2637,9 +5327,24 @@ def regenerate_audio_for_video(
             detail="Kịch bản không đạt kiểm tra tự động; chưa tạo lại audio.",
         )
     try:
-        selected_voice = voice_config.get_voice(request.voice_id)
+        selected_voice = _normalize_voice_record(
+            voice_config.get_voice(
+                request.voice_id,
+                include_inactive=False,
+            ),
+            fallback_id=request.voice_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    provider_config = voice_config.get_provider(selected_voice["provider_id"])
+    if (
+        (provider_config.get("capabilities") or {}).get("billable")
+        and not request.confirm_credit_charge
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Phải xác nhận nhà cung cấp cloud có thể trừ credit cho audio mới.",
+        )
 
     filtered_script = apply_tts_filters(
         get_clean_script_for_tts(video["generated_script"])
@@ -2652,6 +5357,7 @@ def regenerate_audio_for_video(
     requested_hash = tts.get_generation_request_hash(
         filtered_script,
         selected_voice["id"],
+        voice_config.build_voice_snapshot(selected_voice),
     )
     stored_task = db.get_audio_task(video_id)
     if stored_task and stored_task["status"] in {"pending", "processing"}:
@@ -2689,7 +5395,7 @@ def regenerate_audio_for_video(
         current_task = db.get_audio_task(video_id)
         return {
             "success": False,
-            "error": str(exc),
+            "error": security_logging.redact_sensitive(exc),
             "audio_task": (
                 _audio_task_response(current_task) if current_task else None
             ),
@@ -2704,15 +5410,7 @@ def regenerate_audio_for_video(
 
 @app.post("/api/videos/{video_id}/retry-audio")
 def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
-    if not request.confirm_credit_charge:
-        raise HTTPException(
-            status_code=400,
-            detail="Phải xác nhận Genmax sẽ trừ credit lần nữa.",
-        )
-
-    video = db.get_video(video_id)
-    if not video:
-        raise HTTPException(status_code=404, detail="Video not found")
+    video = _require_actionable_video(video_id)
     review = _automatically_approve_audio_review(video_id)
     if review.get("status") != "approved":
         raise HTTPException(
@@ -2730,12 +5428,25 @@ def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
                 detail="Chỉ được retry task đã thất bại.",
             )
 
+        provider_id = task.get("tts_provider_id") or voice_config.GENMAX_PROVIDER_ID
+        provider_config = voice_config.get_provider(provider_id)
+        if (
+            (provider_config.get("capabilities") or {}).get("billable")
+            and not request.confirm_credit_charge
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Retry với nhà cung cấp cloud có thể trừ credit; cần xác nhận.",
+            )
+        voice_snapshot = _voice_snapshot_from_record(task)
+
         current_script = apply_tts_filters(
             get_clean_script_for_tts(video["generated_script"])
         )
         current_request_hash = tts.get_generation_request_hash(
             current_script,
             task.get("voice_id") or AUDIO_VOICE_ID,
+            voice_snapshot,
         )
         if current_request_hash != task.get("request_hash"):
             raise HTTPException(
@@ -2761,13 +5472,17 @@ def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
             for segment in failed_segments:
                 text_hash = segment.get("text_hash", "")
                 characters = segment.get("characters", 0)
-                retried_task = tts.retry_tts_task(segment["task_id"])
+                retried_task = tts.retry_tts_task(
+                    segment["task_id"],
+                    provider_id,
+                )
                 segment.update(
                     _segment_from_remote(
                         segment["index"],
                         "",
                         retried_task,
                         task.get("voice_id") or AUDIO_VOICE_ID,
+                        voice_snapshot,
                     )
                 )
                 segment["text_hash"] = text_hash
@@ -2780,6 +5495,7 @@ def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
                 segments_json=json.dumps(segments, ensure_ascii=False),
                 voice_id=task.get("voice_id", ""),
                 voice_name=task.get("voice_name", ""),
+                **_stored_voice_persistence_fields(task),
             )
             _start_audio_watcher(video_id)
             return {
@@ -2787,7 +5503,7 @@ def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
                 "audio_task": _audio_task_response(updated_task),
             }
 
-        retried_task = tts.retry_tts_task(task["task_id"])
+        retried_task = tts.retry_tts_task(task["task_id"], provider_id)
         updated_task = db.upsert_audio_task(
             video_id=video_id,
             request_hash=task["request_hash"],
@@ -2795,6 +5511,7 @@ def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
             status=retried_task.get("status", "pending"),
             voice_id=task.get("voice_id", ""),
             voice_name=task.get("voice_name", ""),
+            **_stored_voice_persistence_fields(task),
         )
         _start_audio_watcher(video_id)
         return {
@@ -2805,10 +5522,25 @@ def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
 
 @app.put("/api/videos/{video_id}/publish")
 def publish_video(video_id: int, is_published: int):
-    success = db.toggle_published(video_id, is_published)
+    try:
+        success = db.toggle_published(video_id, is_published)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not success:
         raise HTTPException(status_code=404, detail="Video not found")
     return {"success": True}
+
+
+@app.put("/api/videos/{video_id}/status")
+def update_video_status(video_id: int, request: VideoStatusRequest):
+    video = db.set_video_status(video_id, request.status)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return {
+        "success": True,
+        "video_id": video_id,
+        "video_status": video["video_status"],
+    }
 
 
 @app.put("/api/videos/{video_id}/audio-duration")
@@ -2826,54 +5558,174 @@ def get_video(video_id: int):
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
     video["has_checkpoint"] = bool(load_checkpoint(video_id))
+    video["publications"] = db.list_video_publications(video_id)
+    with _prompts_config_lock:
+        prompt_data = _read_prompts_config()
+    channels_by_id = {
+        channel["channel_id"]: channel
+        for channel in db.list_youtube_channels()
+    }
+    _add_video_default_youtube_channel(video, prompt_data, channels_by_id)
     return video
 
 @app.delete("/api/videos/{video_id}")
 def delete_video(video_id: int):
-    success = db.delete_video(video_id)
-    if not success:
+    if _get_chatgpt_video_id() == video_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Video đang được ChatGPT xử lý. "
+                "Hãy đợi tác vụ kết thúc hoặc dừng tác vụ trước khi xóa."
+            ),
+        )
+
+    checkpoint = load_checkpoint(video_id)
+    try:
+        deleted = db.delete_video_with_dependencies(video_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not deleted:
         raise HTTPException(status_code=404, detail="Video not found")
-    return {"success": True}
+
+    deleted_job_ids = deleted["system_job_ids"]
+    with _jobs_lock:
+        for job_id in deleted_job_ids:
+            _jobs.pop(job_id, None)
+    warnings = []
+    try:
+        clear_checkpoint(video_id)
+    except OSError as exc:
+        warnings.append(f"Không thể xóa checkpoint của video #{video_id}: {exc}")
+    deleted_media_count, media_warnings = _delete_unreferenced_managed_media(
+        deleted,
+        checkpoint,
+    )
+    warnings.extend(media_warnings)
+    _kick_video_queue()
+    return {
+        "success": True,
+        "deleted_job_ids": deleted_job_ids,
+        "deleted_media_count": deleted_media_count,
+        "warnings": warnings,
+    }
 
 # --- AUTO LOGIN ENDPOINTS ---
 
-@app.get("/api/account", response_model=AccountData)
+@app.get("/api/account", response_model=AccountStatus)
 def get_account():
-    if not ACCOUNT_PATH.exists():
-        return AccountData()
     try:
-        data = json.loads(ACCOUNT_PATH.read_text(encoding="utf-8"))
-        account = _extract_gpt_account(data)
-        return AccountData(
-            email=account.get("email", ""),
-            password=account.get("password", ""),
-            totp_secret=account.get("totp_secret") or "",
-            headless=account.get("headless", True)
+        account = account_store.load_account()
+        browser_settings = account_store.get_browser_automation_settings()
+        return AccountStatus(
+            email=str(account.get("email") or ""),
+            headless=browser_settings["worker_headless"],
+            password_configured=bool(account.get("password")),
+            totp_configured=bool(account.get("totp_secret")),
         )
     except Exception:
-        return AccountData()
+        return AccountStatus()
 
 @app.post("/api/account")
 def save_account(account: AccountData):
     _save_account_payload(account.dict())
     return {"success": True}
 
+
+@app.get("/api/browser-automation", response_model=BrowserAutomationData)
+def get_browser_automation():
+    return account_store.get_browser_automation_settings()
+
+
+@app.put("/api/browser-automation", response_model=BrowserAutomationData)
+def save_browser_automation(data: BrowserAutomationData):
+    return account_store.save_browser_automation_settings(data.model_dump())
+
+
+@app.get(
+    "/api/chatgpt-browser-service",
+    response_model=ChatGPTBrowserServiceStatus,
+)
+def get_chatgpt_browser_service_status():
+    return chatgpt_browser_service.get_browser_service_status()
+
+
+@app.post(
+    "/api/chatgpt-browser-service/start",
+    response_model=ChatGPTBrowserServiceStatus,
+)
+def start_chatgpt_browser_service():
+    if not _try_start_chatgpt_operation("browser-service-start"):
+        raise HTTPException(status_code=409, detail=CHATGPT_BUSY_ERROR)
+    try:
+        status = chatgpt_browser_service.start_browser_service()
+        if not status.get("connected"):
+            raise HTTPException(status_code=503, detail=status.get("message"))
+        return status
+    finally:
+        _finish_chatgpt_operation()
+
+
+@app.post(
+    "/api/chatgpt-browser-service/stop",
+    response_model=ChatGPTBrowserServiceStatus,
+)
+def stop_chatgpt_browser_service():
+    if not _try_start_chatgpt_operation("browser-service-stop"):
+        raise HTTPException(status_code=409, detail=CHATGPT_BUSY_ERROR)
+    try:
+        status = chatgpt_browser_service.stop_browser_service()
+        if status.get("process_alive"):
+            raise HTTPException(status_code=409, detail=status.get("message"))
+        return status
+    finally:
+        _finish_chatgpt_operation()
+
+
+@app.post(
+    "/api/chatgpt-browser-service/show",
+    response_model=ChatGPTBrowserServiceStatus,
+)
+def show_chatgpt_browser_service_window():
+    try:
+        status = chatgpt_browser_service.set_browser_service_window_visibility(True)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not status.get("connected"):
+        raise HTTPException(status_code=503, detail=status.get("message"))
+    return status
+
+
+@app.post(
+    "/api/chatgpt-browser-service/hide",
+    response_model=ChatGPTBrowserServiceStatus,
+)
+def hide_chatgpt_browser_service_window():
+    try:
+        status = chatgpt_browser_service.set_browser_service_window_visibility(False)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not status.get("connected"):
+        raise HTTPException(status_code=503, detail=status.get("message"))
+    return status
+
 @app.post("/api/clear-account")
 def clear_account():
-    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
-    # Xóa thư mục Profile
-    if profile_dir.exists():
-        try:
+    if not _try_start_chatgpt_operation("clear-account"):
+        raise HTTPException(status_code=409, detail=CHATGPT_BUSY_ERROR)
+    try:
+        browser_status = chatgpt_browser_service.stop_browser_service()
+        if browser_status.get("process_alive"):
+            raise HTTPException(
+                status_code=409,
+                detail="Không thể dừng trình duyệt ChatGPT nền để xóa tài khoản.",
+            )
+        profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+        if profile_dir.exists():
             shutil.rmtree(profile_dir, ignore_errors=True)
-        except Exception:
-            pass
-    # Xóa file Account
-    if ACCOUNT_PATH.exists():
-        try:
-            ACCOUNT_PATH.unlink()
-        except Exception:
-            pass
-    return {"success": True}
+        account_store.clear_account()
+        return {"success": True}
+    finally:
+        _finish_chatgpt_operation()
 
 @app.get("/api/prompts")
 def get_prompts():
@@ -2936,6 +5788,52 @@ def _get_prompt_default_voice_id(version_id: str = "") -> str:
         return str(version.get("default_voice_id", "") or "").strip()
 
 
+def _get_prompt_default_youtube_channel_id(version_id: str = "") -> str:
+    with _prompts_config_lock:
+        data = _read_prompts_config()
+        resolved_version_id = version_id.strip() or data.get(
+            "active_version",
+            "default",
+        )
+        version = data.get("versions", {}).get(resolved_version_id, {})
+        return str(
+            version.get("default_youtube_channel_id", "") or ""
+        ).strip()
+
+
+def _clear_prompt_default_youtube_channel_id(channel_id: str) -> list[str]:
+    normalized_channel_id = str(channel_id or "").strip()
+    if not normalized_channel_id:
+        return []
+    with _prompts_config_lock:
+        data = _read_prompts_config()
+        cleared_versions = []
+        for version_id, version in data.get("versions", {}).items():
+            if (
+                str(version.get("default_youtube_channel_id", "") or "").strip()
+                == normalized_channel_id
+            ):
+                version["default_youtube_channel_id"] = ""
+                cleared_versions.append(version_id)
+        if cleared_versions:
+            _write_prompts_config(data)
+    return cleared_versions
+
+
+def _add_video_default_youtube_channel(video: dict, prompt_data: dict, channels: dict) -> None:
+    version = prompt_data.get("versions", {}).get(
+        str(video.get("prompt_version") or ""),
+        {},
+    )
+    stable_channel_id = str(
+        version.get("default_youtube_channel_id", "") or ""
+    ).strip()
+    channel = channels.get(stable_channel_id)
+    video["default_youtube_channel_id"] = stable_channel_id
+    video["default_youtube_channel_db_id"] = channel.get("id") if channel else None
+    video["default_youtube_channel_title"] = channel.get("title", "") if channel else ""
+
+
 def _get_prompt_pipeline(version_id: str = "") -> dict[str, bool]:
     with _prompts_config_lock:
         data = _read_prompts_config()
@@ -2972,15 +5870,663 @@ def _assert_prompt_version_editable(version_id: str) -> None:
 
 @app.get("/api/voices")
 def get_voices():
-    return voice_config.load_voice_config()
+    config = voice_config.load_voice_config()
+    return {
+        **config,
+        "voices": [
+            voice for voice in config["voices"] if voice.get("status") == "active"
+        ],
+    }
 
 
 @app.post("/api/voices")
 def save_voices(data: VoiceConfigData):
+    """Compatibility adapter for clients that predate the provider catalog."""
     try:
-        return voice_config.save_voice_config(data.model_dump())
+        with _tts_config_lock:
+            current = voice_config.load_voice_config()
+            current_by_id = {voice["id"]: voice for voice in current["voices"]}
+            submitted_ids = {voice.id for voice in data.voices}
+            merged = []
+            for submitted in data.voices:
+                existing = current_by_id.get(submitted.id)
+                if existing:
+                    merged.append({**existing, "name": submitted.name})
+                else:
+                    merged.append(
+                        {
+                            "id": submitted.id,
+                            "name": submitted.name,
+                            "provider_id": voice_config.GENMAX_PROVIDER_ID,
+                            "provider_voice_id": submitted.id,
+                            "status": "active",
+                            "revision": 1,
+                            "config": {},
+                        }
+                    )
+            for existing in current["voices"]:
+                if existing["id"] not in submitted_ids:
+                    merged.append({**existing, "status": "archived"})
+            saved = voice_config.save_voice_config(
+                {
+                    **current,
+                    "default_voice_id": data.active_voice_id,
+                    "active_voice_id": data.active_voice_id,
+                    "voices": merged,
+                }
+            )
+            return {
+                **saved,
+                "voices": [
+                    voice
+                    for voice in saved["voices"]
+                    if voice.get("status") == "active"
+                ],
+            }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _public_provider(provider: dict, health: dict | None = None) -> dict:
+    provider_id = provider["id"]
+    active_tasks = [
+        task
+        for task in db.get_active_audio_tasks()
+        if (task.get("tts_provider_id") or voice_config.GENMAX_PROVIDER_ID)
+        == provider_id
+    ]
+    return {
+        "id": provider_id,
+        "type": provider.get("type", "external"),
+        "display_name": provider.get("display_name", provider_id),
+        "enabled": bool(provider.get("enabled", True)),
+        "capabilities": provider.get("capabilities") or {},
+        "config": provider.get("config") or {},
+        "health": health or {"ok": False, "state": "unknown"},
+        "queued_jobs": len(active_tasks)
+        + len(db.list_active_tts_previews(provider_id)),
+    }
+
+
+def _provider_health(provider_id: str, *, test_connection: bool = False) -> dict:
+    try:
+        return tts.get_provider(provider_id).health(test_connection=test_connection)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "state": "offline",
+            "error": security_logging.redact_sensitive(exc),
+            "configured": (
+                tts.genmax_service.has_api_key()
+                if provider_id == voice_config.GENMAX_PROVIDER_ID
+                else True
+            ),
+        }
+
+
+def _save_tts_config(config: dict) -> dict:
+    try:
+        return voice_config.save_voice_config(config)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/tts/providers")
+def list_tts_providers():
+    config = voice_config.load_voice_config()
+    return {
+        "items": [
+            _public_provider(provider, _provider_health(provider["id"]))
+            for provider in config["providers"]
+        ]
+    }
+
+
+@app.patch("/api/tts/providers/{provider_id}")
+def update_tts_provider(provider_id: str, payload: TTSProviderUpdate):
+    with _tts_config_lock:
+        config = voice_config.load_voice_config()
+        provider = next(
+            (item for item in config["providers"] if item["id"] == provider_id),
+            None,
+        )
+        if not provider:
+            raise HTTPException(status_code=404, detail="Nhà cung cấp TTS không tồn tại.")
+        if payload.enabled is not None:
+            provider["enabled"] = payload.enabled
+        saved = _save_tts_config(config)
+        saved_provider = next(
+            item for item in saved["providers"] if item["id"] == provider_id
+        )
+    return _public_provider(saved_provider, _provider_health(provider_id))
+
+
+@app.post("/api/tts/providers/{provider_id}/test")
+def test_tts_provider(provider_id: str):
+    try:
+        configured_provider = voice_config.get_provider(provider_id)
+        health = tts.get_provider(provider_id).health(test_connection=True)
+        return _public_provider(configured_provider, health)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=security_logging.redact_sensitive(exc),
+        ) from exc
+
+
+@app.put("/api/tts/providers/genmax/credentials")
+def save_genmax_credentials(payload: GenmaxCredentialData):
+    try:
+        tts.genmax_service.save_api_key(payload.api_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "configured": True}
+
+
+@app.delete("/api/tts/providers/genmax/credentials")
+def delete_genmax_credentials():
+    tts.genmax_service.delete_api_key()
+    return {"success": True, "configured": False}
+
+
+@app.get("/api/tts/voices")
+def list_tts_voices(
+    provider_id: str = Query(default="", max_length=64),
+    status: str = Query(default="", max_length=32),
+    search: str = Query(default="", max_length=120),
+):
+    config = voice_config.load_voice_config()
+    items = config["voices"]
+    if provider_id:
+        items = [voice for voice in items if voice["provider_id"] == provider_id]
+    if status:
+        items = [voice for voice in items if voice["status"] == status]
+    normalized_search = search.strip().casefold()
+    if normalized_search:
+        items = [
+            voice
+            for voice in items
+            if normalized_search in voice["name"].casefold()
+            or normalized_search in voice["provider_voice_id"].casefold()
+        ]
+    return {"default_voice_id": config["default_voice_id"], "items": items}
+
+
+@app.put("/api/tts/voices/default")
+def set_default_tts_voice(payload: TTSDefaultVoiceData):
+    with _tts_config_lock:
+        config = voice_config.load_voice_config()
+        voice = next(
+            (item for item in config["voices"] if item["id"] == payload.voice_id),
+            None,
+        )
+        if not voice or voice["status"] != "active":
+            raise HTTPException(
+                status_code=400,
+                detail="Giọng mặc định phải là giọng đang hoạt động.",
+            )
+        config["default_voice_id"] = voice["id"]
+        config["active_voice_id"] = voice["id"]
+        saved = _save_tts_config(config)
+    return {"success": True, "default_voice_id": saved["default_voice_id"]}
+
+
+@app.post("/api/tts/voices")
+def create_tts_voice(payload: TTSVoiceCreate):
+    provider_id = payload.provider_id.strip().casefold()
+    with _tts_config_lock:
+        config = voice_config.load_voice_config()
+        if not any(provider["id"] == provider_id for provider in config["providers"]):
+            raise HTTPException(status_code=400, detail="Nhà cung cấp TTS không tồn tại.")
+        voice = {
+            "id": str(uuid.uuid4()),
+            "name": payload.name.strip(),
+            "provider_id": provider_id,
+            "provider_voice_id": payload.provider_voice_id.strip(),
+            "status": "active",
+            "revision": 1,
+            "config": payload.config,
+        }
+        config["voices"].append(voice)
+        saved = _save_tts_config(config)
+    return next(item for item in saved["voices"] if item["id"] == voice["id"])
+
+
+@app.patch("/api/tts/voices/{voice_id}")
+def update_tts_voice(voice_id: str, payload: TTSVoiceUpdate):
+    with _tts_config_lock:
+        config = voice_config.load_voice_config()
+        voice = next((item for item in config["voices"] if item["id"] == voice_id), None)
+        if not voice:
+            raise HTTPException(status_code=404, detail="Giọng đọc không tồn tại.")
+        changed_configuration = False
+        if payload.name is not None:
+            voice["name"] = payload.name.strip()
+        if payload.provider_voice_id is not None:
+            normalized_remote_id = payload.provider_voice_id.strip()
+            changed_configuration = normalized_remote_id != voice["provider_voice_id"]
+            voice["provider_voice_id"] = normalized_remote_id
+        if payload.config is not None:
+            changed_configuration = changed_configuration or payload.config != voice["config"]
+            voice["config"] = payload.config
+        if payload.status is not None:
+            if payload.status != "active" and config["default_voice_id"] == voice_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Không thể lưu trữ giọng mặc định. Hãy chọn giọng mặc định khác trước.",
+                )
+            voice["status"] = payload.status
+        if changed_configuration:
+            voice["revision"] = int(voice.get("revision") or 1) + 1
+        saved = _save_tts_config(config)
+    return next(item for item in saved["voices"] if item["id"] == voice_id)
+
+
+@app.delete("/api/tts/voices/{voice_id}")
+def archive_tts_voice(voice_id: str):
+    return update_tts_voice(voice_id, TTSVoiceUpdate(status="archived"))
+
+
+@app.post("/api/tts/voices/{voice_id}/test")
+def test_tts_voice(voice_id: str, payload: TTSVoiceTestData):
+    try:
+        voice, provider = tts.get_voice_context(voice_id)
+        if (voice_config.get_provider(voice["provider_id"]).get("capabilities") or {}).get(
+            "billable"
+        ) and not payload.confirm_billable:
+            raise HTTPException(
+                status_code=400,
+                detail="Thử giọng Genmax có thể tốn credit; cần xác nhận trước.",
+            )
+        provider.validate_voice(voice)
+        task = provider.submit(
+            payload.text.strip(),
+            voice,
+            tts.get_request_hash(
+                payload.text.strip(), voice_id, voice_config.build_voice_snapshot(voice)
+            ),
+        )
+        return {"success": True, "task": task}
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail=security_logging.redact_sensitive(exc)
+        ) from exc
+
+
+def _normalize_tts_preview_id(preview_id: str) -> str:
+    try:
+        return str(uuid.UUID(preview_id))
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=404, detail="Bản nghe thử không tồn tại.") from exc
+
+
+def _get_tts_preview_sync_lock(preview_id: str) -> threading.Lock:
+    normalized_id = _normalize_tts_preview_id(preview_id)
+    with _tts_preview_sync_locks_guard:
+        return _tts_preview_sync_locks.setdefault(normalized_id, threading.Lock())
+
+
+def _normalize_tts_preview_status(status: str) -> str:
+    normalized = str(status or "").strip().casefold()
+    if normalized in {"pending", "queued"}:
+        return "queued"
+    if normalized in {"processing", "running"}:
+        return "processing"
+    if normalized in {"completed", "failed", "canceled"}:
+        return normalized
+    return "processing"
+
+
+def _public_tts_preview(preview: dict) -> dict:
+    provider_health = _provider_health(preview["tts_provider_id"])
+    audio_url = ""
+    if preview["status"] == "completed" and preview.get("audio_filename"):
+        audio_url = (
+            f"http://127.0.0.1:8080/api/tts/previews/{preview['id']}/audio"
+        )
+    return {
+        "id": preview["id"],
+        "status": preview["status"],
+        "text": preview["text"],
+        "character_count": preview["character_count"],
+        "voice_id": preview["voice_id"],
+        "voice_name": preview["voice_name"],
+        "provider_id": preview["tts_provider_id"],
+        "provider_state": provider_health.get("state", "unknown"),
+        "provider_busy": bool(provider_health.get("busy")),
+        "duration_seconds": preview.get("duration_seconds"),
+        "audio_url": audio_url,
+        "error": preview.get("error") or "",
+        "created_at": preview["created_at"],
+        "updated_at": preview["updated_at"],
+        "expires_at": preview["expires_at"],
+    }
+
+
+def _cleanup_expired_tts_previews() -> int:
+    expired = db.delete_expired_tts_previews()
+    for preview in expired:
+        if preview["status"] in {"queued", "processing"}:
+            try:
+                tts.cancel_tts_task(
+                    preview["provider_task_id"],
+                    preview["tts_provider_id"],
+                )
+            except Exception as exc:
+                print(
+                    "Could not cancel expired TTS preview: "
+                    f"{security_logging.redact_sensitive(exc)}",
+                    file=sys.stderr,
+                )
+        tts.discard_preview_audio(preview.get("audio_filename") or "")
+        with _tts_preview_sync_locks_guard:
+            _tts_preview_sync_locks.pop(preview["id"], None)
+    return len(expired)
+
+
+def _tts_preview_cleanup_scheduler() -> None:
+    while not _tts_preview_cleanup_stop_event.wait(
+        TTS_PREVIEW_CLEANUP_INTERVAL_SECONDS
+    ):
+        try:
+            _cleanup_expired_tts_previews()
+        except Exception as exc:
+            print(
+                "TTS preview cleanup failed: "
+                f"{security_logging.redact_sensitive(exc)}",
+                file=sys.stderr,
+            )
+
+
+def _get_unexpired_tts_preview(preview_id: str) -> dict:
+    normalized_id = _normalize_tts_preview_id(preview_id)
+    preview = db.get_tts_preview(normalized_id)
+    if preview is None:
+        raise HTTPException(status_code=404, detail="Bản nghe thử không tồn tại.")
+    expires_at = _parse_utc_datetime(preview["expires_at"])
+    if expires_at and expires_at <= datetime.datetime.now(datetime.timezone.utc):
+        _cleanup_expired_tts_previews()
+        raise HTTPException(status_code=404, detail="Bản nghe thử đã hết hạn.")
+    return preview
+
+
+def _sync_tts_preview(preview_id: str) -> dict:
+    lock = _get_tts_preview_sync_lock(preview_id)
+    with lock:
+        preview = _get_unexpired_tts_preview(preview_id)
+        audio_filename = preview.get("audio_filename") or ""
+        if (
+            preview["status"] == "completed"
+            and audio_filename
+            and (tts.PREVIEW_AUDIO_DIR / audio_filename).is_file()
+        ):
+            return preview
+        if preview["status"] in {"failed", "canceled"}:
+            return preview
+        try:
+            task = tts.get_tts_task(
+                preview["provider_task_id"],
+                preview["tts_provider_id"],
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=security_logging.redact_sensitive(exc),
+            ) from exc
+        status = _normalize_tts_preview_status(task.get("status") or "")
+        if status == "completed":
+            try:
+                filename, duration = tts.materialize_preview_audio(
+                    task,
+                    preview["id"],
+                )
+                config = (preview.get("voice_snapshot") or {}).get("config") or {}
+                audio_utils.validate_spoken_duration(
+                    preview["text"],
+                    duration,
+                    minimum_words_per_minute=float(
+                        config.get("min_words_per_minute") or 105
+                    ),
+                    provider_name="OmniVoice",
+                )
+                return db.update_tts_preview(
+                    preview["id"],
+                    status="completed",
+                    audio_filename=filename,
+                    duration_seconds=duration,
+                    error="",
+                )
+            except Exception as exc:
+                tts.discard_preview_audio(f"{preview['id']}.wav")
+                return db.update_tts_preview(
+                    preview["id"],
+                    status="failed",
+                    audio_filename="",
+                    duration_seconds=None,
+                    error=security_logging.redact_sensitive(exc),
+                )
+        error = ""
+        if status in {"failed", "canceled"}:
+            error = security_logging.redact_sensitive(task.get("error") or "")
+        return db.update_tts_preview(
+            preview["id"],
+            status=status,
+            error=error,
+        )
+
+
+@app.post("/api/tts/previews")
+def create_tts_preview(payload: TTSPreviewCreateData):
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Nội dung nghe thử không được để trống.")
+    if len(text) > TTS_PREVIEW_MAX_CHARACTERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Nội dung nghe thử tối đa {TTS_PREVIEW_MAX_CHARACTERS} ký tự.",
+        )
+    try:
+        voice, provider = tts.get_voice_context(payload.voice_id)
+        if voice["provider_id"] != voice_config.OMNIVOICE_PROVIDER_ID:
+            raise ValueError("Bản nghe thử tại đây chỉ hỗ trợ giọng OmniVoice.")
+        snapshot = voice_config.build_voice_snapshot(voice)
+        preview_voice = {
+            **voice,
+            "provider_voice_id": snapshot["provider_voice_id"],
+            "revision": snapshot["voice_revision"],
+            "config": snapshot.get("config") or {},
+        }
+        provider.validate_voice(preview_voice)
+        preview_id = str(uuid.uuid4())
+        request_hash = tts.get_request_hash(
+            f"tts-preview:{preview_id}:{text}",
+            voice["id"],
+            snapshot,
+        )
+        task = provider.submit(text, preview_voice, request_hash)
+        provider_task_id = str(task.get("id") or "").strip()
+        if not provider_task_id:
+            raise RuntimeError("OmniVoice không trả về mã job nghe thử.")
+        expires_at = (
+            datetime.datetime.now(datetime.timezone.utc) + TTS_PREVIEW_RETENTION
+        ).isoformat()
+        try:
+            preview = db.create_tts_preview(
+                preview_id=preview_id,
+                provider_task_id=provider_task_id,
+                request_hash=request_hash,
+                status=_normalize_tts_preview_status(task.get("status") or ""),
+                text=text,
+                voice_id=voice["id"],
+                voice_name=voice["name"],
+                tts_provider_id=voice["provider_id"],
+                voice_revision=snapshot["voice_revision"],
+                voice_snapshot_json=json.dumps(snapshot, ensure_ascii=False),
+                expires_at=expires_at,
+            )
+        except Exception:
+            try:
+                provider.cancel(provider_task_id)
+            except Exception:
+                pass
+            raise
+        if preview["status"] == "completed":
+            preview = _sync_tts_preview(preview["id"])
+        return _public_tts_preview(preview)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=security_logging.redact_sensitive(exc),
+        ) from exc
+
+
+@app.get("/api/tts/previews/{preview_id}")
+def get_tts_preview(preview_id: str):
+    return _public_tts_preview(_sync_tts_preview(preview_id))
+
+
+@app.post("/api/tts/previews/{preview_id}/cancel")
+def cancel_tts_preview(preview_id: str):
+    lock = _get_tts_preview_sync_lock(preview_id)
+    with lock:
+        preview = _get_unexpired_tts_preview(preview_id)
+        if preview["status"] in {"completed", "failed", "canceled"}:
+            return _public_tts_preview(preview)
+        try:
+            tts.cancel_tts_task(
+                preview["provider_task_id"],
+                preview["tts_provider_id"],
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=security_logging.redact_sensitive(exc),
+            ) from exc
+        preview = db.update_tts_preview(
+            preview["id"],
+            status="canceled",
+            error="",
+        )
+        return _public_tts_preview(preview)
+
+
+@app.get("/api/tts/previews/{preview_id}/audio")
+def serve_tts_preview_audio(preview_id: str, download: bool = Query(False)):
+    preview = _get_unexpired_tts_preview(preview_id)
+    if preview["status"] != "completed" or not preview.get("audio_filename"):
+        raise HTTPException(status_code=409, detail="Bản nghe thử chưa hoàn tất.")
+    expected_filename = f"{preview['id']}.wav"
+    if preview["audio_filename"] != expected_filename:
+        raise HTTPException(status_code=400, detail="Tên file nghe thử không hợp lệ.")
+    file_path = _resolve_media_file(
+        tts.PREVIEW_AUDIO_DIR,
+        preview["audio_filename"],
+        ".wav",
+    )
+    return FileResponse(
+        str(file_path),
+        media_type="audio/wav",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": (
+                f'{"attachment" if download else "inline"}; '
+                f'filename="omnivoice-preview-{preview["id"]}.wav"'
+            ),
+        },
+    )
+
+
+@app.post("/api/tts/providers/omnivoice/sync")
+def sync_omnivoice_profiles():
+    try:
+        remote = tts.get_provider(voice_config.OMNIVOICE_PROVIDER_ID).list_remote_voices()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail=security_logging.redact_sensitive(exc)
+        ) from exc
+    with _tts_config_lock:
+        config = voice_config.load_voice_config()
+        existing = {
+            voice["provider_voice_id"]: voice
+            for voice in config["voices"]
+            if voice["provider_id"] == voice_config.OMNIVOICE_PROVIDER_ID
+        }
+        added = []
+        for profile in remote.get("profiles", []):
+            remote_id = str(profile.get("id") or "").strip()
+            if not remote_id or remote_id in existing:
+                continue
+            voice = {
+                "id": str(uuid.uuid4()),
+                "name": str(profile.get("name") or remote_id).strip(),
+                "provider_id": voice_config.OMNIVOICE_PROVIDER_ID,
+                "provider_voice_id": remote_id,
+                "status": "active",
+                "revision": 1,
+                "config": {},
+            }
+            config["voices"].append(voice)
+            existing[remote_id] = voice
+            added.append(voice["id"])
+        saved = _save_tts_config(config)
+    return {
+        "success": True,
+        "added": len(added),
+        "profiles": remote.get("profiles", []),
+        "samples": remote.get("samples", []),
+        "voices": [voice for voice in saved["voices"] if voice["id"] in added],
+    }
+
+
+@app.post("/api/tts/providers/omnivoice/clone")
+async def clone_omnivoice_voice(
+    file: UploadFile = File(...),
+    name: str = Form(..., min_length=1, max_length=120),
+    start_seconds: float = Form(..., ge=0),
+    end_seconds: float = Form(..., gt=0),
+    reference_text: str = Form(..., min_length=2, max_length=2000),
+):
+    if end_seconds - start_seconds < 3 or end_seconds - start_seconds > 10:
+        raise HTTPException(status_code=400, detail="Đoạn mẫu phải dài từ 3 đến 10 giây.")
+    contents = await file.read(100 * 1024 * 1024 + 1)
+    if not contents or len(contents) > 100 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File mẫu rỗng hoặc vượt quá 100 MB.")
+    try:
+        result = tts.omnivoice_client.clone_voice(
+            name=name.strip(),
+            file_name=file.filename or "sample.wav",
+            file_bytes=contents,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+            reference_text=reference_text.strip(),
+        )
+        profile_id = str(result.get("id") or "").strip()
+        if not profile_id:
+            raise RuntimeError("OmniVoice không trả về Profile ID.")
+        voice = create_tts_voice(
+            TTSVoiceCreate(
+                name=name.strip(),
+                provider_id=voice_config.OMNIVOICE_PROVIDER_ID,
+                provider_voice_id=profile_id,
+            )
+        )
+        return {"success": True, "voice": voice, "profile": result}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail=security_logging.redact_sensitive(exc)
+        ) from exc
 
 @app.post("/api/prompts")
 def save_prompts(data: PromptsData):
@@ -3065,6 +6611,31 @@ def save_prompt_default_voice(
     }
 
 
+@app.patch("/api/prompts/{version_id}/default-youtube-channel")
+def save_prompt_default_youtube_channel(
+    version_id: str,
+    payload: PromptDefaultYoutubeChannelData,
+):
+    selected_channel_id = payload.channel_id.strip()
+    if selected_channel_id and not db.get_youtube_channel_by_channel_id(
+        selected_channel_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Kênh YouTube đã chọn chưa được kết nối hoặc không còn tồn tại.",
+        )
+    with _prompts_config_lock:
+        _assert_prompt_version_editable(version_id)
+        data = _read_prompts_config()
+        version = _get_prompt_version(data, version_id)
+        version["default_youtube_channel_id"] = selected_channel_id
+        normalized_data = _write_prompts_config(data)
+    return {
+        "version_id": version_id,
+        "version": normalized_data["versions"][version_id],
+    }
+
+
 @app.patch("/api/prompts/{version_id}/pipeline")
 def save_prompt_pipeline(version_id: str, payload: PromptPipelineData):
     with _prompts_config_lock:
@@ -3111,21 +6682,26 @@ async def trigger_login():
 
     profile_reserved = False
     try:
-        if not ACCOUNT_PATH.exists():
+        account = account_store.load_account()
+        if not account.get("email"):
             return {"success": False, "error": "Chưa có thông tin tài khoản"}
 
         if not _try_start_chatgpt_operation("login"):
             return {"success": False, "error": CHATGPT_BUSY_ERROR}
         profile_reserved = True
 
-        data = json.loads(ACCOUNT_PATH.read_text(encoding="utf-8"))
-        account = _extract_gpt_account(data)
-        
+        browser_status = await asyncio.to_thread(
+            chatgpt_browser_service.stop_browser_service
+        )
+        if browser_status.get("process_alive"):
+            raise RuntimeError(
+                "Không thể dừng trình duyệt ChatGPT nền để mở phiên đăng nhập."
+            )
+
         async def _run_login():
             async with async_playwright() as p:
                 profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
                 profile_dir.mkdir(parents=True, exist_ok=True)
-                
                 context = await p.chromium.launch_persistent_context(
                     str(profile_dir),
                     headless=False,
@@ -3137,30 +6713,24 @@ async def trigger_login():
                         "Chrome/126.0.0.0 Safari/537.36"
                     )
                 )
-                page = context.pages[0] if context.pages else await context.new_page()
-                page.set_default_timeout(60000)
-                
-                saved_cookies = account.get("session_cookie") or []
-                if saved_cookies:
-                    try:
-                        result = await restore_session(saved_cookies, page)
-                    except Exception:
+                try:
+                    page = context.pages[0] if context.pages else await context.new_page()
+                    page.set_default_timeout(60000)
+
+                    saved_cookies = account.get("session_cookie") or []
+                    if saved_cookies:
+                        try:
+                            result = await restore_session(saved_cookies, page)
+                        except Exception:
+                            result = await login_gpt_auto(account, page)
+                    else:
                         result = await login_gpt_auto(account, page)
-                else:
-                    result = await login_gpt_auto(account, page)
-                
-                # Save session
-                account["session_cookie"] = result.get("cookies", [])
-                
-                existing = {}
-                if ACCOUNT_PATH.exists():
-                    try:
-                        existing = json.loads(ACCOUNT_PATH.read_text(encoding="utf-8"))
-                    except Exception: pass
-                existing["gpt_account1"] = account
-                ACCOUNT_PATH.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
-                
-                return result
+
+                    account["session_cookie"] = result.get("cookies", [])
+                    account_store.save_account(account)
+                    return result
+                finally:
+                    await context.close()
                 
         result = await _run_login()
         return {"success": True, "message": "Login successful"}
@@ -3168,6 +6738,7 @@ async def trigger_login():
         return {"success": False, "error": str(e)}
     finally:
         if profile_reserved:
+            await asyncio.to_thread(chatgpt_browser_service.start_browser_service)
             _finish_chatgpt_operation()
 
 @app.post("/api/open-profile")
@@ -3177,6 +6748,16 @@ async def open_profile():
 
     if not _try_start_chatgpt_operation("profile"):
         return {"success": False, "error": CHATGPT_BUSY_ERROR}
+
+    browser_status = await asyncio.to_thread(
+        chatgpt_browser_service.stop_browser_service
+    )
+    if browser_status.get("process_alive"):
+        _finish_chatgpt_operation()
+        return {
+            "success": False,
+            "error": "Không thể dừng trình duyệt ChatGPT nền để mở profile.",
+        }
 
     async def _launch():
         try:
@@ -3188,21 +6769,42 @@ async def open_profile():
                     args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
                     ignore_default_args=["--enable-automation"]
                 )
+                account = account_store.load_account()
                 try:
-                    page = await context.new_page()
+                    current_cookies = await context.cookies(
+                        ["https://chatgpt.com/", "https://auth.openai.com/"]
+                    )
+                    restorable = account_store.select_restorable_chatgpt_cookies(
+                        account.get("session_cookie") or [],
+                        current_cookies,
+                    )
+                    if restorable:
+                        await context.add_cookies(restorable)
+                    page = context.pages[0] if context.pages else await context.new_page()
                     await page.goto("https://chatgpt.com/")
                     await page.wait_for_timeout(600000) # 10 mins
                 except Exception:
                     pass
                 finally:
+                    try:
+                        refreshed_cookies = await context.cookies(
+                            ["https://chatgpt.com/", "https://auth.openai.com/"]
+                        )
+                        if account_store.has_chatgpt_auth_cookie(refreshed_cookies):
+                            account["session_cookie"] = refreshed_cookies
+                            account_store.save_account(account)
+                    except Exception:
+                        pass
                     await context.close()
         finally:
+            await asyncio.to_thread(chatgpt_browser_service.start_browser_service)
             _finish_chatgpt_operation()
 
     # Launch as a separate asyncio task so it doesn't block the API
     try:
         asyncio.create_task(_launch())
     except Exception:
+        await asyncio.to_thread(chatgpt_browser_service.start_browser_service)
         _finish_chatgpt_operation()
         raise
     return {"success": True, "message": "Browser profile opened on server."}

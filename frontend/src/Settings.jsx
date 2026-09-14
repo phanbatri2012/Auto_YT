@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import './Settings.css';
+import YouTubeChannelSettings from './YouTubeChannelSettings';
 
 const DEFAULT_PIPELINE = {
   metadata: true,
@@ -33,9 +34,28 @@ const PIPELINE_STEPS = [
   {
     key: 'audio',
     label: 'Tự động tạo audio',
-    description: 'Tự kiểm duyệt kịch bản và gửi sang Genmax bằng giọng đã chọn.'
+    description: 'Tự kiểm duyệt kịch bản và gửi đúng nhà cung cấp của giọng đã chọn.'
   }
 ];
+
+function ProviderVoiceOptions({ voices }) {
+  const providerNames = { genmax: 'Genmax', omnivoice: 'OmniVoice' };
+  const groups = voices.reduce((result, voice) => {
+    const providerId = voice.provider_id || 'genmax';
+    if (!result[providerId]) result[providerId] = [];
+    result[providerId].push(voice);
+    return result;
+  }, {});
+  return Object.entries(groups).map(([providerId, items]) => (
+    <optgroup key={providerId} label={providerNames[providerId] || providerId}>
+      {items.map(voice => (
+        <option key={voice.id} value={voice.id}>
+          [{providerNames[providerId] || providerId}] {voice.name}
+        </option>
+      ))}
+    </optgroup>
+  ));
+}
 
 export default function Settings({
   lockedPromptVersion = '',
@@ -43,72 +63,70 @@ export default function Settings({
 }) {
   const [promptsData, setPromptsData] = useState(null);
   const [voicesData, setVoicesData] = useState(null);
+  const [youtubeChannels, setYoutubeChannels] = useState([]);
+  const [browserAutomation, setBrowserAutomation] = useState({
+    worker_headless: true,
+    game_mode: false
+  });
+  const [browserService, setBrowserService] = useState({
+    connected: false,
+    process_alive: false,
+    window_visible: false,
+    state: 'stopped',
+    message: 'Đang kiểm tra trình duyệt ChatGPT nền...'
+  });
   const [activeVersion, setActiveVersion] = useState('');
   const [loadingMsg, setLoadingMsg] = useState('');
   const [resultMsg, setResultMsg] = useState('');
+  const [resultSection, setResultSection] = useState('');
   const [savingSection, setSavingSection] = useState('');
+
+  const fetchBrowserServiceStatus = async () => {
+    try {
+      const response = await fetch(
+        'http://127.0.0.1:8080/api/chatgpt-browser-service'
+      );
+      if (!response.ok) return;
+      setBrowserService(await response.json());
+    } catch (err) {
+      console.error('Lỗi khi kiểm tra Browser Service:', err);
+    }
+  };
 
   useEffect(() => {
     fetchData();
+    const intervalId = window.setInterval(fetchBrowserServiceStatus, 5000);
+    return () => window.clearInterval(intervalId);
   }, []);
 
   const fetchData = async () => {
     try {
-      const [promptsResponse, voicesResponse] = await Promise.all([
+      const [promptsResponse, voicesResponse, channelsResponse, browserResponse, serviceResponse] = await Promise.all([
         fetch('http://127.0.0.1:8080/api/prompts'),
-        fetch('http://127.0.0.1:8080/api/voices')
+        fetch('http://127.0.0.1:8080/api/voices'),
+        fetch('http://127.0.0.1:8080/api/youtube-comments/channels'),
+        fetch('http://127.0.0.1:8080/api/browser-automation'),
+        fetch('http://127.0.0.1:8080/api/chatgpt-browser-service')
       ]);
       const prompts = await promptsResponse.json();
       const voices = await voicesResponse.json();
+      const channels = await channelsResponse.json();
+      const browserSettings = await browserResponse.json();
+      const serviceStatus = await serviceResponse.json();
       setPromptsData(prompts);
       setVoicesData(voices);
+      setYoutubeChannels(Array.isArray(channels.items) ? channels.items : []);
+      if (browserResponse.ok) {
+        setBrowserAutomation({
+          worker_headless: browserSettings.worker_headless ?? true,
+          game_mode: browserSettings.game_mode ?? false
+        });
+      }
+      if (serviceResponse.ok) setBrowserService(serviceStatus);
       setActiveVersion(prompts.active_version);
     } catch (err) {
       console.error("Lỗi khi lấy prompts:", err);
     }
-  };
-
-  const handleVoiceChange = (index, field, value) => {
-    setVoicesData(prev => {
-      const previousVoice = prev.voices[index];
-      return {
-        ...prev,
-        active_voice_id:
-          field === 'id' && prev.active_voice_id === previousVoice.id
-            ? value
-            : prev.active_voice_id,
-        voices: prev.voices.map((voice, voiceIndex) =>
-          voiceIndex === index ? { ...voice, [field]: value } : voice
-        )
-      };
-    });
-  };
-
-  const handleAddVoice = () => {
-    setVoicesData(prev => ({
-      ...prev,
-      voices: [...prev.voices, { id: '', name: '' }]
-    }));
-  };
-
-  const handleRemoveVoice = (index) => {
-    setVoicesData(prev => {
-      if (prev.voices.length <= 1) {
-        alert('Phải giữ lại ít nhất một giọng đọc.');
-        return prev;
-      }
-      const voices = prev.voices.filter((_, voiceIndex) => voiceIndex !== index);
-      const activeVoiceExists = voices.some(
-        voice => voice.id === prev.active_voice_id
-      );
-      return {
-        ...prev,
-        voices,
-        active_voice_id: activeVoiceExists
-          ? prev.active_voice_id
-          : voices[0].id
-      };
-    });
   };
 
   const handlePromptChange = (key, value) => {
@@ -166,6 +184,19 @@ export default function Settings({
     }));
   };
 
+  const handlePromptDefaultYoutubeChannelChange = (channelId) => {
+    setPromptsData(prev => ({
+      ...prev,
+      versions: {
+        ...prev.versions,
+        [activeVersion]: {
+          ...prev.versions[activeVersion],
+          default_youtube_channel_id: channelId
+        }
+      }
+    }));
+  };
+
   const handlePipelineChange = (stepKey, enabled) => {
     setPromptsData(prev => ({
       ...prev,
@@ -204,6 +235,8 @@ export default function Settings({
         project_url: newData.versions[activeVersion].project_url,
         default_voice_id:
           newData.versions[activeVersion].default_voice_id || '',
+        default_youtube_channel_id:
+          newData.versions[activeVersion].default_youtube_channel_id || '',
         pipeline: {
           ...DEFAULT_PIPELINE,
           ...(newData.versions[activeVersion].pipeline || {})
@@ -247,10 +280,20 @@ export default function Settings({
       setSavingSection(sectionKey);
       setLoadingMsg(loadingText);
       setResultMsg('');
+      setResultSection(sectionKey);
       const response = await request();
-      const result = await response.json();
+      const contentType = response.headers.get('content-type') || '';
+      const result = contentType.includes('application/json')
+        ? await response.json()
+        : { detail: await response.text() };
       if (!response.ok) {
-        throw new Error(result.detail || 'Không thể lưu thiết lập.');
+        const compatibilityHint = response.status === 404
+          ? ' Backend chưa nạp phiên bản API mới; hãy khởi động lại hệ thống.'
+          : '';
+        throw new Error(
+          (result.detail || `Không thể lưu thiết lập (${response.status}).`) +
+          compatibilityHint
+        );
       }
       setResultMsg(`✅ ${successText}`);
       return result;
@@ -323,6 +366,35 @@ export default function Settings({
     );
   };
 
+  const handleSavePromptDefaultYoutubeChannel = async () => {
+    const versionId = activeVersion;
+    const channelId = (
+      promptsData.versions[versionId].default_youtube_channel_id || ''
+    );
+    const result = await saveSection(
+      'prompt-default-youtube-channel',
+      'Đang lưu kênh YouTube mặc định của bộ prompt...',
+      'Đã lưu kênh YouTube mặc định của bộ prompt.',
+      () => fetch(
+        `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/default-youtube-channel`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ channel_id: channelId })
+        }
+      )
+    );
+    if (result && activeVersion === versionId) {
+      setPromptsData(prev => ({
+        ...prev,
+        versions: {
+          ...prev.versions,
+          [versionId]: result.version
+        }
+      }));
+    }
+  };
+
   const handleSavePipeline = async () => {
     const versionId = activeVersion;
     const pipeline = {
@@ -356,18 +428,46 @@ export default function Settings({
     }
   };
 
-  const handleSaveVoices = async () => {
+  const handleSaveBrowserAutomation = async () => {
     const result = await saveSection(
-      'voices',
-      'Đang lưu danh sách giọng...',
-      'Đã lưu danh sách và giọng mặc định.',
-      () => fetch('http://127.0.0.1:8080/api/voices', {
-        method: 'POST',
+      'browser-automation',
+      'Đang lưu chế độ trình duyệt ChatGPT...',
+      'Đã lưu chế độ trình duyệt ChatGPT.',
+      () => fetch('http://127.0.0.1:8080/api/browser-automation', {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(voicesData)
+        body: JSON.stringify(browserAutomation)
       })
     );
-    if (result) setVoicesData(result);
+    if (result) setBrowserAutomation(result);
+  };
+
+  const handleBrowserServiceAction = async (action) => {
+    const starting = action === 'start';
+    const showing = action === 'show';
+    const hiding = action === 'hide';
+    const result = await saveSection(
+      `browser-service-${action}`,
+      starting
+        ? 'Đang khởi động trình duyệt ChatGPT nền...'
+        : showing
+          ? 'Đang đưa trình duyệt ChatGPT ra màn hình...'
+          : hiding
+            ? 'Đang ẩn trình duyệt ChatGPT...'
+            : 'Đang dừng trình duyệt ChatGPT nền...',
+      starting
+        ? 'Trình duyệt ChatGPT nền đã được khởi động.'
+        : showing
+          ? 'Trình duyệt ChatGPT đang hiển thị trên màn hình.'
+          : hiding
+            ? 'Trình duyệt ChatGPT đã được ẩn.'
+            : 'Trình duyệt ChatGPT nền đã dừng.',
+      () => fetch(
+        `http://127.0.0.1:8080/api/chatgpt-browser-service/${action}`,
+        { method: 'POST' }
+      )
+    );
+    if (result) setBrowserService(result);
   };
 
   const handleSavePrompt = (promptKey, promptLabel) => {
@@ -411,16 +511,21 @@ export default function Settings({
       setSavingSection('all');
       setLoadingMsg('Đang lưu thiết lập...');
       setResultMsg('');
-      const voicesResponse = await fetch('http://127.0.0.1:8080/api/voices', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(voicesData)
-      });
-      const voicesResult = await voicesResponse.json();
-      if (!voicesResponse.ok) {
-        throw new Error(voicesResult.detail || 'Không thể lưu danh sách giọng.');
+      const browserResponse = await fetch(
+        'http://127.0.0.1:8080/api/browser-automation',
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(browserAutomation)
+        }
+      );
+      const browserResult = await browserResponse.json();
+      if (!browserResponse.ok) {
+        throw new Error(
+          browserResult.detail || 'Không thể lưu chế độ trình duyệt ChatGPT.'
+        );
       }
-      setVoicesData(voicesResult);
+      setBrowserAutomation(browserResult);
 
       const promptsResponse = await fetch('http://127.0.0.1:8080/api/prompts', {
         method: 'POST',
@@ -434,7 +539,7 @@ export default function Settings({
       setResultMsg(
         lockedPromptVersion
           ? '✅ Đã lưu các thiết lập khác. Bộ prompt đang chạy được giữ nguyên.'
-          : '✅ Đã lưu cấu hình Prompt và giọng đọc thành công!'
+          : '✅ Đã lưu cấu hình Prompt và trình duyệt thành công!'
       );
     } catch (err) {
       setResultMsg('❌ ' + err.message);
@@ -462,6 +567,15 @@ export default function Settings({
   const promptDefaultVoiceMissing = Boolean(
     promptDefaultVoiceId &&
     !voicesData.voices.some(voice => voice.id === promptDefaultVoiceId)
+  );
+  const promptDefaultYoutubeChannelId = (
+    currentVersion.default_youtube_channel_id || ''
+  );
+  const promptDefaultYoutubeChannelMissing = Boolean(
+    promptDefaultYoutubeChannelId &&
+    !youtubeChannels.some(
+      channel => channel.channel_id === promptDefaultYoutubeChannelId
+    )
   );
   const currentPipeline = {
     ...DEFAULT_PIPELINE,
@@ -625,6 +739,126 @@ export default function Settings({
           thể quản lý các bộ prompt khác và danh sách giọng đọc.
         </div>
       )}
+
+      <div className="prompt-item" style={{ marginBottom: '20px' }}>
+        <div className="prompt-header">
+          <div>
+            <label>🕶️ Trình duyệt ChatGPT cho job tự động</label>
+            <div className="help-text" style={{ marginTop: '5px' }}>
+              Hệ thống khởi động Chromium một lần và mọi job dùng lại cùng phiên qua
+              kết nối nội bộ. Nếu phiên nền mất kết nối, job sẽ tạm dừng thay vì tự mở
+              cửa sổ mới. Auto Login và Open Profile chỉ hiện khi chính bạn bấm.
+            </div>
+          </div>
+          <button
+            className="btn-save section-save-button"
+            onClick={handleSaveBrowserAutomation}
+            disabled={Boolean(savingSection)}
+          >
+            💾 Lưu
+          </button>
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            flexWrap: 'wrap',
+            gap: '10px',
+            marginTop: '12px'
+          }}
+        >
+          <span
+            role="status"
+            style={{
+              color: browserService.connected ? '#4ce0b3' : '#f5b041',
+              fontWeight: 700
+            }}
+          >
+            {browserService.connected ? '● Đã kết nối' : '● Chưa kết nối'}
+          </span>
+          <span className="help-text" style={{ flex: '1 1 280px' }}>
+            {browserService.message}
+          </span>
+          <button
+            className="btn-secondary"
+            onClick={() => handleBrowserServiceAction(
+              browserService.window_visible ? 'hide' : 'show'
+            )}
+            disabled={
+              Boolean(savingSection) ||
+              !browserService.connected
+            }
+          >
+            {browserService.window_visible
+              ? '🙈 Ẩn trình duyệt'
+              : '👁 Hiện trình duyệt'}
+          </button>
+          <button
+            className="btn-secondary"
+            onClick={() => handleBrowserServiceAction('start')}
+            disabled={
+              Boolean(savingSection) ||
+              Boolean(chatGptOperation) ||
+              browserService.connected ||
+              browserService.state === 'starting'
+            }
+          >
+            ▶ Khởi động trình duyệt nền
+          </button>
+          <button
+            className="btn-danger"
+            onClick={() => handleBrowserServiceAction('stop')}
+            disabled={
+              Boolean(savingSection) ||
+              Boolean(chatGptOperation) ||
+              !browserService.process_alive
+            }
+          >
+            ■ Dừng
+          </button>
+        </div>
+        <div className="pipeline-options" style={{ marginTop: '12px' }}>
+          <label className="pipeline-option">
+            <input
+              type="checkbox"
+              checked={browserAutomation.worker_headless}
+              onChange={event => setBrowserAutomation(previous => ({
+                ...previous,
+                worker_headless: event.target.checked
+              }))}
+            />
+            <span>
+              <strong>Chạy job ChatGPT ẩn</strong>
+              <small>Áp dụng ở lần khởi động Browser Service tiếp theo.</small>
+            </span>
+          </label>
+          <label className="pipeline-option">
+            <input
+              type="checkbox"
+              checked={browserAutomation.game_mode}
+              onChange={event => setBrowserAutomation(previous => ({
+                ...previous,
+                game_mode: event.target.checked
+              }))}
+            />
+            <span>
+              <strong>Chế độ chơi game</strong>
+              <small>Giữ Chromium nền ngoài màn hình và không cho job tự bật lại.</small>
+            </span>
+          </label>
+        </div>
+        {!browserAutomation.worker_headless && !browserAutomation.game_mode && (
+          <div className="help-text" style={{ marginTop: '10px', color: '#f5b041' }}>
+            ⚠️ Job ChatGPT có thể mở cửa sổ và làm mất focus ứng dụng đang dùng.
+          </div>
+        )}
+      </div>
+
+      <YouTubeChannelSettings
+        onChannelsChange={setYoutubeChannels}
+        promptVersions={promptsData.versions}
+        activePromptVersion={activeVersion}
+      />
       
       <div className="version-control">
         <div className="version-editor">
@@ -701,11 +935,7 @@ export default function Settings({
               ⚠️ Giọng đã bị xóa — sẽ dùng giọng mặc định chung
             </option>
           )}
-          {voicesData.voices.map(voice => (
-            <option key={voice.id} value={voice.id}>
-              {voice.name}
-            </option>
-          ))}
+          <ProviderVoiceOptions voices={voicesData.voices} />
         </select>
       </div>
 
@@ -733,6 +963,56 @@ export default function Settings({
           style={{ width: '100%', marginTop: '12px' }}
           disabled={activeVersionLocked}
         />
+      </div>
+
+      <div className="prompt-item" style={{ marginBottom: '20px' }}>
+        <div className="prompt-header">
+          <div>
+            <label>📺 Kênh YouTube mặc định của bộ prompt</label>
+            <div className="help-text" style={{ marginTop: '5px' }}>
+              Mọi video cũ và mới thuộc bộ prompt này sẽ tự chọn kênh này khi
+              gắn link đã đăng và đồng bộ bình luận.
+            </div>
+          </div>
+          <button
+            className="btn-save section-save-button"
+            onClick={handleSavePromptDefaultYoutubeChannel}
+            disabled={Boolean(savingSection) || activeVersionLocked}
+          >
+            💾 Lưu
+          </button>
+        </div>
+        <select
+          value={promptDefaultYoutubeChannelId}
+          onChange={(event) => handlePromptDefaultYoutubeChannelChange(event.target.value)}
+          className="version-select"
+          style={{ width: '100%', marginTop: '12px' }}
+          disabled={activeVersionLocked}
+        >
+          <option value="">Chưa chọn kênh mặc định</option>
+          {promptDefaultYoutubeChannelMissing && (
+            <option value={promptDefaultYoutubeChannelId}>
+              ⚠️ Kênh đã ngắt kết nối — hãy chọn lại
+            </option>
+          )}
+          {youtubeChannels.map(channel => (
+            <option key={channel.channel_id} value={channel.channel_id}>
+              {channel.title}
+            </option>
+          ))}
+        </select>
+        {!youtubeChannels.length && (
+          <div className="help-text" style={{ marginTop: 8, color: '#f5b041' }}>
+            Hãy kết nối kênh YouTube ở mục phía trên trước khi chọn.
+          </div>
+        )}
+        {resultSection === 'prompt-default-youtube-channel' &&
+          (loadingMsg || resultMsg) && (
+            <div className="status-box inline-save-status" role="status">
+              {loadingMsg && <p className="loading">{loadingMsg}</p>}
+              {resultMsg && <p className="result">{resultMsg}</p>}
+            </div>
+          )}
       </div>
 
       <div className="prompt-item" style={{ marginBottom: '20px' }}>
@@ -778,89 +1058,8 @@ export default function Settings({
         </div>
       </div>
 
-      <div className="prompt-item" style={{ marginBottom: '20px' }}>
-        <div className="prompt-header" style={{ alignItems: 'center' }}>
-          <div>
-            <label>🎙️ Quản lý giọng đọc Genmax</label>
-            <div className="help-text" style={{ marginTop: '5px' }}>
-              Nhập UUID của giọng tùy chỉnh hoặc mã giọng hệ thống từ Genmax.
-            </div>
-          </div>
-          <div className="prompt-header-actions">
-            <button
-              className="btn-save section-save-button"
-              onClick={handleSaveVoices}
-              disabled={Boolean(savingSection)}
-            >
-              💾 Lưu
-            </button>
-            <button className="btn-secondary" onClick={handleAddVoice}>
-              ➕ Thêm giọng
-            </button>
-          </div>
-        </div>
-
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: '10px',
-          margin: '15px 0', flexWrap: 'wrap'
-        }}>
-          <label style={{ color: '#fff', fontWeight: 'bold' }}>
-            Giọng mặc định chung (dự phòng):
-          </label>
-          <select
-            value={voicesData.active_voice_id}
-            onChange={(event) => setVoicesData(prev => ({
-              ...prev,
-              active_voice_id: event.target.value
-            }))}
-            className="version-select"
-          >
-            {voicesData.voices.map((voice, index) => (
-              <option key={`${voice.id}-${index}`} value={voice.id}>
-                {voice.name || `Giọng ${index + 1}`}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-          {voicesData.voices.map((voice, index) => (
-            <div
-              key={index}
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'minmax(180px, 0.8fr) minmax(300px, 1.5fr) auto',
-                gap: '10px',
-                alignItems: 'center'
-              }}
-            >
-              <input
-                value={voice.name}
-                onChange={(event) => handleVoiceChange(index, 'name', event.target.value)}
-                placeholder="Tên giọng"
-                className="version-select"
-                style={{ width: '100%' }}
-              />
-              <input
-                value={voice.id}
-                onChange={(event) => handleVoiceChange(index, 'id', event.target.value)}
-                placeholder="Voice ID (UUID hoặc mã giọng hệ thống)"
-                className="version-select"
-                style={{ width: '100%' }}
-              />
-              <button
-                className="btn-danger"
-                onClick={() => handleRemoveVoice(index)}
-                title="Xóa giọng đọc"
-              >
-                🗑️
-              </button>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {(loadingMsg || resultMsg) && (
+      {(loadingMsg || resultMsg) &&
+        resultSection !== 'prompt-default-youtube-channel' && (
         <div className="status-box" style={{marginBottom: '20px'}}>
           {loadingMsg && <p className="loading">{loadingMsg}</p>}
           {resultMsg && <p className="result">{resultMsg}</p>}

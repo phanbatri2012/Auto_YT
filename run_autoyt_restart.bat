@@ -1,25 +1,31 @@
-﻿@echo off
+@echo off
 setlocal EnableExtensions
-chcp 65001 >nul
 cd /d "%~dp0"
 
-title Restart Auto YT
+title Restart Auto_YT
+set "AUTOYT_NO_PAUSE=1"
 
-echo ===================================================
-echo KHOI DONG LAI HE THONG AUTO YT
-echo ===================================================
+echo [Auto_YT] Stopping the current system...
+call "%~dp0run_autoyt_stop.bat"
+set "AUTOYT_STOP_EXIT_CODE=%ERRORLEVEL%"
+if not "%AUTOYT_STOP_EXIT_CODE%"=="0" (
+    echo.
+    echo Auto_YT restart aborted because the current system could not be stopped safely.
+    if not defined AUTOYT_RESTART_NO_PAUSE pause
+    exit /b %AUTOYT_STOP_EXIT_CODE%
+)
+
 echo.
-echo Dang tat cac tien trinh dang chay ngam (Backend va Frontend)...
+echo [Auto_YT] Starting the system again...
+call "%~dp0run_autoyt.bat" %*
+set "AUTOYT_START_EXIT_CODE=%ERRORLEVEL%"
+if not "%AUTOYT_START_EXIT_CODE%"=="0" (
+    echo.
+    echo Auto_YT stopped successfully but failed to start again. Review data\logs.
+    if not defined AUTOYT_RESTART_NO_PAUSE pause
+    exit /b %AUTOYT_START_EXIT_CODE%
+)
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue | Where-Object State -eq 'Listen' | Select-Object -ExpandProperty OwningProcess | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }"
-
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-NetTCPConnection -LocalPort 5173 -ErrorAction SilentlyContinue | Where-Object State -eq 'Listen' | Select-Object -ExpandProperty OwningProcess | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }"
-
-echo Da tat thanh cong!
 echo.
-echo Dang bat lai he thong...
-echo.
-
-call run_autoyt.bat
-
+echo Auto_YT restarted successfully.
 exit /b 0

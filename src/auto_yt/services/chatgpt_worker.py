@@ -1,11 +1,13 @@
 import sys
 import time
 import asyncio
+import base64
 import json
 import os
 import re
 import uuid
 import hashlib
+from contextlib import closing
 from urllib.parse import parse_qs, urlparse
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright, Page
@@ -13,6 +15,7 @@ from auto_yt.paths import gpt_profile_dir, PROMPTS_PATH, THUMBNAILS_DIR
 from auto_yt.default_prompts import DEFAULT_PROMPTS_DATA
 from auto_yt.services.chatgpt_projects import (
     CHATGPT_PROJECT_URL_ENV,
+    DEFAULT_CHATGPT_BOOTSTRAP_URL,
     DEFAULT_CHATGPT_PROJECT_URL,
     PROMPT_PIPELINE_ENV,
     get_project_url,
@@ -22,6 +25,17 @@ from auto_yt.services.chatgpt_projects import (
 from auto_yt.services.generation_checkpoint import (
     load_checkpoint,
     save_checkpoint,
+)
+from auto_yt.services.audio_review import looks_like_editorial_artifact
+from auto_yt.services.network_security import (
+    MAX_IMAGE_DOWNLOAD_BYTES,
+    validate_chatgpt_image_url,
+    validate_image_bytes,
+)
+from auto_yt.services import chatgpt_browser_service
+from auto_yt.services.chatgpt_runtime import (
+    ChatGPTAttentionRequiredError,
+    encode_attention_error,
 )
 
 if sys.platform == "win32":
@@ -35,16 +49,42 @@ _HERE = __import__('pathlib').Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parent.parent.parent))
 
 DEFAULT_GPT_PROFILE = "PROFILE_GPT_1"
-PROFILE_WAIT_TIMEOUT_SECONDS = 20 * 60
-PROFILE_RETRY_INTERVAL_SECONDS = 5
+CHATGPT_BROWSER_CONNECT_TIMEOUT_SECONDS = 15
+CHATGPT_BROWSER_CONNECT_RETRY_SECONDS = 1
 CHATGPT_RESPONSE_TIMEOUT_SECONDS = 20 * 60
 CHAPTER_LATE_RESPONSE_GRACE_SECONDS = 5 * 60
 ASSISTANT_RESPONSE_WAIT_SECONDS = 30
 ASSISTANT_RESPONSE_POLL_SECONDS = 0.5
 ASSISTANT_RESPONSE_STABLE_SECONDS = 5
 ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS = 1
+CHATGPT_COMPOSER_RECOVERY_ATTEMPTS = 3
+CHATGPT_COMPOSER_WAIT_PER_ATTEMPT_MS = 20_000
+CHATGPT_PAGE_RECOVERY_SETTLE_MS = 1_500
+CHATGPT_NAVIGATION_TIMEOUT_MS = 60_000
+CHATGPT_PROJECT_NAVIGATION_ATTEMPTS = 2
+CHATGPT_PROMPT_SUBMISSION_TIMEOUT_MS = 30_000
+EXTERNAL_APP_PERMISSION_CLICK_TIMEOUT_MS = 5_000
+EXTERNAL_APP_PERMISSION_DIALOG_SELECTOR = '[role="dialog"], [role="alertdialog"]'
+EXTERNAL_APP_PERMISSION_DIALOG_MARKER_GROUPS = (
+    (
+        "search outside this project",
+        "chatgpt will use",
+        "help answer your request",
+    ),
+    (
+        "tìm kiếm bên ngoài dự án này",
+        "chatgpt sẽ sử dụng",
+        "giúp trả lời yêu cầu của bạn",
+    ),
+)
+EXTERNAL_APP_PERMISSION_DENY_LABELS = (
+    "deny",
+    "don't allow",
+    "do not allow",
+    "từ chối",
+    "không cho phép",
+)
 OUTLINE_PART_MAX_CHARS = 3000
-NARRATIVE_CONTEXT_MIN_CHARS = 160
 NARRATIVE_ARTIFACT_MAX_WORDS = 14
 THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS = 5 * 60
 THUMBNAIL_TURN_WAIT_TIMEOUT_SECONDS = 30
@@ -53,22 +93,6 @@ NARRATIVE_ONLY_INSTRUCTION = (
     "\n\nYÊU CẦU ĐẦU RA CHO PHẦN NỘI DUNG: Chỉ viết văn xuôi liền mạch. "
     "Không chèn tiêu đề, nhãn chuyển đoạn, dàn ý, ghi chú biên tập hoặc "
     "chỉ dẫn về cách viết."
-)
-NARRATIVE_EDITORIAL_PREFIXES = (
-    "bổ sung ",
-    "chuyển ý",
-    "dẫn dắt ",
-    "đào sâu ",
-    "giải thích ",
-    "giữ nhịp",
-    "khai thác ",
-    "kết nối ",
-    "làm rõ ",
-    "mở rộng ",
-    "nhấn mạnh ",
-    "nêu bật ",
-    "tăng nhịp",
-    "triển khai ",
 )
 THUMBNAIL_IMAGE_SELECTOR = (
     'img[src*="backend-api/estuary"], '
@@ -82,11 +106,58 @@ THUMBNAIL_REPAIR_PROMPT = (
 THUMBNAIL_REGENERATE_PROMPT = (
     "Tạo ảnh theo prompt vừa được sửa ở ngay trên. Lưu ý: chỉ cần xuất ảnh của prompt mới sửa"
 )
-PROFILE_BUSY_ERROR_MARKERS = (
-    "Opening in existing browser session",
-    "profile is already in use",
-    "ProcessSingleton",
+URL_LIKE_TOKEN_PATTERN = re.compile(
+    r"(?:https?://|www\.)[^\s<>{}\[\]\"']+"
+    r"|\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
+    r"[a-z]{2,}(?:/[^\s<>{}\[\]\"']*)?",
+    flags=re.IGNORECASE,
 )
+JSON_STRING_LITERAL_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"', flags=re.DOTALL)
+CORRUPTED_UNICODE_PATTERN = re.compile(
+    r"(?:(?<=\w)\?|(?<=\?)\?|\?(?=\w)|\?(?=\?))",
+    flags=re.UNICODE,
+)
+MIN_CORRUPTED_UNICODE_MARKERS = 3
+
+
+def download_chatgpt_image_via_page(page: Page, chatgpt_url: str) -> str:
+    """Persist one authenticated ChatGPT PNG after URL, redirect and size checks."""
+    validate_chatgpt_image_url(chatgpt_url)
+    payload = page.evaluate(
+        """
+        async ({ url, maxBytes }) => {
+            const response = await fetch(url, { credentials: 'include' });
+            if (!response.ok) throw new Error(`Image download failed: ${response.status}`);
+            const declaredSize = Number(response.headers.get('content-length') || 0);
+            if (declaredSize > maxBytes) throw new Error('Image exceeds size limit');
+            const buffer = await response.arrayBuffer();
+            if (buffer.byteLength > maxBytes) throw new Error('Image exceeds size limit');
+            const bytes = new Uint8Array(buffer);
+            let binary = '';
+            const chunkSize = 0x8000;
+            for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+                binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+            }
+            return {
+                base64: btoa(binary),
+                finalUrl: response.url,
+                contentType: response.headers.get('content-type') || ''
+            };
+        }
+        """,
+        {"url": chatgpt_url, "maxBytes": MAX_IMAGE_DOWNLOAD_BYTES},
+    )
+    validate_chatgpt_image_url(str(payload.get("finalUrl") or ""))
+    content_type = str(payload.get("contentType") or "").split(";", 1)[0].casefold()
+    if content_type != "image/png":
+        raise ValueError("Generated thumbnail did not return PNG content.")
+    image_bytes = base64.b64decode(payload.get("base64") or "", validate=True)
+    validate_image_bytes(image_bytes)
+    THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"thumb_{uuid.uuid4().hex[:12]}.png"
+    destination = THUMBNAILS_DIR / filename
+    destination.write_bytes(image_bytes)
+    return f"/api/thumbnails/{filename}"
 THUMBNAIL_GENERATION_ERROR_MARKERS = (
     "something went wrong",
     "please try again",
@@ -242,6 +313,52 @@ def get_assistant_message_count(page: Page) -> int:
         ).count()
     except Exception:
         return 0
+
+
+def get_user_message_count(page: Page) -> int:
+    try:
+        return page.locator(
+            '[data-message-author-role="user"]'
+        ).count()
+    except Exception:
+        return 0
+
+
+def dismiss_external_app_permission_dialog(page: Page) -> bool:
+    """Deny a connector request that would search outside the current Project."""
+    dialogs = page.locator(EXTERNAL_APP_PERMISSION_DIALOG_SELECTOR)
+    for dialog_index in range(dialogs.count()):
+        dialog = dialogs.nth(dialog_index)
+        if not dialog.is_visible():
+            continue
+
+        dialog_text = " ".join(dialog.inner_text().casefold().split())
+        is_external_app_permission = any(
+            all(marker in dialog_text for marker in marker_group)
+            for marker_group in EXTERNAL_APP_PERMISSION_DIALOG_MARKER_GROUPS
+        )
+        if not is_external_app_permission:
+            continue
+
+        buttons = dialog.locator("button")
+        for button_index in range(buttons.count()):
+            button = buttons.nth(button_index)
+            button_text = button.inner_text().strip()
+            if not button_text:
+                button_text = button.get_attribute("aria-label") or ""
+            normalized_label = " ".join(button_text.casefold().split())
+            if normalized_label not in EXTERNAL_APP_PERMISSION_DENY_LABELS:
+                continue
+
+            button.click(timeout=EXTERNAL_APP_PERMISSION_CLICK_TIMEOUT_MS)
+            print(
+                ">>> Denied ChatGPT access to an external app outside the "
+                "configured Project; continuing to wait for the current response.",
+                file=sys.stderr,
+            )
+            return True
+
+    return False
 
 
 def get_response_turn_baseline(
@@ -536,44 +653,483 @@ def ensure_expected_conversation_page(
         )
 
 
+def is_expected_project_conversation_url(
+    actual_url: str,
+    project_url: str,
+) -> bool:
+    actual = urlparse(str(actual_url or "").strip())
+    project = urlparse(str(project_url or "").strip())
+    actual_parts = actual.path.strip("/").split("/")
+    project_parts = project.path.strip("/").split("/")
+    return (
+        actual.scheme == project.scheme == "https"
+        and actual.netloc == project.netloc == "chatgpt.com"
+        and len(project_parts) == 3
+        and project_parts[0] == "g"
+        and project_parts[2] == "project"
+        and len(actual_parts) == 4
+        and actual_parts[0] == "g"
+        and actual_parts[1] == project_parts[1]
+        and actual_parts[2] == "c"
+        and bool(actual_parts[3])
+    )
+
+
+def ensure_expected_project_conversation_page(
+    actual_url: str,
+    project_url: str,
+) -> None:
+    if not is_expected_project_conversation_url(actual_url, project_url):
+        raise RuntimeError(
+            "ChatGPT created or opened a conversation outside the configured "
+            "Project. No automatic resend was attempted."
+        )
+
+
+def get_project_sidebar_slug(project_url: str) -> str:
+    project_identifier = urlparse(project_url).path.strip("/").split("/")[1]
+    match = re.match(r"^g-p-[0-9a-f]{32}-(.+)$", project_identifier, re.I)
+    return match.group(1) if match else project_identifier.removeprefix("g-p-")
+
+
+def open_configured_project_from_sidebar(page: Page, project_url: str) -> bool:
+    """Open a Project through ChatGPT's healthy client-side sidebar.
+
+    Project rows are interactive ``div`` elements rather than links. Directly
+    loading ``/project`` can leave ChatGPT on its full-page "Try again" state,
+    while the same route works when reached through the hydrated home shell.
+    This helper only expands sidebar rows and clicks their non-destructive
+    "Open project home" control; it never submits a prompt.
+    """
+    project_identifier = urlparse(project_url).path.strip("/").split("/")[1]
+    project_slug = get_project_sidebar_slug(project_url)
+    result = page.evaluate(
+        """async ({ projectIdentifier, projectSlug }) => {
+            const delay = (milliseconds) => new Promise(
+                (resolve) => setTimeout(resolve, milliseconds)
+            );
+            const normalize = (value) => (value || '')
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, ' ')
+                .trim();
+            const normalizedSlug = normalize(projectSlug.replace(/-/g, ' '));
+
+            const getRows = () => [...document.querySelectorAll(
+                'button[aria-label^="Open project options for "]'
+            )].map((optionsButton) => {
+                const controls = optionsButton.parentElement;
+                const group = controls?.parentElement;
+                const row = group?.querySelector(
+                    '[data-sidebar-item][role="button"]'
+                );
+                const homeButton = controls?.querySelector(
+                    'button[aria-label="Open project home"]'
+                );
+                const label = row?.innerText?.trim()
+                    || optionsButton.getAttribute('aria-label')
+                        ?.replace(/^Open project options for\s+/, '')
+                    || '';
+                return { group, row, homeButton, label };
+            }).filter((item) => item.row && item.homeButton);
+
+            const expandMoreSidebarItems = async () => {
+                const buttons = [...document.querySelectorAll(
+                    'button, [role="button"]'
+                )].filter((element) => {
+                    const text = normalize(
+                        element.innerText || element.textContent
+                    );
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0
+                        && rect.height > 0
+                        && (text === 'show more' || text === 'hien them');
+                });
+                for (const button of buttons.slice(0, 4)) {
+                    button.click();
+                    await delay(150);
+                }
+            };
+
+            let rows = getRows();
+            let selected = rows.find(
+                (item) => normalize(item.label) === normalizedSlug
+            );
+            if (!selected) {
+                await expandMoreSidebarItems();
+                rows = getRows();
+                selected = rows.find(
+                    (item) => normalize(item.label) === normalizedSlug
+                );
+            }
+
+            // When the URL slug and display name differ, identify the row by
+            // expanding it and checking its project-scoped conversation links.
+            if (!selected) {
+                for (const item of rows) {
+                    if (item.row.getAttribute('aria-expanded') !== 'true') {
+                        item.row.click();
+                        await delay(200);
+                    }
+                    const expectedConversationPrefix = `/g/${projectIdentifier}/c/`;
+                    const ownsConfiguredProject = [...document.querySelectorAll(
+                        'a[href]'
+                    )].some((anchor) => {
+                        try {
+                            const url = new URL(anchor.href, location.origin);
+                            return url.pathname.startsWith(
+                                expectedConversationPrefix
+                            );
+                        } catch (_) {
+                            return false;
+                        }
+                    });
+                    if (ownsConfiguredProject) {
+                        selected = item;
+                        break;
+                    }
+                }
+            }
+
+            if (!selected) return false;
+            if (selected.row.getAttribute('aria-expanded') !== 'true') {
+                selected.row.click();
+                await delay(200);
+            }
+            selected.homeButton.click();
+            return true;
+        }""",
+        {
+            "projectIdentifier": project_identifier,
+            "projectSlug": project_slug,
+        },
+    )
+    return bool(result)
+
+
+def navigate_to_chatgpt_project(
+    page: Page,
+    project_url: str,
+    bootstrap_url: str = DEFAULT_CHATGPT_BOOTSTRAP_URL,
+) -> None:
+    """Open a configured Project from the healthy global ChatGPT shell.
+
+    The exact Project route is validated before the caller can send a prompt.
+    There is deliberately no direct ``/project`` fallback: direct loads are the
+    failure mode this bootstrap flow is designed to avoid.
+    """
+    expected_path = urlparse(project_url).path.rstrip("/")
+    last_error: Exception | None = None
+
+    for attempt in range(CHATGPT_PROJECT_NAVIGATION_ATTEMPTS):
+        try:
+            page.goto(
+                bootstrap_url,
+                wait_until="domcontentloaded",
+                timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+            )
+            wait_for_chatgpt_composer(page)
+
+            if not open_configured_project_from_sidebar(page, project_url):
+                raise RuntimeError(
+                    "Configured ChatGPT Project was not found in the sidebar. "
+                    "No prompt was sent."
+                )
+            page.wait_for_function(
+                """(path) => location.pathname.replace(/\/+$/, '') === path""",
+                arg=expected_path,
+                timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+            )
+
+            ensure_expected_project_page(page.url, project_url)
+            wait_for_chatgpt_composer(page)
+            return
+        except ChatGPTAttentionRequiredError:
+            # Authentication and anti-bot challenges require an explicit user
+            # action. Do not turn them into a transient navigation failure or
+            # retry the Project route, because that could open/focus another
+            # window and enqueue the same prompt again.
+            raise
+        except Exception as exc:
+            last_error = exc
+            print(
+                ">>> ChatGPT Project bootstrap attempt "
+                f"{attempt + 1}/{CHATGPT_PROJECT_NAVIGATION_ATTEMPTS} failed: {exc}",
+                file=sys.stderr,
+            )
+
+    raise RuntimeError(
+        "ChatGPT Project did not become ready after bounded bootstrap "
+        "recovery. No prompt was sent."
+    ) from last_error
+
+
+def get_chatgpt_load_state(page: Page) -> dict:
+    """Return enough DOM state to distinguish a transient full-page failure."""
+    try:
+        return page.evaluate(
+            """() => {
+                const isVisible = (element) => {
+                    if (!element) return false;
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && rect.width > 0
+                        && rect.height > 0;
+                };
+                const normalize = (value) => (value || '')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .toLowerCase();
+                const retryLabels = ['try again', 'retry', 'thử lại'];
+                const loginLabels = ['log in', 'sign in', 'đăng nhập'];
+                const challengeMarkers = [
+                    'verify you are human', 'checking your browser',
+                    'security check', 'cloudflare', 'captcha', 'just a moment',
+                    'xác minh bạn là con người', 'đang kiểm tra trình duyệt'
+                ];
+                const editor = document.querySelector('#prompt-textarea');
+                const turns = document.querySelectorAll(
+                    '[data-testid^="conversation-turn-"], '
+                    + '[data-message-author-role]'
+                );
+                const retryButton = [...document.querySelectorAll(
+                    'button, [role="button"]'
+                )].find((element) => {
+                    const label = normalize(
+                        element.innerText
+                        || element.textContent
+                        || element.getAttribute('aria-label')
+                    );
+                    return isVisible(element)
+                        && retryLabels.some((candidate) => label === candidate);
+                });
+                const editorPresent = Boolean(editor && isVisible(editor));
+                const visibleControls = [...document.querySelectorAll(
+                    'button, a, [role="button"]'
+                )].filter(isVisible);
+                const loginRequired = !editorPresent && turns.length === 0
+                    && visibleControls.some((element) => {
+                        const label = normalize(
+                            element.innerText
+                            || element.textContent
+                            || element.getAttribute('aria-label')
+                        );
+                        return loginLabels.some((candidate) => label === candidate);
+                    });
+                const pageText = normalize(
+                    `${document.title || ''} ${document.body?.innerText || ''}`
+                );
+                return {
+                    editor_present: editorPresent,
+                    conversation_turn_count: turns.length,
+                    login_required: loginRequired,
+                    challenge_present: !editorPresent && turns.length === 0
+                        && challengeMarkers.some((marker) => pageText.includes(marker)),
+                    full_page_retry: Boolean(
+                        !editorPresent && turns.length === 0 && retryButton
+                    ),
+                    body_preview: normalize(document.body?.innerText).slice(0, 240),
+                };
+            }"""
+        )
+    except Exception as exc:
+        return {
+            "editor_present": False,
+            "conversation_turn_count": 0,
+            "full_page_retry": False,
+            "login_required": False,
+            "challenge_present": False,
+            "body_preview": "",
+            "inspection_error": str(exc),
+        }
+
+
+def raise_if_chatgpt_attention_required(state: dict) -> None:
+    """Stop safely when continuing requires an interactive browser."""
+    if state.get("challenge_present"):
+        raise ChatGPTAttentionRequiredError(
+            "ChatGPT đang yêu cầu CAPTCHA/Cloudflare. Mở Auto Login hoặc "
+            "Open Profile để xác minh, sau đó tiếp tục job trong Trung tâm Job."
+        )
+    if state.get("login_required"):
+        raise ChatGPTAttentionRequiredError(
+            "Phiên đăng nhập ChatGPT đã hết hạn. Mở Auto Login hoặc Open "
+            "Profile để đăng nhập, sau đó tiếp tục job trong Trung tâm Job."
+        )
+
+
+def check_chatgpt_page_attention(page: Page) -> None:
+    """Inspect redirects before strict Project/conversation URL validation."""
+    raise_if_chatgpt_attention_required(get_chatgpt_load_state(page))
+
+
+def click_chatgpt_full_page_retry(page: Page) -> bool:
+    """Click only the retry control from a full-page load failure."""
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                    const isVisible = (element) => {
+                        if (!element) return false;
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    };
+                    const normalize = (value) => (value || '')
+                        .replace(/\s+/g, ' ')
+                        .trim()
+                        .toLowerCase();
+                    const retryLabels = ['try again', 'retry', 'thử lại'];
+                    const editor = document.querySelector('#prompt-textarea');
+                    const turns = document.querySelectorAll(
+                        '[data-testid^="conversation-turn-"], '
+                        + '[data-message-author-role]'
+                    );
+                    if (editor || turns.length > 0) return false;
+                    const retryButton = [...document.querySelectorAll(
+                        'button, [role="button"]'
+                    )].find((element) => {
+                        const label = normalize(
+                            element.innerText
+                            || element.textContent
+                            || element.getAttribute('aria-label')
+                        );
+                        return isVisible(element)
+                            && retryLabels.some((candidate) => label === candidate);
+                    });
+                    if (!retryButton) return false;
+                    retryButton.click();
+                    return true;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def wait_for_chatgpt_composer(
+    page: Page,
+    attempts: int = CHATGPT_COMPOSER_RECOVERY_ATTEMPTS,
+) -> object:
+    """Wait for the composer and recover transient page-load failures safely.
+
+    Recovery occurs before any prompt text is inserted. It therefore cannot
+    duplicate a prompt, and reload always stays in the current project or
+    conversation instead of opening a new chat.
+    """
+    prompt_textarea = page.locator('#prompt-textarea').first
+    retry_clicked = False
+    last_state: dict = {}
+    last_error: Exception | None = None
+
+    for attempt in range(max(1, attempts)):
+        try:
+            prompt_textarea.wait_for(
+                state="visible",
+                timeout=CHATGPT_COMPOSER_WAIT_PER_ATTEMPT_MS,
+            )
+            return prompt_textarea
+        except Exception as exc:
+            last_error = exc
+            last_state = get_chatgpt_load_state(page)
+            raise_if_chatgpt_attention_required(last_state)
+            if attempt >= max(1, attempts) - 1:
+                break
+
+            recovered = False
+            if last_state.get("full_page_retry") and not retry_clicked:
+                retry_clicked = True
+                recovered = click_chatgpt_full_page_retry(page)
+                if recovered:
+                    print(
+                        ">>> ChatGPT page failed to load; clicked the full-page "
+                        "Try again control before sending any prompt.",
+                        file=sys.stderr,
+                    )
+
+            if not recovered:
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=60000)
+                    print(
+                        ">>> ChatGPT composer was unavailable; reloaded the same "
+                        "page before sending any prompt.",
+                        file=sys.stderr,
+                    )
+                except Exception as reload_error:
+                    last_state["reload_error"] = str(reload_error)
+
+            try:
+                page.wait_for_timeout(CHATGPT_PAGE_RECOVERY_SETTLE_MS)
+            except Exception:
+                time.sleep(CHATGPT_PAGE_RECOVERY_SETTLE_MS / 1000)
+
+    preview = str(last_state.get("body_preview", "")).strip()
+    detail = f" Page preview: {preview!r}." if preview else ""
+    raise RuntimeError(
+        "ChatGPT page did not become ready after bounded same-page recovery. "
+        "No prompt was sent. Check the ChatGPT login or service status."
+        f"{detail} Last error: {last_error}"
+    ) from last_error
+
+
+class SharedBrowserContextLease:
+    """Proxy a shared persistent context without letting a worker close it."""
+
+    def __init__(self, context, browser):
+        self._context = context
+        # Keep the CDP Browser wrapper alive until the Playwright client exits.
+        self._browser = browser
+
+    def __getattr__(self, name):
+        return getattr(self._context, name)
+
+    def close(self) -> None:
+        # The Browser Service is the only owner allowed to close this context.
+        # Exiting sync_playwright() disconnects this client automatically.
+        return None
+
+
 def launch_chatgpt_context(
     browser_type,
     profile_dir,
-    wait_timeout: float = PROFILE_WAIT_TIMEOUT_SECONDS,
-    retry_interval: float = PROFILE_RETRY_INTERVAL_SECONDS,
+    wait_timeout: float = CHATGPT_BROWSER_CONNECT_TIMEOUT_SECONDS,
+    retry_interval: float = CHATGPT_BROWSER_CONNECT_RETRY_SECONDS,
 ):
+    """Attach to the long-lived Browser Service without launching a window."""
     deadline = time.monotonic() + wait_timeout
+    last_error: Exception | None = None
 
     while True:
-        try:
-            return browser_type.launch_persistent_context(
-                str(profile_dir),
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
-                viewport={"width": 1280, "height": 800},
-            )
-        except Exception as exc:
-            error_message = str(exc)
-            profile_is_busy = any(
-                marker.lower() in error_message.lower()
-                for marker in PROFILE_BUSY_ERROR_MARKERS
-            )
-            if not profile_is_busy:
-                raise
+        endpoint = chatgpt_browser_service.get_browser_service_endpoint()
+        if endpoint:
+            try:
+                browser = browser_type.connect_over_cdp(
+                    endpoint,
+                    timeout=min(3_000, max(250, int(wait_timeout * 1000))),
+                )
+                if not browser.contexts:
+                    raise RuntimeError(
+                        "ChatGPT Browser Service has no persistent context."
+                    )
+                return SharedBrowserContextLease(browser.contexts[0], browser)
+            except Exception as exc:
+                last_error = exc
 
-            remaining_seconds = deadline - time.monotonic()
-            if remaining_seconds <= 0:
-                raise RuntimeError(
-                    "ChatGPT browser profile is still busy after waiting "
-                    f"{wait_timeout:g} seconds."
-                ) from exc
-
-            print(
-                "ChatGPT browser profile is busy; waiting for the current "
-                "video or thumbnail job to finish...",
-                file=sys.stderr,
-            )
-            time.sleep(min(retry_interval, remaining_seconds))
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            detail = f" Chi tiết: {last_error}" if last_error else ""
+            raise ChatGPTAttentionRequiredError(
+                "Trình duyệt ChatGPT nền chưa kết nối. Mở Settings và bấm "
+                "'Khởi động trình duyệt nền', sau đó tiếp tục job trong "
+                f"Trung tâm Job.{detail}"
+            ) from last_error
+        time.sleep(min(retry_interval, remaining_seconds))
 
 def get_active_prompts():
     try:
@@ -702,7 +1258,7 @@ def clean_text(text: str) -> str:
     """Removes 'Edit' and common AI conversational fillers from the output."""
     lines = text.split('\n')
     cleaned = []
-    skip_keywords = ["dưới đây là", "trân trọng gửi", "đây là", "chắc chắn rồi", "dạ vâng", "vâng,", "đã hoàn thành", "bạn chưa cung cấp", "nội dung hoàn chỉnh", "chào bạn"]
+    skip_keywords = ["dưới đây là", "trân trọng gửi", "chắc chắn rồi", "dạ vâng", "vâng,", "đã hoàn thành", "bạn chưa cung cấp", "nội dung hoàn chỉnh", "chào bạn"]
     for line in lines:
         lower_line = line.strip().lower()
         if lower_line == "edit":
@@ -743,10 +1299,9 @@ def _is_short_narrative_artifact(block: str) -> tuple[bool, bool]:
         lowered_line = normalized_line.lower()
         explicit_editorial_note = explicit_editorial_note or (
             has_markdown_heading
-            or lowered_line.startswith(NARRATIVE_EDITORIAL_PREFIXES)
+            or looks_like_editorial_artifact(lowered_line)
             or bool(re.match(
-                r"^(?:intro|body|outro|ghi chú|ý chính|trọng tâm|"
-                r"phần\s+(?:\d+|intro|body|outro))\b",
+                r"^(?:ghi chú|ý chính|trọng tâm)\b",
                 lowered_line,
             ))
         )
@@ -765,20 +1320,19 @@ def sanitize_narrative_response(response_text: str) -> str:
     if not blocks:
         return ""
 
+    block_checks = [_is_short_narrative_artifact(block) for block in blocks]
+    has_substantive_narrative = any(
+        not is_short_artifact
+        for is_short_artifact, _ in block_checks
+    )
     kept_blocks = []
-    for index, block in enumerate(blocks):
-        is_short_artifact, is_explicit_note = _is_short_narrative_artifact(
-            block
-        )
-        previous_is_prose = (
-            index > 0 and len(blocks[index - 1]) >= NARRATIVE_CONTEXT_MIN_CHARS
-        )
-        next_is_prose = (
-            index + 1 < len(blocks)
-            and len(blocks[index + 1]) >= NARRATIVE_CONTEXT_MIN_CHARS
-        )
+    for block, (is_short_artifact, is_explicit_note) in zip(
+        blocks,
+        block_checks,
+    ):
         if is_short_artifact and (
-            is_explicit_note or (previous_is_prose and next_is_prose)
+            is_explicit_note
+            or (has_substantive_narrative and len(blocks) > 1)
         ):
             continue
         kept_blocks.append(block)
@@ -813,10 +1367,18 @@ def sanitize_generated_script(script_text: str) -> str:
 def validate_prompt_text(prompt_text: str) -> None:
     if not isinstance(prompt_text, str) or not prompt_text.strip():
         raise ValueError("The ChatGPT prompt must contain text.")
-    if "\ufffd" in prompt_text or re.search(
-        r"(?:\w\?\w|\?{2,}\w|\w\?{2,})",
-        prompt_text,
-        flags=re.UNICODE,
+    # Query strings legitimately contain a question mark between alphanumeric
+    # characters (for example ``youtube.com/channel/...?...``). Remove URL-like
+    # tokens before looking for question marks that replaced damaged Unicode.
+    text_without_urls = URL_LIKE_TOKEN_PATTERN.sub("", prompt_text)
+    # JSON string values can contain arbitrary viewer text. A question mark
+    # between words is valid punctuation there and is not evidence that the
+    # application's own prompt text was damaged during decoding.
+    trusted_prompt_text = JSON_STRING_LITERAL_PATTERN.sub('""', text_without_urls)
+    corrupted_markers = CORRUPTED_UNICODE_PATTERN.findall(trusted_prompt_text)
+    if (
+        "\ufffd" in prompt_text
+        or len(corrupted_markers) >= MIN_CORRUPTED_UNICODE_MARKERS
     ):
         raise ValueError(
             "The ChatGPT prompt contains corrupted Unicode text. "
@@ -983,6 +1545,7 @@ def wait_for_assistant_response(
     saw_busy_state = False
 
     while True:
+        dismiss_external_app_permission_dialog(page)
         busy = is_chatgpt_generation_active(page)
         saw_busy_state = saw_busy_state or busy
         response_text = get_new_assistant_response(
@@ -1086,10 +1649,7 @@ def get_reusable_outline_response(page: Page) -> str:
 
 
 def wait_for_conversation_history(page: Page) -> None:
-    page.locator('#prompt-textarea').first.wait_for(
-        state="visible",
-        timeout=60000,
-    )
+    wait_for_chatgpt_composer(page)
     page.wait_for_function(
         """() => {
             const turns = [...document.querySelectorAll(
@@ -1123,12 +1683,9 @@ def send_prompt(
 ) -> str:
     validate_prompt_text(prompt_text)
 
-    # Ensure textarea is ready and enabled
-    prompt_textarea = page.locator('#prompt-textarea').first
-    try:
-        prompt_textarea.wait_for(state="visible", timeout=60000)
-    except Exception:
-        raise Exception("Could not find the prompt textarea after 60s. Are you logged in, or is a Cloudflare check/popup blocking it?")
+    # Recover a transient ChatGPT full-page load failure before touching the
+    # composer. This is shared by every prompt-driven workflow.
+    prompt_textarea = wait_for_chatgpt_composer(page)
 
     if is_chatgpt_conversation_url(page.url):
         wait_for_conversation_history(page)
@@ -1150,6 +1707,7 @@ def send_prompt(
     page_url_before_send = page.url
     previous_assistant_turn = get_latest_conversation_turn(page, "assistant")
     previous_assistant_count = get_assistant_message_count(page)
+    previous_user_count = get_user_message_count(page)
 
     # Mark existing messages so we can identify the new one
     page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"]').forEach(el => el.classList.add('my-old-msg'))")
@@ -1271,35 +1829,40 @@ def send_prompt(
                 ) from recovery_error
 
     send_btn.click()
-    
-    # 1. Wait for textarea to clear (confirms send was successful)
+
+    # Confirm the single send attempt through multiple independent UI signals.
+    # Never press Enter or click again after an ambiguous delivery because the
+    # first request may already have reached ChatGPT.
     try:
         page.wait_for_function(
-            """() => {
-                const ta = document.querySelector('#prompt-textarea');
-                return ta && ta.textContent.trim() === '';
+            """(baseline) => {
+                const editor = document.querySelector('#prompt-textarea');
+                const userTurns = document.querySelectorAll(
+                    '[data-message-author-role="user"]'
+                ).length;
+                const generationStarted = Boolean(
+                    document.querySelector('[data-testid="stop-button"]')
+                );
+                const editorCleared = Boolean(
+                    editor && (editor.innerText || editor.textContent || '').trim() === ''
+                );
+                return editorCleared
+                    || generationStarted
+                    || userTurns > baseline.previousUserCount
+                    || location.href !== baseline.previousUrl;
             }""",
-            timeout=5000
+            arg={
+                "previousUrl": page_url_before_send,
+                "previousUserCount": previous_user_count,
+            },
+            timeout=CHATGPT_PROMPT_SUBMISSION_TIMEOUT_MS,
         )
-    except Exception:
-        # Fallback 1: try pressing Enter
-        prompt_textarea.press("Enter")
-        time.sleep(1)
-        try:
-            page.wait_for_function(
-                """() => {
-                    const ta = document.querySelector('#prompt-textarea');
-                    return ta && ta.textContent.trim() === '';
-                }""",
-                timeout=5000
-            )
-        except Exception:
-            # Fallback 2: JS click
-            try:
-                page.evaluate('document.querySelector(\'[data-testid="send-button"]\').click()')
-                time.sleep(1)
-            except Exception as e:
-                print(f"Warning: JS click failed: {e}", file=sys.stderr)
+    except Exception as exc:
+        raise RuntimeError(
+            "Prompt submission could not be confirmed after one send attempt. "
+            "No automatic resend was attempted to avoid duplicate ChatGPT "
+            "messages."
+        ) from exc
 
     response_turn_baseline = get_response_turn_baseline(
         page_url_before_send,
@@ -1372,23 +1935,28 @@ def _run_complete(transcript: str, state: dict) -> dict:
     if not profile_dir.exists():
         raise Exception("Profile directory not found. Please run the auto-login tool first.")
 
-    with sync_playwright() as p:
-        context = launch_chatgpt_context(p.chromium, profile_dir)
-
+    with sync_playwright() as p, closing(
+        launch_chatgpt_context(p.chromium, profile_dir)
+    ) as context:
         page = context.pages[0] if context.pages else context.new_page()
         project_url = get_chatgpt_project_url()
         resume_url = state.get("chat_url", "")
         is_resuming = is_chatgpt_conversation_url(resume_url)
-        target_url = resume_url if is_resuming else project_url
-        page.goto(target_url, wait_until="domcontentloaded")
         if is_resuming:
+            page.goto(
+                resume_url,
+                wait_until="domcontentloaded",
+                timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+            )
+            check_chatgpt_page_attention(page)
+            ensure_expected_conversation_page(page.url, resume_url)
             wait_for_conversation_history(page)
             print(
                 f">>> TIẾP TỤC PHIÊN CHAT CŨ: {resume_url}",
                 file=sys.stderr,
             )
         else:
-            ensure_expected_project_page(page.url, project_url)
+            navigate_to_chatgpt_project(page, project_url)
 
         STRICT_NO_FILLER = "\n\nLƯU Ý QUAN TRỌNG: TRẢ LỜI TRỰC TIẾP VÀO NỘI DUNG. TUYỆT ĐỐI KHÔNG CHÀO HỎI, KHÔNG DẠ VÂNG, KHÔNG THÊM BẤT KỲ CÂU DẪN HAY GIẢI THÍCH NÀO (VD: 'Dưới đây là...', 'Trân trọng gửi bạn...'). CHỈ IN RA ĐÚNG NỘI DUNG CẦN VIẾT."
 
@@ -1410,11 +1978,25 @@ def _run_complete(transcript: str, state: dict) -> dict:
                     outline = send_prompt(page, prompt2)
                 finally:
                     if is_chatgpt_conversation_url(page.url):
+                        ensure_expected_project_conversation_page(
+                            page.url,
+                            project_url,
+                        )
                         state["chat_url"] = page.url
                         persist_generation_state(state)
 
             if is_chatgpt_conversation_url(page.url):
+                ensure_expected_project_conversation_page(
+                    page.url,
+                    project_url,
+                )
                 state["chat_url"] = page.url
+            if not state.get("chat_url"):
+                raise RuntimeError(
+                    "ChatGPT did not create a conversation inside the configured "
+                    "Project after the first prompt. No automatic resend was "
+                    "attempted."
+                )
             print(f"    -> Chat URL: {state['chat_url']}", file=sys.stderr)
 
             if "[PHAN]" in outline:
@@ -1535,27 +2117,12 @@ def _run_complete(transcript: str, state: dict) -> dict:
         def _download_image_local(chatgpt_url: str) -> str:
             """Download image via Playwright session and save locally."""
             try:
-                THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
-                filename = f"thumb_{uuid.uuid4().hex[:12]}.png"
-                dest = THUMBNAILS_DIR / filename
-                b64 = page.evaluate("""
-                    async (url) => {
-                        const res = await fetch(url, { credentials: 'include' });
-                        const buf = await res.arrayBuffer();
-                        const bytes = new Uint8Array(buf);
-                        let binary = '';
-                        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-                        return btoa(binary);
-                    }
-                """, chatgpt_url)
-                import base64
-                dest.write_bytes(base64.b64decode(b64))
-                local_path = f"/api/thumbnails/{filename}"
+                local_path = download_chatgpt_image_via_page(page, chatgpt_url)
                 print(f"    -> Đã download ảnh về local: {local_path}", file=sys.stderr)
                 return local_path
             except Exception as e:
                 print(f"    -> Lỗi download ảnh: {e}", file=sys.stderr)
-                return chatgpt_url  # fallback to original URL
+                return ""
 
         # Step 8: Thumbnail Idea 1 (With Text)
         if pipeline["thumbnail_with_text"] and not state.get("thumb_text"):
@@ -1607,8 +2174,6 @@ def _run_complete(transcript: str, state: dict) -> dict:
             state["thumb_notext"] = thumb2
             persist_generation_state(state)
 
-        context.close()
-        
         state["current_step"] = "complete"
         persist_generation_state(state)
         complete_for_audio = is_core_script_complete(transcript, state)
@@ -1667,6 +2232,9 @@ def run(transcript: str) -> dict:
             )
     try:
         return _run_complete(transcript, state)
+    except ChatGPTAttentionRequiredError:
+        persist_generation_state(state)
+        raise
     except Exception as exc:
         has_recoverable_content = bool(
             state["chat_url"]
@@ -1715,12 +2283,17 @@ def generate_chapters_only(
                 if is_original_chat
                 else get_chatgpt_project_url(prompt_version)
             )
-            page.goto(target_url, wait_until="domcontentloaded")
-            if not is_original_chat:
-                ensure_expected_project_page(page.url, target_url)
-
             if is_original_chat:
+                page.goto(
+                    target_url,
+                    wait_until="domcontentloaded",
+                    timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+                )
+                check_chatgpt_page_attention(page)
+                ensure_expected_conversation_page(page.url, target_url)
                 wait_for_conversation_history(page)
+            else:
+                navigate_to_chatgpt_project(page, target_url)
 
             if is_original_chat and reuse_existing_response:
                 try:
@@ -1790,6 +2363,7 @@ def generate_metadata_only(
         try:
             page = context.pages[0] if context.pages else context.new_page()
             page.goto(conversation_url, wait_until="domcontentloaded")
+            check_chatgpt_page_attention(page)
             ensure_expected_conversation_page(page.url, conversation_url)
             time.sleep(2)
 
@@ -1810,6 +2384,102 @@ def generate_metadata_only(
             return request_complete_metadata(page, generation_prompt)
         finally:
             context.close()
+
+
+def generate_comment_replies(
+    chat_url: str,
+    comments: list[dict],
+    reply_instruction: str = "",
+    recent_replies: list[str] | None = None,
+) -> dict[str, str]:
+    """Draft replies inside the video's existing ChatGPT conversation only."""
+    from auto_yt.services.youtube_comments import (
+        build_comment_reply_prompt,
+        parse_comment_reply_response,
+    )
+
+    conversation_url = get_video_chat_url(chat_url)
+    expected_ids = {str(comment["comment_id"]) for comment in comments}
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception(
+            "Profile directory not found. Please run the auto-login tool first."
+        )
+
+    with sync_playwright() as playwright, closing(
+        launch_chatgpt_context(playwright.chromium, profile_dir)
+    ) as context:
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(
+            conversation_url,
+            wait_until="domcontentloaded",
+            timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+        )
+        check_chatgpt_page_attention(page)
+        ensure_expected_conversation_page(page.url, conversation_url)
+        wait_for_conversation_history(page)
+        response_text = send_prompt(
+            page,
+            build_comment_reply_prompt(comments, reply_instruction, recent_replies),
+        )
+        return parse_comment_reply_response(response_text, expected_ids)
+
+
+def initialize_comment_video_chat(
+    *,
+    title: str,
+    description: str,
+    transcript: str,
+    prompt_version: str,
+) -> str:
+    """Create one dedicated Project conversation for a legacy YouTube video.
+
+    A single prompt carries the complete available source context. If delivery
+    becomes ambiguous after ChatGPT has already created the conversation, the
+    new URL is returned instead of sending the prompt a second time.
+    """
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception(
+            "Profile directory not found. Please run the auto-login tool first."
+        )
+    project_url = get_chatgpt_project_url(prompt_version)
+    normalized_title = str(title or "").strip()
+    normalized_description = str(description or "").strip()
+    normalized_transcript = str(transcript or "").strip()
+    if not normalized_title:
+        raise ValueError("Legacy video title is required.")
+    if not normalized_description and not normalized_transcript:
+        raise ValueError(
+            "Legacy video must have a description or transcript before Chat creation."
+        )
+    context_prompt = (
+        "Đây là phiên Chat riêng dành duy nhất cho một video YouTube đã đăng. "
+        "Hãy dùng tiêu đề, mô tả và transcript bên dưới làm nền tảng nội dung "
+        "để trả lời các bình luận của người xem ở những lượt sau. Không trộn "
+        "nội dung với video khác. Ở lượt này chỉ xác nhận ngắn gọn rằng bạn đã "
+        "nhận nội dung, không phân tích và không viết lại kịch bản.\n\n"
+        f"TIÊU ĐỀ VIDEO:\n{normalized_title}\n\n"
+        f"MÔ TẢ VIDEO:\n{normalized_description or '(Không có mô tả)'}\n\n"
+        f"TRANSCRIPT VIDEO:\n{normalized_transcript or '(Không có transcript)'}"
+    )
+
+    with sync_playwright() as playwright, closing(
+        launch_chatgpt_context(playwright.chromium, profile_dir)
+    ) as context:
+        page = context.pages[0] if context.pages else context.new_page()
+        navigate_to_chatgpt_project(page, project_url)
+        try:
+            send_prompt(page, context_prompt)
+        except Exception:
+            # One send may have succeeded even if the response watcher failed.
+            # Saving the resulting conversation is safer than creating a second
+            # chat or duplicating the context prompt.
+            if is_expected_project_conversation_url(page.url, project_url):
+                return page.url.strip().rstrip("/")
+            raise
+        ensure_expected_project_conversation_page(page.url, project_url)
+        return page.url.strip().rstrip("/")
 
 
 def generate_thumbnails_only(
@@ -1835,9 +2505,9 @@ def generate_thumbnails_only(
     if not profile_dir.exists():
         raise Exception("Profile directory not found. Please run the auto-login tool first.")
 
-    with sync_playwright() as p:
-        context = launch_chatgpt_context(p.chromium, profile_dir)
-
+    with sync_playwright() as p, closing(
+        launch_chatgpt_context(p.chromium, profile_dir)
+    ) as context:
         page = context.pages[0] if context.pages else context.new_page()
         
         # Navigate to the original chat session if URL provided, otherwise open new chat
@@ -1848,9 +2518,16 @@ def generate_thumbnails_only(
             else get_chatgpt_project_url(prompt_version)
         )
         print(f"    -> Navigating to: {target_url}", file=sys.stderr)
-        page.goto(target_url, wait_until="domcontentloaded")
-        if not is_original_chat:
-            ensure_expected_project_page(page.url, target_url)
+        if is_original_chat:
+            page.goto(
+                target_url,
+                wait_until="domcontentloaded",
+                timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+            )
+            check_chatgpt_page_attention(page)
+            ensure_expected_conversation_page(page.url, target_url)
+        else:
+            navigate_to_chatgpt_project(page, target_url)
         time.sleep(2)  # Let the page settle
 
         # Temporarily set PROMPT_VERSION env var so get_active_prompts() reads it
@@ -1870,23 +2547,7 @@ def generate_thumbnails_only(
         def _download_image(page, chatgpt_url: str) -> str:
             """Download image via Playwright session (has ChatGPT cookies) and save locally."""
             try:
-                THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
-                filename = f"thumb_{uuid.uuid4().hex[:12]}.png"
-                dest = THUMBNAILS_DIR / filename
-                # Use page.evaluate to fetch the image as base64 using the authenticated session
-                b64 = page.evaluate("""
-                    async (url) => {
-                        const res = await fetch(url, { credentials: 'include' });
-                        const buf = await res.arrayBuffer();
-                        const bytes = new Uint8Array(buf);
-                        let binary = '';
-                        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-                        return btoa(binary);
-                    }
-                """, chatgpt_url)
-                import base64
-                dest.write_bytes(base64.b64decode(b64))
-                local_path = f"/api/thumbnails/{filename}"
+                local_path = download_chatgpt_image_via_page(page, chatgpt_url)
                 print(f"    -> Đã download ảnh về local: {local_path}", file=sys.stderr)
                 return local_path
             except Exception as e:
@@ -1929,8 +2590,6 @@ def generate_thumbnails_only(
                 lambda image_url: _download_image(page, image_url),
             )
 
-        context.close()
-
         return {
             "thumb_text": thumb1,
             "thumb_notext": thumb2,
@@ -1971,13 +2630,14 @@ def _generate_single_thumbnail(
     if not profile_dir.exists():
         raise Exception("Profile directory not found. Please run the auto-login tool first.")
 
-    with sync_playwright() as p:
-        context = launch_chatgpt_context(p.chromium, profile_dir)
-
+    with sync_playwright() as p, closing(
+        launch_chatgpt_context(p.chromium, profile_dir)
+    ) as context:
         page = context.pages[0] if context.pages else context.new_page()
         target_url = get_video_thumbnail_chat_url(chat_url)
         print(f"    -> Navigating to: {target_url}", file=sys.stderr)
         page.goto(target_url, wait_until="domcontentloaded")
+        check_chatgpt_page_attention(page)
         ensure_expected_conversation_page(page.url, target_url)
         time.sleep(2)
 
@@ -1995,28 +2655,7 @@ def _generate_single_thumbnail(
 
         def download_image(chatgpt_url: str) -> str:
             try:
-                THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
-                filename = f"thumb_{uuid.uuid4().hex[:12]}.png"
-                destination = THUMBNAILS_DIR / filename
-                image_base64 = page.evaluate(
-                    """
-                    async (url) => {
-                        const response = await fetch(url, { credentials: 'include' });
-                        if (!response.ok) throw new Error(`Image download failed: ${response.status}`);
-                        const buffer = await response.arrayBuffer();
-                        const bytes = new Uint8Array(buffer);
-                        let binary = '';
-                        for (let i = 0; i < bytes.byteLength; i++) {
-                            binary += String.fromCharCode(bytes[i]);
-                        }
-                        return btoa(binary);
-                    }
-                    """,
-                    chatgpt_url,
-                )
-                import base64
-                destination.write_bytes(base64.b64decode(image_base64))
-                return f"/api/thumbnails/{filename}"
+                return download_chatgpt_image_via_page(page, chatgpt_url)
             except Exception as exc:
                 print(f"    -> Image download failed: {exc}", file=sys.stderr)
                 return ""
@@ -2045,8 +2684,6 @@ def _generate_single_thumbnail(
                 download_image,
             )
             retry_succeeded = bool(image_urls)
-
-        context.close()
 
         result = {
             "thumb_text": None,
@@ -2092,5 +2729,8 @@ if __name__ == "__main__":
             f"\n###WORKER_META###{json.dumps(worker_meta)}".encode("utf-8")
         )
     except Exception as e:
-        sys.stderr.write(str(e))
+        if isinstance(e, ChatGPTAttentionRequiredError):
+            sys.stderr.write(encode_attention_error(str(e)))
+        else:
+            sys.stderr.write(str(e))
         sys.exit(1)

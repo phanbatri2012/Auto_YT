@@ -3,8 +3,14 @@ from __future__ import annotations
 import os
 import tempfile
 import time
-import urllib.request
 from pathlib import Path
+
+from auto_yt.services.network_security import (
+    GENMAX_AUDIO_HOSTS,
+    MAX_AUDIO_DOWNLOAD_BYTES,
+    UnsafeRemoteResource,
+    download_bounded,
+)
 
 
 DOWNLOAD_TIMEOUT_SECONDS = 90
@@ -141,12 +147,19 @@ def extract_mp3_audio_frames(data: bytes) -> tuple[bytes, float, tuple]:
 
 
 def download_audio(audio_url: str) -> bytes:
-    request = urllib.request.Request(
-        audio_url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-    )
-    with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
-        return response.read()
+    try:
+        data = download_bounded(
+            audio_url,
+            allowed_hosts=GENMAX_AUDIO_HOSTS,
+            allowed_content_types=("audio/mpeg", "audio/mp3", "application/octet-stream"),
+            max_bytes=MAX_AUDIO_DOWNLOAD_BYTES,
+            timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
+        )
+    except UnsafeRemoteResource as exc:
+        raise AudioContentError(f"Genmax returned an unsafe audio resource: {exc}") from exc
+    # Validate the container before callers persist or merge untrusted bytes.
+    _find_first_frame(data)
+    return data
 
 
 def get_remote_mp3_duration(audio_url: str) -> float:
@@ -154,15 +167,37 @@ def get_remote_mp3_duration(audio_url: str) -> float:
     return duration_seconds
 
 
-def validate_spoken_duration(text: str, duration_seconds: float) -> None:
+def validate_spoken_duration(
+    text: str,
+    duration_seconds: float,
+    *,
+    minimum_words_per_minute: float | None = None,
+    provider_name: str = "Genmax",
+) -> None:
     word_count = len(text.split())
     minimum_duration = word_count / MAX_SPEECH_WORDS_PER_SECOND
     if duration_seconds < minimum_duration:
         raise AudioContentError(
-            "Genmax returned incomplete audio: "
+            f"{provider_name} returned incomplete audio: "
             f"{duration_seconds / 60:.1f} minutes for {word_count:,} words "
             f"(minimum expected {minimum_duration / 60:.1f} minutes)."
         )
+    if minimum_words_per_minute is not None:
+        minimum_wpm = float(minimum_words_per_minute)
+        if minimum_wpm <= 0:
+            raise ValueError("minimum_words_per_minute must be positive.")
+        # A small fixed allowance avoids rejecting natural pauses in very
+        # short samples while still catching systematic slow/hallucinated TTS.
+        maximum_duration = max(
+            8.0,
+            word_count * 60.0 / minimum_wpm + 4.0,
+        )
+        if duration_seconds > maximum_duration:
+            raise AudioContentError(
+                f"{provider_name} returned implausibly long audio: "
+                f"{duration_seconds / 60:.1f} minutes for {word_count:,} words "
+                f"(maximum expected {maximum_duration / 60:.1f} minutes)."
+            )
 
 
 def _replace_file_with_retry(source_path: Path, output_path: Path) -> None:

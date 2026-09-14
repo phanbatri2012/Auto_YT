@@ -15,12 +15,173 @@ $dataRoot = Join-Path $projectRoot "data"
 $logsRoot = Join-Path $dataRoot "logs"
 $venvRoot = Join-Path $projectRoot ".venv"
 $venvPython = Join-Path $venvRoot "Scripts\python.exe"
-$backendUrl = "http://127.0.0.1:8080/api/chatgpt-status"
+$backendUrl = "http://127.0.0.1:8080/health"
+$legacyBackendUrl = "http://127.0.0.1:8080/api/chatgpt-status"
 $frontendUrl = "http://127.0.0.1:5173/"
 
 function Write-Step {
     param([string]$Message)
     Write-Host "[Auto_YT] $Message" -ForegroundColor Cyan
+}
+
+function Protect-DataDirectory {
+    $resolvedDataRoot = [System.IO.Path]::GetFullPath($dataRoot).TrimEnd("\")
+    $requiredPrefix = "$projectRoot\"
+    if (-not $resolvedDataRoot.StartsWith($requiredPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to change ACL outside the Auto_YT project: $resolvedDataRoot"
+    }
+
+    New-Item -ItemType Directory -Path $resolvedDataRoot -Force | Out-Null
+    $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $grants = @(
+        "*$($currentUserSid):(OI)(CI)F",
+        "*S-1-5-18:(OI)(CI)F",
+        "*S-1-5-32-544:(OI)(CI)F"
+    )
+
+    & icacls.exe $resolvedDataRoot "/inheritance:r" "/grant:r" $grants "/remove:g" "*S-1-5-32-545" "*S-1-5-11" "*S-1-1-0" "/Q" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not restrict the data directory ACL."
+    }
+
+    $aclMarker = Join-Path $resolvedDataRoot ".acl-protected-v1"
+    if (Test-Path -LiteralPath $aclMarker -PathType Leaf) {
+        return
+    }
+
+    $deferredMarker = Join-Path $resolvedDataRoot ".acl-migration-deferred-v1"
+    $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $currentPrincipal = [System.Security.Principal.WindowsPrincipal]::new($currentIdentity)
+    $isElevated = $currentPrincipal.IsInRole(
+        [System.Security.Principal.WindowsBuiltInRole]::Administrator
+    )
+    if ((Test-Path -LiteralPath $deferredMarker -PathType Leaf) -and -not $isElevated) {
+        Write-Warning "Legacy data ACL migration is pending. Run run_autoyt.bat once as Administrator when Auto_YT Chrome is closed; normal startup will continue."
+        return
+    }
+
+    $profileProcess = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.CommandLine -and
+            $_.CommandLine.IndexOf($resolvedDataRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        } |
+        Select-Object -First 1
+    if ($profileProcess) {
+        Write-Warning "Data ACL migration is waiting for the Auto_YT Chrome profile to close."
+        return
+    }
+
+    try {
+    if (Get-ChildItem -LiteralPath $resolvedDataRoot -Force -ErrorAction SilentlyContinue) {
+        $null = & icacls.exe (Join-Path $resolvedDataRoot "*") "/reset" "/T" "/C" "/Q" 2>&1
+    }
+
+    $unsafeAccountNames = @(
+        ([System.Security.Principal.SecurityIdentifier]::new("S-1-1-0")).Translate([System.Security.Principal.NTAccount]).Value,
+        ([System.Security.Principal.SecurityIdentifier]::new("S-1-5-11")).Translate([System.Security.Principal.NTAccount]).Value,
+        ([System.Security.Principal.SecurityIdentifier]::new("S-1-5-32-545")).Translate([System.Security.Principal.NTAccount]).Value
+    )
+    $allItems = @(
+        Get-Item -LiteralPath $resolvedDataRoot -Force
+        Get-ChildItem -LiteralPath $resolvedDataRoot -Recurse -Force -ErrorAction SilentlyContinue
+    )
+    $unsafeItems = @($allItems | Where-Object {
+        $itemAcl = Get-Acl -LiteralPath $_.FullName
+        [bool]($itemAcl.Access | Where-Object {
+            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+            $_.IdentityReference.Value -in $unsafeAccountNames
+        } | Select-Object -First 1)
+    })
+    $unsafeDirectories = @($unsafeItems | Where-Object { $_.PSIsContainer })
+
+    foreach ($file in @($unsafeItems | Where-Object { -not $_.PSIsContainer })) {
+        $unsafeParent = $unsafeDirectories | Where-Object {
+            $directoryPrefix = "$($_.FullName)\"
+            $_.FullName -ne $resolvedDataRoot -and
+            $file.FullName.StartsWith($directoryPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1
+        if ($unsafeParent) {
+            continue
+        }
+        $temporaryFile = Join-Path $file.DirectoryName (".acl-migrate-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+        try {
+            $contentHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+            Copy-Item -LiteralPath $file.FullName -Destination $temporaryFile
+            Move-Item -LiteralPath $temporaryFile -Destination $file.FullName -Force
+            if ((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash -ne $contentHash) {
+                throw "Content verification failed after replacing $($file.FullName)."
+            }
+        }
+        catch {
+            Write-Warning "Could not migrate the ACL for $($file.FullName): $($_.Exception.Message)"
+        }
+        finally {
+            if (Test-Path -LiteralPath $temporaryFile -PathType Leaf) {
+                Remove-Item -LiteralPath $temporaryFile -Force
+            }
+        }
+    }
+
+    $currentUserName = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    foreach ($directory in @($unsafeDirectories | Sort-Object { $_.FullName.Length } -Descending)) {
+        if ($directory.FullName -eq $resolvedDataRoot) {
+            continue
+        }
+        if ((Get-Acl -LiteralPath $directory.FullName).Owner -ne $currentUserName) {
+            continue
+        }
+        $parent = Split-Path -Parent $directory.FullName
+        $leaf = Split-Path -Leaf $directory.FullName
+        $legacyLeaf = ".acl-migrate-" + [Guid]::NewGuid().ToString("N")
+        $legacyPath = Join-Path $parent $legacyLeaf
+        try {
+            Rename-Item -LiteralPath $directory.FullName -NewName $legacyLeaf
+            New-Item -ItemType Directory -Path $directory.FullName | Out-Null
+            Get-ChildItem -LiteralPath $legacyPath -Force -ErrorAction SilentlyContinue |
+                Move-Item -Destination $directory.FullName
+            Remove-Item -LiteralPath $legacyPath -Force
+        }
+        catch {
+            Write-Warning "Could not migrate the ACL for $($directory.FullName): $($_.Exception.Message)"
+            if (Test-Path -LiteralPath $legacyPath) {
+                if (Test-Path -LiteralPath $directory.FullName) {
+                    Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction SilentlyContinue |
+                        Move-Item -Destination $legacyPath -Force
+                    Remove-Item -LiteralPath $directory.FullName -Force
+                }
+                Rename-Item -LiteralPath $legacyPath -NewName $leaf
+            }
+        }
+    }
+
+    $remainingUnsafe = @(
+        Get-Item -LiteralPath $resolvedDataRoot -Force
+        Get-ChildItem -LiteralPath $resolvedDataRoot -Recurse -Force -ErrorAction SilentlyContinue
+    ) | Where-Object {
+        $itemAcl = Get-Acl -LiteralPath $_.FullName
+        [bool]($itemAcl.Access | Where-Object {
+            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+            $_.IdentityReference.Value -in $unsafeAccountNames
+        } | Select-Object -First 1)
+    } | Select-Object -First 1
+    if ($remainingUnsafe) {
+        Write-Warning "Some administrator-owned legacy files still have a broad ACL. Run run_autoyt.bat once as Administrator to secure them; normal startup remains available."
+        Set-Content -LiteralPath $deferredMarker -Value "Pending administrator migration" -Encoding UTF8
+    }
+    else {
+        Set-Content -LiteralPath $aclMarker -Value "Protected for $currentUserSid" -Encoding UTF8
+        Remove-Item -LiteralPath $deferredMarker -Force -ErrorAction SilentlyContinue
+    }
+    }
+    catch {
+        Write-Warning "Legacy data ACL migration could not be completed: $($_.Exception.Message) Normal startup will continue."
+        try {
+            Set-Content -LiteralPath $deferredMarker -Value "Pending administrator migration" -Encoding UTF8
+        }
+        catch {
+            Write-Warning "Could not record the deferred ACL migration: $($_.Exception.Message)"
+        }
+    }
 }
 
 function Invoke-ExternalCommand {
@@ -71,7 +232,20 @@ function Test-BackendReady {
         return $true
     }
     catch {
-        return $false
+        try {
+            $null = Invoke-RestMethod -Uri $legacyBackendUrl -TimeoutSec 2
+            return $true
+        }
+        catch {
+            $responseProperty = $_.Exception.PSObject.Properties["Response"]
+            if ($responseProperty -and $null -ne $responseProperty.Value) {
+                $statusCodeProperty = $responseProperty.Value.PSObject.Properties["StatusCode"]
+                if ($statusCodeProperty -and [int]$statusCodeProperty.Value -eq 401) {
+                    return $true
+                }
+            }
+            return $false
+        }
     }
 }
 
@@ -331,13 +505,9 @@ if (-not $createdNew) {
 try {
     Set-Location $projectRoot
 
-    if (-not $env:GENMAX_API_KEY) {
-        $apiKeyPath = Join-Path $dataRoot "genmax_api_key.txt"
-        if (Test-Path -LiteralPath $apiKeyPath -PathType Leaf) {
-            $env:GENMAX_API_KEY = (Get-Content -LiteralPath $apiKeyPath -Raw).Trim()
-        }
-    }
-    if (-not $env:GENMAX_API_KEY) {
+    $apiKeyPath = Join-Path $dataRoot "genmax_api_key.txt"
+    $hasStoredApiKey = Test-Path -LiteralPath $apiKeyPath -PathType Leaf
+    if (-not $env:GENMAX_API_KEY -and -not $hasStoredApiKey) {
         Write-Warning "Genmax API key is missing; audio generation will be unavailable."
     }
 
@@ -349,6 +519,7 @@ try {
     }
     else {
         if (-not $backendReady) {
+            Protect-DataDirectory
             if (Test-PortInUse 8080) {
                 Wait-ForService "Backend" ${function:Test-BackendReady} 10
                 $backendReady = $true

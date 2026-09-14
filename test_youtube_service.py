@@ -1,4 +1,5 @@
 import unittest
+import urllib.error
 from unittest.mock import MagicMock, patch
 
 from auto_yt.services import youtube_service
@@ -31,6 +32,21 @@ class YouTubeServiceTests(unittest.TestCase):
             youtube_service.YOUTUBE_REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status.assert_called_once_with()
+
+    def test_title_decodes_html_entities(self):
+        response = MagicMock()
+        response.text = "<title>Nội dung &quot;đặc biệt&quot; - YouTube</title>"
+
+        with patch.object(
+            youtube_service.curl_requests,
+            "get",
+            return_value=response,
+        ):
+            title = youtube_service.get_video_title(
+                "https://www.youtube.com/watch?v=video-id"
+            )
+
+        self.assertEqual(title, 'Nội dung "đặc biệt"')
 
     def test_transcript_download_keeps_tls_verification_enabled(self):
         class FakeYoutubeDL:
@@ -77,6 +93,48 @@ class YouTubeServiceTests(unittest.TestCase):
         self.assertNotIn("nocheckcertificate", FakeYoutubeDL.last_options)
         self.assertNotIn("verify", get.call_args.kwargs)
         response.raise_for_status.assert_called_once_with()
+
+    def test_transcript_falls_back_to_transcript_api_when_ytdlp_is_rate_limited(self):
+        class RateLimitedYoutubeDL:
+            def __init__(self, _options):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def extract_info(self, url, download=False):
+                raise urllib.error.HTTPError(url, 429, "Too Many Requests", {}, None)
+
+        class TranscriptSnippet:
+            def __init__(self, text):
+                self.text = text
+
+        transcript_api = MagicMock()
+        transcript_api.fetch.return_value = [
+            TranscriptSnippet("Nội dung dự phòng"),
+            TranscriptSnippet("vẫn đầy đủ"),
+        ]
+
+        with (
+            patch.object(youtube_service, "YoutubeDL", RateLimitedYoutubeDL),
+            patch.object(
+                youtube_service,
+                "YouTubeTranscriptApi",
+                return_value=transcript_api,
+            ),
+        ):
+            transcript = youtube_service.get_video_transcript(
+                "https://www.youtube.com/watch?v=video-id"
+            )
+
+        self.assertEqual(transcript, "Nội dung dự phòng vẫn đầy đủ")
+        transcript_api.fetch.assert_called_once_with(
+            "video-id",
+            languages=("vi", "en"),
+        )
 
 
 if __name__ == "__main__":

@@ -145,6 +145,201 @@ class PromptSettingsTests(unittest.TestCase):
             "voice-second",
         )
 
+    def test_old_prompt_versions_receive_empty_default_youtube_channel(self):
+        data = main._read_prompts_config()
+
+        self.assertEqual(
+            data["versions"]["default"]["default_youtube_channel_id"],
+            "",
+        )
+        self.assertEqual(
+            data["versions"]["second"]["default_youtube_channel_id"],
+            "",
+        )
+
+    def test_default_youtube_channel_save_only_changes_selected_prompt_version(self):
+        before = main._read_prompts_config()
+        with patch.object(
+            main.db,
+            "get_youtube_channel_by_channel_id",
+            return_value={"id": 7, "channel_id": "UC-default", "title": "Kênh A"},
+        ):
+            main.save_prompt_default_youtube_channel(
+                "default",
+                main.PromptDefaultYoutubeChannelData(channel_id=" UC-default "),
+            )
+
+        saved = self.read_saved_data()
+        self.assertEqual(
+            saved["versions"]["default"]["default_youtube_channel_id"],
+            "UC-default",
+        )
+        self.assertEqual(
+            saved["versions"]["second"],
+            before["versions"]["second"],
+        )
+
+    def test_default_youtube_channel_rejects_unconnected_channel(self):
+        with patch.object(
+            main.db,
+            "get_youtube_channel_by_channel_id",
+            return_value=None,
+        ):
+            with self.assertRaises(HTTPException) as error:
+                main.save_prompt_default_youtube_channel(
+                    "default",
+                    main.PromptDefaultYoutubeChannelData(channel_id="UC-missing"),
+                )
+
+        self.assertEqual(error.exception.status_code, 400)
+
+    def test_disconnecting_channel_clears_every_prompt_reference(self):
+        data = self.read_saved_data()
+        for version in data["versions"].values():
+            version["default_youtube_channel_id"] = "UC-disconnected"
+        self.prompts_path.write_text(
+            json.dumps(data, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        cleared = main._clear_prompt_default_youtube_channel_id(
+            "UC-disconnected"
+        )
+        saved = self.read_saved_data()
+
+        self.assertEqual(set(cleared), {"default", "second"})
+        self.assertTrue(
+            all(
+                not version["default_youtube_channel_id"]
+                for version in saved["versions"].values()
+            )
+        )
+
+    def test_video_list_resolves_default_channel_from_its_prompt(self):
+        data = self.read_saved_data()
+        data["versions"]["default"]["default_youtube_channel_id"] = "UC-default"
+        self.prompts_path.write_text(
+            json.dumps(data, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        result = {
+            "total": 1,
+            "count_published": 0,
+            "count_unpublished": 1,
+            "items": [{"id": 12, "prompt_version": "default"}],
+        }
+        with (
+            patch.object(main.db, "get_all_videos", return_value=result),
+            patch.object(
+                main.db,
+                "list_youtube_channels",
+                return_value=[
+                    {"id": 9, "channel_id": "UC-default", "title": "Kênh A"}
+                ],
+            ),
+            patch.object(main, "load_checkpoint", return_value=None),
+        ):
+            response = main.get_videos()
+
+        video = response["items"][0]
+        self.assertEqual(video["default_youtube_channel_id"], "UC-default")
+        self.assertEqual(video["default_youtube_channel_db_id"], 9)
+        self.assertEqual(video["default_youtube_channel_title"], "Kênh A")
+
+    def test_publication_uses_prompt_channel_when_request_omits_channel(self):
+        publication = {"id": 3, "youtube_channel_id": 9}
+        with (
+            patch.object(
+                main.db,
+                "get_video",
+                return_value={"id": 12, "prompt_version": "default"},
+            ),
+            patch.object(
+                main,
+                "_get_prompt_default_youtube_channel_id",
+                return_value="UC-default",
+            ),
+            patch.object(
+                main.db,
+                "get_youtube_channel_by_channel_id",
+                return_value={"id": 9, "channel_id": "UC-default", "title": "Kênh A"},
+            ),
+            patch.object(
+                main,
+                "_get_youtube_access_token",
+                return_value=({"id": 9, "channel_id": "UC-default"}, "token"),
+            ),
+            patch.object(
+                main.youtube_comments,
+                "get_video_details",
+                return_value={
+                    "channel_id": "UC-default",
+                    "title": "Video đã đăng",
+                    "published_at": "2026-09-11T00:00:00Z",
+                },
+            ),
+            patch.object(
+                main.db,
+                "save_video_publication",
+                return_value=publication,
+            ) as save_publication,
+        ):
+            response = main.add_video_publication(
+                12,
+                main.VideoPublicationRequest(
+                    published_url="https://www.youtube.com/watch?v=abc_DEF-12"
+                ),
+            )
+
+        self.assertEqual(response, publication)
+        self.assertEqual(
+            save_publication.call_args.kwargs["youtube_channel_id"],
+            9,
+        )
+
+    def test_publication_without_prompt_channel_is_saved_without_verification(self):
+        publication = {"id": 4, "youtube_channel_id": None}
+        with (
+            patch.object(
+                main.db,
+                "get_video",
+                return_value={"id": 12, "prompt_version": "default"},
+            ),
+            patch.object(
+                main,
+                "_get_prompt_default_youtube_channel_id",
+                return_value="",
+            ),
+            patch.object(main, "_get_youtube_access_token") as get_access_token,
+            patch.object(
+                main.youtube_comments,
+                "get_video_details",
+            ) as get_video_details,
+            patch.object(
+                main.db,
+                "save_video_publication",
+                return_value=publication,
+            ) as save_publication,
+        ):
+            response = main.add_video_publication(
+                12,
+                main.VideoPublicationRequest(
+                    published_url="https://youtu.be/abc_DEF-12"
+                ),
+            )
+
+        self.assertEqual(response["youtube_channel_id"], None)
+        self.assertEqual(
+            save_publication.call_args.kwargs["youtube_channel_id"],
+            None,
+        )
+        self.assertEqual(
+            save_publication.call_args.kwargs["published_url"],
+            "https://www.youtube.com/watch?v=abc_DEF-12",
+        )
+        get_access_token.assert_not_called()
+        get_video_details.assert_not_called()
+
     def test_old_prompt_versions_receive_the_full_default_pipeline(self):
         data = main._read_prompts_config()
 

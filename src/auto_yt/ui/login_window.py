@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import shutil
 
@@ -19,44 +18,22 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from auto_yt.paths import ACCOUNT_PATH, DATA_DIR, SESSION_PATH, gpt_profile_dir
+from auto_yt.paths import gpt_profile_dir
+from auto_yt.services import account_store
 from auto_yt.services.chatgpt_login import ChatGPTLoginError, login_gpt_auto, restore_session
 
 WINDOW_TITLE = "ChatGPT Auto Login"
 
 
-def _extract_gpt_account(data: dict) -> dict:
-    """Extract account fields from either flat or nested config format."""
-    if DEFAULT_GPT_ACCOUNT_KEY in data and isinstance(data[DEFAULT_GPT_ACCOUNT_KEY], dict):
-        return data[DEFAULT_GPT_ACCOUNT_KEY]
-    if "email" in data:
-        return data
-    return {}
-
-
 def _save_account_payload(account: dict) -> None:
-    """Merge account payload back into account.json under gpt_account1."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    existing = {}
-    if ACCOUNT_PATH.exists():
-        try:
-            existing = json.loads(ACCOUNT_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    existing[DEFAULT_GPT_ACCOUNT_KEY] = account
-    ACCOUNT_PATH.write_text(
-        json.dumps(existing, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    """Persist account fields through the encrypted account store."""
+    account_store.save_account(account)
 
 
 def _load_saved_session_cookies() -> list[dict]:
     """Load saved ChatGPT session cookies from account.json."""
-    if not ACCOUNT_PATH.exists():
-        return []
     try:
-        data = json.loads(ACCOUNT_PATH.read_text(encoding="utf-8"))
-        account = _extract_gpt_account(data)
+        account = account_store.load_account()
         cookies = account.get("session_cookie", [])
         return cookies if isinstance(cookies, list) else []
     except Exception:
@@ -64,7 +41,6 @@ def _load_saved_session_cookies() -> list[dict]:
 
 WINDOW_WIDTH = 520
 WINDOW_HEIGHT = 480
-DEFAULT_GPT_ACCOUNT_KEY = "gpt_account1"
 DEFAULT_GPT_PROFILE = "PROFILE_GPT_1"
 
 
@@ -131,17 +107,12 @@ class LoginWorker(QThread):
 
             login_logger.removeHandler(handler)
 
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
             account_payload = dict(self.account)
             account_payload["session_cookie"] = result.get("cookies", [])
             account_payload.setdefault("folder_user_data", DEFAULT_GPT_PROFILE)
             _save_account_payload(account_payload)
 
-            SESSION_PATH.write_text(
-                json.dumps(result, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            self.log.emit(f"💾 Session saved to {SESSION_PATH.name}")
+            self.log.emit("💾 Session saved in encrypted account storage")
             self.finished.emit(result)
 
         except ChatGPTLoginError as exc:
@@ -321,11 +292,8 @@ class LoginWindow(QWidget):
     # --- Config persistence -----------------------------------------------
 
     def _load_config(self):
-        if not ACCOUNT_PATH.exists():
-            return
         try:
-            data = json.loads(ACCOUNT_PATH.read_text(encoding="utf-8"))
-            account = _extract_gpt_account(data)
+            account = account_store.load_account()
             self.email_input.setText(account.get("email", ""))
             self.password_input.setText(account.get("password", ""))
             self.totp_input.setText(account.get("totp_secret", ""))
@@ -339,23 +307,17 @@ class LoginWindow(QWidget):
             pass
 
     def _save_config(self):
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
         current_email = self.email_input.text().strip()
         session_cookie = self._saved_cookies if current_email == self._saved_email else []
-        data = {
-            DEFAULT_GPT_ACCOUNT_KEY: {
-                "email": current_email,
-                "password": self.password_input.text(),
-                "totp_secret": self.totp_input.text().strip(),
-                "session_cookie": session_cookie,
-                "folder_user_data": str(gpt_profile_dir(DEFAULT_GPT_PROFILE)),
-                "type_account": "unknown",
-            }
+        account = {
+            "email": current_email,
+            "password": self.password_input.text(),
+            "totp_secret": self.totp_input.text().strip(),
+            "session_cookie": session_cookie,
+            "folder_user_data": str(gpt_profile_dir(DEFAULT_GPT_PROFILE)),
+            "type_account": "unknown",
         }
-        ACCOUNT_PATH.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        account_store.save_account(account)
         self._saved_email = current_email
         self._saved_cookies = session_cookie
 
@@ -397,8 +359,7 @@ class LoginWindow(QWidget):
 
     def _on_clear(self):
         self._saved_cookies = []
-        if SESSION_PATH.exists():
-            SESSION_PATH.unlink()
+        account_store.clear_account()
         profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
         if profile_dir.exists():
             shutil.rmtree(profile_dir, ignore_errors=True)

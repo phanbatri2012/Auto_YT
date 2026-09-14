@@ -147,6 +147,22 @@ async def _raise_if_cloudflare_or_captcha(page) -> None:
 
 async def _get_visible_error_text(page) -> str | None:
     """Return a visible auth error text from common OpenAI/Auth0 locations."""
+    try:
+        on_auth_domain = AUTH_DOMAIN in page.url
+    except Exception:
+        on_auth_domain = False
+    on_auth_form = False
+    if not on_auth_domain:
+        for selector in (SEL_EMAIL_INPUT, SEL_PASSWORD_INPUT, SEL_MFA_INPUT):
+            try:
+                if await page.locator(selector).first.is_visible(timeout=300):
+                    on_auth_form = True
+                    break
+            except Exception:
+                continue
+    if not on_auth_domain and not on_auth_form:
+        return None
+
     error_selectors = (
         '[role="alert"]',
         '[data-testid*="error"]',
@@ -236,9 +252,6 @@ async def _verify_logged_in(page) -> dict:
                     "plan":  user_info.get("plan", ""),
                 },
             }
-        if auth_status == "logged_out":
-            return {"logged_in": False, "user": None}
-
     # DOM fallback
     try:
         await page.locator(SEL_PROFILE_BUTTON).first.wait_for(state="visible", timeout=5_000)
@@ -370,6 +383,14 @@ async def login_gpt_auto(account: dict, page) -> dict:
 
     await _raise_known_auth_error(page, "email")
 
+    verify = await _verify_logged_in(page)
+    if verify["logged_in"]:
+        return {
+            "success": True,
+            "cookies": await context.cookies(),
+            "user": verify["user"],
+        }
+
     # --- Step 4: Password ------------------------------------------------
     logger.info("[4] Entering password (and handling SSO intermediate screens)")
     
@@ -415,6 +436,13 @@ async def login_gpt_auto(account: dict, page) -> dict:
     try:
         await _fill_and_submit(page, SEL_PASSWORD_INPUT, password)
     except Exception as exc:
+        verify = await _verify_logged_in(page)
+        if verify["logged_in"]:
+            return {
+                "success": True,
+                "cookies": await context.cookies(),
+                "user": verify["user"],
+            }
         await _raise_known_auth_error(page, "password-form")
         raise ChatGPTLoginError(f"Password field not found: {exc}") from exc
 

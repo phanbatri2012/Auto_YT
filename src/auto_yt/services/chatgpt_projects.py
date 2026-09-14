@@ -6,6 +6,7 @@ from auto_yt.paths import PROMPTS_PATH
 
 
 CHATGPT_PROJECT_URL_ENV = "CHATGPT_PROJECT_URL"
+DEFAULT_CHATGPT_BOOTSTRAP_URL = "https://chatgpt.com/"
 DEFAULT_CHATGPT_PROJECT_URL = (
     "https://chatgpt.com/g/"
     "g-p-6a1f9204f2d88191b39b64eb7f2dbb97-dd-vn2-phan-tich/project"
@@ -100,6 +101,7 @@ def add_project_defaults(data: dict) -> dict:
     for version in normalized.get("versions", {}).values():
         version.setdefault("project_url", DEFAULT_CHATGPT_PROJECT_URL)
         version.setdefault("default_voice_id", "")
+        version.setdefault("default_youtube_channel_id", "")
         version["pipeline"] = normalize_prompt_pipeline(version.get("pipeline"))
     return normalized
 
@@ -109,6 +111,14 @@ def validate_prompt_projects(data: dict) -> dict:
     source_versions = data.get("versions", {}) if isinstance(data, dict) else {}
     for version_id, version in normalized.get("versions", {}).items():
         version["project_url"] = validate_project_url(version["project_url"])
+        default_channel_id = str(
+            version.get("default_youtube_channel_id", "") or ""
+        ).strip()
+        if len(default_channel_id) > 100:
+            raise ValueError(
+                f"YouTube Channel ID của bộ prompt {version_id} quá dài."
+            )
+        version["default_youtube_channel_id"] = default_channel_id
         source_version = source_versions.get(version_id, {})
         source_pipeline = (
             source_version.get("pipeline")

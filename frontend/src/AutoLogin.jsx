@@ -6,7 +6,8 @@ export default function AutoLogin() {
     email: '',
     password: '',
     totp_secret: '',
-    headless: true
+    password_configured: false,
+    totp_configured: false,
   });
   const [loadingMsg, setLoadingMsg] = useState('');
   const [resultMsg, setResultMsg] = useState('');
@@ -14,7 +15,14 @@ export default function AutoLogin() {
   useEffect(() => {
     fetch('http://127.0.0.1:8080/api/account')
       .then(res => res.json())
-      .then(data => setAccount(data))
+      .then(data => setAccount(prev => ({
+        ...prev,
+        email: data.email || '',
+        password: '',
+        totp_secret: '',
+        password_configured: Boolean(data.password_configured),
+        totp_configured: Boolean(data.totp_configured),
+      })))
       .catch(err => console.error("Lỗi khi lấy account", err));
   }, []);
 
@@ -29,13 +37,25 @@ export default function AutoLogin() {
   const handleSave = async () => {
     try {
       setLoadingMsg('Đang lưu cấu hình...');
-      await fetch('http://127.0.0.1:8080/api/account', {
+      const response = await fetch('http://127.0.0.1:8080/api/account', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(account)
+        body: JSON.stringify({
+          email: account.email,
+          password: account.password,
+          totp_secret: account.totp_secret,
+        })
       });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setAccount(prev => ({
+        ...prev,
+        password: '',
+        totp_secret: '',
+        password_configured: prev.password_configured || Boolean(prev.password),
+        totp_configured: prev.totp_configured || Boolean(prev.totp_secret),
+      }));
       setResultMsg('✅ Đã lưu cấu hình thành công!');
-    } catch (err) {
+    } catch {
       setResultMsg('❌ Lỗi khi lưu cấu hình.');
     } finally {
       setLoadingMsg('');
@@ -47,9 +67,15 @@ export default function AutoLogin() {
     try {
       setLoadingMsg('Đang xóa thông tin...');
       await fetch('http://127.0.0.1:8080/api/clear-account', { method: 'POST' });
-      setAccount({ email: '', password: '', totp_secret: '', headless: true });
+      setAccount({
+        email: '',
+        password: '',
+        totp_secret: '',
+        password_configured: false,
+        totp_configured: false,
+      });
       setResultMsg('✅ Đã xóa thông tin thành công!');
-    } catch (err) {
+    } catch {
       setResultMsg('❌ Lỗi khi xóa thông tin.');
     } finally {
       setLoadingMsg('');
@@ -61,7 +87,7 @@ export default function AutoLogin() {
       setLoadingMsg('Đang mở trình duyệt...');
       await fetch('http://127.0.0.1:8080/api/open-profile', { method: 'POST' });
       setResultMsg('🌐 Đang mở cửa sổ Chrome (Sẽ tự đóng sau 10 phút hoặc khi bạn tắt).');
-    } catch (err) {
+    } catch {
       setResultMsg('❌ Lỗi khi mở trình duyệt.');
     } finally {
       setLoadingMsg('');
@@ -79,7 +105,7 @@ export default function AutoLogin() {
       } else {
         setResultMsg(`❌ Lỗi Auto Login: ${data.error || data.message}`);
       }
-    } catch (err) {
+    } catch {
       setResultMsg('❌ Lỗi kết nối tới Backend.');
     } finally {
       setLoadingMsg('');
@@ -110,36 +136,25 @@ export default function AutoLogin() {
             name="password" 
             value={account.password} 
             onChange={handleChange} 
-            placeholder="Nhập mật khẩu..." 
+            placeholder={account.password_configured ? 'Đã lưu — để trống để giữ nguyên' : 'Nhập mật khẩu...'}
           />
         </div>
 
         <div className="form-group">
           <label>Mã bảo mật 2FA (TOTP Secret) - Tùy chọn:</label>
           <input 
-            type="text" 
+            type="password"
             name="totp_secret" 
             value={account.totp_secret} 
             onChange={handleChange} 
-            placeholder="ABC123XYZ..." 
+            placeholder={account.totp_configured ? 'Đã lưu — để trống để giữ nguyên' : 'ABC123XYZ...'}
           />
         </div>
 
-        <div className="form-group checkbox-group">
-          <label className="switch">
-            <input 
-              type="checkbox" 
-              name="headless" 
-              checked={account.headless} 
-              onChange={handleChange} 
-            />
-            <span className="slider round"></span>
-          </label>
-          <span className="checkbox-label">Chạy Ẩn (Headless Mode)</span>
-          <p className="help-text" style={{margin: '5px 0 0 50px', fontSize: '0.85em', color: '#888'}}>
-            Tắt đi nếu bạn muốn trình duyệt mở lên để tự giải CAPTCHA hoặc xác minh Cloudflare.
-          </p>
-        </div>
+        <p className="help-text" style={{fontSize: '0.85em', color: '#888'}}>
+          Cấu hình chạy ẩn và Chế độ chơi game nằm trong Settings. Auto Login
+          và Open Profile luôn mở trình duyệt vì đây là thao tác do bạn chủ động gọi.
+        </p>
         
         <div className="action-buttons">
           <button className="btn-save" onClick={handleSave}>💾 Save Settings</button>

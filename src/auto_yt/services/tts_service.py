@@ -7,6 +7,11 @@ import time
 import sys
 
 from auto_yt.paths import DATA_DIR
+from auto_yt.services.secret_store import (
+    encrypt_secret,
+    read_encrypted_secret_file,
+    write_private_text,
+)
 
 API_KEY_FILE = DATA_DIR / "genmax_api_key.txt"
 BASE_URL = "https://api.genmax.io/v1"
@@ -15,6 +20,8 @@ MAX_WAIT_SECONDS = 40 * 60
 HISTORY_PAGE_SIZE = 100
 HISTORY_PAGES_TO_CHECK = 3
 MAX_TTS_CHARS_PER_TASK = 9_000
+MAX_TTS_TOTAL_CHARS = max(9_000, int(os.environ.get("AUTO_YT_MAX_TTS_CHARS", "200000")))
+MAX_GENMAX_RESPONSE_BYTES = 5 * 1024 * 1024
 BATCH_REQUEST_VERSION = 1
 PROVIDER = "minimax"
 MODEL_ID = "speech-2.8-hd"
@@ -32,7 +39,7 @@ def _get_api_key() -> str:
         return environment_key
 
     if API_KEY_FILE.exists():
-        file_key = API_KEY_FILE.read_text(encoding="utf-8").strip()
+        file_key = read_encrypted_secret_file(API_KEY_FILE)
         if file_key:
             return file_key
 
@@ -42,13 +49,46 @@ def _get_api_key() -> str:
     )
 
 
-def _build_payload(text: str) -> dict:
+def migrate_api_key_storage() -> None:
+    """Encrypt a legacy plaintext Genmax key without making an API request."""
+    if API_KEY_FILE.exists():
+        read_encrypted_secret_file(API_KEY_FILE)
+
+
+def has_api_key() -> bool:
+    try:
+        return bool(_get_api_key())
+    except ValueError:
+        return False
+
+
+def save_api_key(api_key: str) -> None:
+    normalized_key = str(api_key or "").strip()
+    if len(normalized_key) < 16 or len(normalized_key) > 512:
+        raise ValueError("Genmax API key không hợp lệ.")
+    write_private_text(API_KEY_FILE, encrypt_secret(normalized_key))
+
+
+def delete_api_key() -> None:
+    API_KEY_FILE.unlink(missing_ok=True)
+
+
+def _build_payload(text: str, settings: dict | None = None) -> dict:
+    settings = settings or {}
+    voice_settings = {
+        **VOICE_SETTINGS,
+        **{
+            key: settings[key]
+            for key in ("speed", "pitch", "vol")
+            if key in settings
+        },
+    }
     return {
         "text": text,
-        "provider": PROVIDER,
-        "model_id": MODEL_ID,
-        "language_code": LANGUAGE_CODE,
-        "voice_settings": VOICE_SETTINGS,
+        "provider": str(settings.get("provider") or PROVIDER),
+        "model_id": str(settings.get("model_id") or MODEL_ID),
+        "language_code": str(settings.get("language_code") or LANGUAGE_CODE),
+        "voice_settings": voice_settings,
     }
 
 
@@ -73,6 +113,12 @@ def split_text_for_tts(
     """Split long TTS input at natural boundaries below the provider limit."""
     if max_chars <= 0:
         raise ValueError("max_chars must be positive")
+
+    if len(text) > MAX_TTS_TOTAL_CHARS:
+        raise ValueError(
+            "Kịch bản vượt giới hạn an toàn cho một lượt tạo audio "
+            f"({MAX_TTS_TOTAL_CHARS:,} ký tự)."
+        )
 
     remaining = text.strip()
     chunks = []
@@ -130,18 +176,29 @@ def _request_json(url: str, method: str = "GET", payload: dict = None) -> dict:
 
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
+            raw = response.read(MAX_GENMAX_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_GENMAX_RESPONSE_BYTES:
+                raise RuntimeError("Genmax returned a response that is too large.")
+            return json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
+        error_body = exc.read(64 * 1024).decode("utf-8", errors="replace")
         raise RuntimeError(f"Genmax API error: {exc.code} - {error_body}") from exc
     except (urllib.error.URLError, TimeoutError) as exc:
         raise RuntimeError(f"Không thể kết nối Genmax: {exc}") from exc
 
 
-def submit_tts_task(text: str, voice_id: str) -> dict:
+def submit_tts_task(text: str, voice_id: str, settings: dict | None = None) -> dict:
+    if not str(text or "").strip():
+        raise ValueError("Nội dung tạo audio không được để trống.")
+    if len(text) > MAX_TTS_CHARS_PER_TASK:
+        raise ValueError("Một tác vụ Genmax vượt giới hạn ký tự cho phép.")
     print(">>> SUBMITTING AUDIO TASK (TTS)...", file=sys.stderr)
     url = f"{BASE_URL}/text-to-speech/{voice_id}"
-    response = _request_json(url, method="POST", payload=_build_payload(text))
+    response = _request_json(
+        url,
+        method="POST",
+        payload=_build_payload(text, settings),
+    )
     task_id = response.get("id")
     if not task_id:
         raise RuntimeError("Genmax không trả về Task ID.")

@@ -80,6 +80,7 @@ class VoiceSelectionTests(unittest.TestCase):
                     SCRIPT,
                     voice_id=VOICE_ID,
                     voice_name="Giọng kể chuyện",
+                    tts_provider_id="omnivoice",
                 )
                 task = database.upsert_audio_task(
                     video_id=video_id,
@@ -95,6 +96,7 @@ class VoiceSelectionTests(unittest.TestCase):
                 self.assertEqual(video["voice_id"], VOICE_ID)
                 self.assertEqual(video["voice_name"], "Giọng kể chuyện")
                 self.assertEqual(dashboard_video["voice_name"], "Giọng kể chuyện")
+                self.assertEqual(dashboard_video["tts_provider_id"], "omnivoice")
                 self.assertEqual(task["voice_id"], VOICE_ID)
 
     def test_audio_submission_uses_voice_saved_on_video(self):

@@ -84,6 +84,15 @@ test('legacy video import supports channel-wide selection with exact dedupe stat
   assert.match(commentsSource, /Chọn tất cả có thể nhập/)
 })
 
+test('legacy video import reports request and terminal job outcomes in place', () => {
+  assert.match(commentsSource, /const \[importMessage, setImportMessage\]/)
+  assert.match(commentsSource, /const \[importTrackedJobIds, setImportTrackedJobIds\]/)
+  assert.match(commentsSource, /api\/jobs\/\$\{jobId\}/)
+  assert.match(commentsSource, /setImportTrackedJobIds\(trackedJobIds\)/)
+  assert.match(commentsSource, /aria-live="polite"/)
+  assert.match(commentsSource, /Promise\.allSettled/)
+})
+
 test('legacy import only offers prompt sets assigned to the selected channel', () => {
   assert.match(commentsSource, /default_youtube_channel_id/)
   assert.match(commentsSource, /selectedImportChannel\?\.channel_id/)

@@ -24,6 +24,34 @@ const IMPORT_STATUS_LABELS = {
   channel_conflict: 'Đã liên kết với kênh khác — bỏ qua'
 }
 
+const ACTIVE_IMPORT_JOB_STATUSES = new Set(['queued', 'running', 'retry_wait', 'paused'])
+
+function buildLegacyImportRequestMessage(data) {
+  const skipped = Number(data.skipped_error || 0)
+  const duplicateJobs = Number(data.duplicate_jobs || 0)
+  const prefix = data.queued || data.created || data.linked || data.already_ready ? '✅' : '⚠️'
+  return (
+    `${prefix} Đã xử lý ${data.requested || 0} video: tạo ${data.created || 0}, ` +
+    `liên kết ${data.linked || 0}, xếp hàng tạo Chat ${data.queued || 0}, ` +
+    `đã sẵn sàng ${data.already_ready || 0}, job đang tồn tại ${duplicateJobs}, ` +
+    `bỏ qua ${skipped}.`
+  )
+}
+
+function buildLegacyImportTerminalMessage(jobs) {
+  const succeeded = jobs.filter(job => job.status === 'done').length
+  const failedJobs = jobs.filter(job => job.status !== 'done')
+  if (!failedJobs.length) {
+    return `✅ Đã tạo Chat thành công cho ${succeeded} video.`
+  }
+  const prefix = succeeded ? '⚠️' : '❌'
+  const firstError = failedJobs.find(job => job.error)?.error || ''
+  return (
+    `${prefix} Tạo Chat hoàn tất: thành công ${succeeded}, thất bại ${failedJobs.length}.` +
+    (firstError ? ` ${firstError}` : ' Hãy xem chi tiết trong Trung tâm Job.')
+  )
+}
+
 export default function YouTubeComments({ onOpenVideo, refreshKey }) {
   const [channels, setChannels] = useState([])
   const [comments, setComments] = useState([])
@@ -47,6 +75,8 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
   const [importCounts, setImportCounts] = useState({})
   const [importSelectedIds, setImportSelectedIds] = useState([])
   const [importBusy, setImportBusy] = useState(false)
+  const [importMessage, setImportMessage] = useState('')
+  const [importTrackedJobIds, setImportTrackedJobIds] = useState([])
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
 
@@ -94,6 +124,24 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
     setComments(Array.isArray(data.items) ? data.items : [])
     setCounts(data.counts || {})
   }, [channelFilter, videoFilter, statusFilter, debouncedSearch])
+
+  const refreshLegacyVideoInventory = useCallback(async () => {
+    const response = await fetch(`${API_BASE}/api/youtube-comments/import-preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        channel_id: Number(importChannelId),
+        published_url: importUrl.trim()
+      })
+    })
+    const data = await response.json()
+    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+    const items = Array.isArray(data.items) ? data.items : []
+    setImportItems(items)
+    setImportCounts(data.counts || {})
+    setImportSelectedIds(items.filter(item => item.eligible).map(item => item.youtube_video_id))
+    return { data, items }
+  }, [importChannelId, importUrl])
 
   useEffect(() => {
     const timeout = setTimeout(() => setDebouncedSearch(search.trim()), 250)
@@ -307,28 +355,15 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
 
   const loadLegacyVideos = async () => {
     setImportBusy(true)
-    setMessage('')
+    setImportMessage('')
     try {
-      const response = await fetch(`${API_BASE}/api/youtube-comments/import-preview`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          channel_id: Number(importChannelId),
-          published_url: importUrl.trim()
-        })
-      })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
-      const items = Array.isArray(data.items) ? data.items : []
-      setImportItems(items)
-      setImportCounts(data.counts || {})
-      setImportSelectedIds(items.filter(item => item.eligible).map(item => item.youtube_video_id))
-      setMessage(`✅ Đã đối chiếu ${items.length} video; ${data.counts?.eligible || 0} video có thể nhập.`)
+      const { data, items } = await refreshLegacyVideoInventory()
+      setImportMessage(`✅ Đã đối chiếu ${items.length} video; ${data.counts?.eligible || 0} video có thể nhập.`)
     } catch (error) {
       setImportItems([])
       setImportCounts({})
       setImportSelectedIds([])
-      setMessage(`❌ ${error.message}`)
+      setImportMessage(`❌ ${error.message}`)
     } finally {
       setImportBusy(false)
     }
@@ -336,7 +371,7 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
 
   const startLegacyVideoImport = async () => {
     setImportBusy(true)
-    setMessage('')
+    setImportMessage('')
     try {
       const response = await fetch(`${API_BASE}/api/youtube-comments/import`, {
         method: 'POST',
@@ -348,19 +383,89 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
         })
       })
       const data = await response.json()
-      if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
-      await Promise.all([loadPublications(), loadComments()])
-      await loadLegacyVideos()
-      setMessage(
-        `✅ Đã xử lý ${data.requested} video: tạo ${data.created}, liên kết ${data.linked}, ` +
-        `xếp hàng tạo Chat ${data.queued}; giữ nguyên ${data.already_ready} video đã sẵn sàng.`
-      )
+      if (!response.ok || data.success === false) {
+        throw new Error(data.detail || data.error || `HTTP ${response.status}`)
+      }
+      const trackedJobIds = Array.isArray(data.job_ids)
+        ? data.job_ids.filter(jobId => typeof jobId === 'string' && jobId)
+        : []
+      setImportTrackedJobIds(trackedJobIds)
+      setImportMessage(buildLegacyImportRequestMessage(data))
+
+      const refreshResults = await Promise.allSettled([
+        loadVideos(),
+        loadPublications(),
+        loadComments()
+      ])
+      if (refreshResults.some(result => result.status === 'rejected')) {
+        setImportMessage(previous => (
+          `${previous} ⚠️ Dữ liệu đã được lưu nhưng chưa thể làm mới đầy đủ giao diện.`
+        ))
+      }
     } catch (error) {
-      setMessage(`❌ ${error.message}`)
+      setImportMessage(`❌ ${error.message}`)
     } finally {
       setImportBusy(false)
     }
   }
+
+  useEffect(() => {
+    if (!importTrackedJobIds.length) return undefined
+    let stopped = false
+    let polling = false
+
+    const pollImportJobs = async () => {
+      if (polling) return
+      polling = true
+      try {
+        const jobs = await Promise.all(importTrackedJobIds.map(async jobId => {
+          const response = await fetch(`${API_BASE}/api/jobs/${jobId}`)
+          const data = await response.json()
+          if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+          return data
+        }))
+        if (stopped) return
+
+        const activeCount = jobs.filter(job => ACTIVE_IMPORT_JOB_STATUSES.has(job.status)).length
+        const succeeded = jobs.filter(job => job.status === 'done').length
+        const failed = jobs.length - activeCount - succeeded
+        if (activeCount) {
+          setImportMessage(
+            `⏳ Đang tạo Chat: ${activeCount} đang xử lý, ${succeeded} thành công, ${failed} thất bại.`
+          )
+          return
+        }
+
+        setImportMessage(buildLegacyImportTerminalMessage(jobs))
+        setImportTrackedJobIds([])
+        void Promise.allSettled([
+          loadVideos(),
+          loadPublications(),
+          loadComments(),
+          refreshLegacyVideoInventory()
+        ])
+      } catch (error) {
+        if (!stopped) {
+          setImportMessage(`⚠️ Job đã được tạo nhưng chưa thể cập nhật trạng thái: ${error.message}`)
+        }
+      } finally {
+        polling = false
+      }
+    }
+
+    void pollImportJobs()
+    const interval = setInterval(pollImportJobs, 2000)
+    return () => {
+      stopped = true
+      clearInterval(interval)
+    }
+  }, [
+    importTrackedJobIds,
+    loadComments,
+    loadPublications,
+    loadVideos,
+    refreshLegacyVideoInventory
+  ])
 
   const toggleImportVideo = youtubeVideoId => {
     setImportSelectedIds(previous => previous.includes(youtubeVideoId)
@@ -500,11 +605,13 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
           <select
             aria-label="Kênh nhập video cũ"
             value={importChannelId}
+            disabled={importBusy || importTrackedJobIds.length > 0}
             onChange={event => {
               setImportChannelId(event.target.value)
               setImportItems([])
               setImportCounts({})
               setImportSelectedIds([])
+              setImportMessage('')
             }}
           >
             {!channels.length && <option value="">Chưa kết nối kênh YouTube</option>}
@@ -515,7 +622,11 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
           <select
             aria-label="Bộ prompt cho video cũ"
             value={importPromptVersion}
-            onChange={event => setImportPromptVersion(event.target.value)}
+            disabled={importBusy || importTrackedJobIds.length > 0}
+            onChange={event => {
+              setImportPromptVersion(event.target.value)
+              setImportMessage('')
+            }}
           >
             {!importPromptOptions.length && (
               <option value="">Kênh chưa được gắn với bộ prompt trong Settings</option>
@@ -526,17 +637,37 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
           </select>
           <input
             value={importUrl}
-            onChange={event => setImportUrl(event.target.value)}
+            disabled={importBusy || importTrackedJobIds.length > 0}
+            onChange={event => {
+              setImportUrl(event.target.value)
+              setImportMessage('')
+            }}
             placeholder="Tùy chọn: link một video; để trống để lấy toàn bộ video của kênh"
           />
           <button
             className="btn-secondary"
-            disabled={importBusy || !importChannelId || !importPromptVersion}
-            onClick={loadLegacyVideos}
+            disabled={importBusy || importTrackedJobIds.length > 0 || !importChannelId || !importPromptVersion}
+            onClick={() => loadLegacyVideos()}
           >
             {importBusy ? 'Đang đối chiếu...' : 'Tải danh sách & kiểm tra trùng'}
           </button>
         </div>
+
+        {importMessage && (
+          <div
+            role={importMessage.startsWith('❌') ? 'alert' : 'status'}
+            aria-live="polite"
+            style={{
+              marginTop: 12,
+              padding: '10px 12px',
+              borderRadius: 6,
+              border: `1px solid ${importMessage.startsWith('❌') ? '#ff6b6b' : '#4dd0e1'}`,
+              color: importMessage.startsWith('❌') ? '#ff6b6b' : '#4dd0e1'
+            }}
+          >
+            {importMessage}
+          </div>
+        )}
 
         {!!importItems.length && (
           <div style={{ marginTop: 16 }}>
@@ -544,6 +675,7 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
               <label>
                 <input
                   type="checkbox"
+                  disabled={importBusy || importTrackedJobIds.length > 0}
                   checked={importEligibleIds.length > 0 && importSelectedIds.length === importEligibleIds.length}
                   onChange={event => setImportSelectedIds(event.target.checked ? importEligibleIds : [])}
                 />{' '}
@@ -555,10 +687,12 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
               <button
                 className="btn-run"
                 style={{ width: 'auto', marginLeft: 'auto' }}
-                disabled={importBusy || !importSelectedIds.length || !importPromptVersion}
+                disabled={importBusy || importTrackedJobIds.length > 0 || !importSelectedIds.length || !importPromptVersion}
                 onClick={startLegacyVideoImport}
               >
-                Nhập {importSelectedIds.length} video đã chọn
+                {importTrackedJobIds.length
+                  ? `Đang tạo Chat (${importTrackedJobIds.length})...`
+                  : `Nhập ${importSelectedIds.length} video đã chọn`}
               </button>
             </div>
             <div style={{ maxHeight: 420, overflowY: 'auto', marginTop: 12, display: 'grid', gap: 8 }}>

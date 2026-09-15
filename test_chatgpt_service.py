@@ -10,6 +10,279 @@ from auto_yt.services.chatgpt_runtime import ChatGPTAttentionRequiredError
 
 
 class ChatGptServiceTests(unittest.TestCase):
+    def test_assistant_reader_uses_every_non_empty_markdown_region(self):
+        message = Mock()
+        markdown_nodes = Mock()
+        empty_markdown = Mock()
+        content_markdown = Mock()
+        markdown_nodes.count.return_value = 2
+        markdown_nodes.first = empty_markdown
+        markdown_nodes.nth.side_effect = [empty_markdown, content_markdown]
+        empty_markdown.count.return_value = 1
+        empty_markdown.inner_text.return_value = ""
+        content_markdown.inner_text.return_value = "Metadata đầy đủ"
+        message.locator.return_value = markdown_nodes
+        message.inner_text.return_value = "Metadata đầy đủ"
+
+        response = chatgpt_worker._read_assistant_message(message)
+
+        self.assertEqual(response, "Metadata đầy đủ")
+
+    def test_assistant_reader_falls_back_when_markdown_region_is_empty(self):
+        message = Mock()
+        markdown_nodes = Mock()
+        empty_markdown = Mock()
+        markdown_nodes.count.return_value = 1
+        markdown_nodes.first = empty_markdown
+        markdown_nodes.nth.return_value = empty_markdown
+        empty_markdown.count.return_value = 1
+        empty_markdown.inner_text.return_value = ""
+        message.locator.return_value = markdown_nodes
+        message.inner_text.return_value = "Nội dung trong assistant message"
+
+        response = chatgpt_worker._read_assistant_message(message)
+
+        self.assertEqual(response, "Nội dung trong assistant message")
+
+    def test_reads_assistant_after_latest_user_when_dom_counts_are_stable(self):
+        page = Mock()
+        messages = Mock()
+        old_user = Mock()
+        old_assistant = Mock()
+        latest_user = Mock()
+        latest_assistant = Mock()
+        messages.count.return_value = 4
+        message_nodes = [
+            old_user,
+            old_assistant,
+            latest_user,
+            latest_assistant,
+        ]
+        messages.nth.side_effect = lambda index: message_nodes[index]
+        old_user.get_attribute.return_value = "user"
+        old_assistant.get_attribute.return_value = "assistant"
+        latest_user.get_attribute.return_value = "user"
+        latest_user.inner_text.return_value = "Prompt metadata"
+        latest_assistant.get_attribute.return_value = "assistant"
+        page.locator.return_value = messages
+
+        with patch.object(
+            chatgpt_worker,
+            "_read_assistant_message",
+            return_value="Metadata mới",
+        ) as read_message:
+            response = chatgpt_worker.get_assistant_response_after_latest_user(
+                page,
+                expected_user_text="Prompt metadata",
+            )
+
+        self.assertEqual(response, "Metadata mới")
+        read_message.assert_called_once_with(latest_assistant)
+
+    def test_response_timeout_recovers_by_reloading_without_resending(self):
+        page = Mock()
+        with (
+            patch.object(
+                chatgpt_worker,
+                "dismiss_external_app_permission_dialog",
+                return_value=False,
+            ),
+            patch.object(
+                chatgpt_worker,
+                "is_chatgpt_generation_active",
+                return_value=False,
+            ),
+            patch.object(
+                chatgpt_worker,
+                "get_new_assistant_response",
+                return_value="",
+            ),
+            patch.object(
+                chatgpt_worker,
+                "recover_assistant_response_after_reload",
+                return_value="Metadata recovered",
+            ) as recover_response,
+            patch.object(
+                chatgpt_worker.time,
+                "monotonic",
+                side_effect=[0, 2],
+            ),
+        ):
+            response = chatgpt_worker.wait_for_assistant_response(
+                page,
+                previous_assistant_turn=4,
+                timeout=1,
+                submitted_prompt_text="Prompt metadata",
+            )
+
+        self.assertEqual(response, "Metadata recovered")
+        recover_response.assert_called_once_with(page, "Prompt metadata")
+
+    def test_response_wait_uses_latest_user_fallback_after_busy_state(self):
+        page = Mock()
+        with (
+            patch.object(
+                chatgpt_worker,
+                "dismiss_external_app_permission_dialog",
+                return_value=False,
+            ),
+            patch.object(
+                chatgpt_worker,
+                "is_chatgpt_generation_active",
+                side_effect=[True, False, False],
+            ),
+            patch.object(
+                chatgpt_worker,
+                "get_new_assistant_response",
+                return_value="",
+            ),
+            patch.object(
+                chatgpt_worker,
+                "get_assistant_response_after_latest_user",
+                side_effect=["", "Metadata generated", "Metadata generated"],
+            ) as fallback_response,
+            patch.object(
+                chatgpt_worker.time,
+                "monotonic",
+                side_effect=[0, 0.5, 1, 2.1],
+            ),
+            patch.object(chatgpt_worker.time, "sleep"),
+        ):
+            response = chatgpt_worker.wait_for_assistant_response(
+                page,
+                previous_assistant_turn=4,
+                timeout=20,
+                submitted_prompt_text="Prompt metadata",
+            )
+
+        self.assertEqual(response, "Metadata generated")
+        self.assertEqual(fallback_response.call_count, 3)
+
+    def test_response_recovery_reloads_the_same_conversation_once(self):
+        page = Mock(url="https://chatgpt.com/c/saved-chat")
+        prompt_locator = Mock()
+        prompt_editor = Mock()
+        prompt_locator.first = prompt_editor
+        page.locator.return_value = prompt_locator
+
+        with (
+            patch.object(chatgpt_worker, "check_chatgpt_page_attention"),
+            patch.object(
+                chatgpt_worker,
+                "ensure_expected_conversation_page",
+            ) as ensure_conversation,
+            patch.object(
+                chatgpt_worker,
+                "wait_for_conversation_history",
+            ) as wait_for_history,
+            patch.object(
+                chatgpt_worker,
+                "wait_for_existing_assistant_response",
+                return_value="Metadata recovered",
+            ),
+        ):
+            response = chatgpt_worker.recover_assistant_response_after_reload(
+                page,
+                "Prompt metadata",
+            )
+
+        self.assertEqual(response, "Metadata recovered")
+        page.reload.assert_called_once_with(
+            wait_until="domcontentloaded",
+            timeout=chatgpt_worker.CHATGPT_NAVIGATION_TIMEOUT_MS,
+        )
+        ensure_conversation.assert_called_once_with(page.url, page.url)
+        wait_for_history.assert_called_once_with(page, composer_ready=True)
+
+    def test_pending_generation_prompt_is_recovered_without_resending(self):
+        prompt_text = "Prompt metadata"
+        state = {
+            "current_step": "metadata",
+            "pending_prompt": {
+                "step": "metadata",
+                "fingerprint": chatgpt_worker.get_prompt_fingerprint(prompt_text),
+            },
+        }
+        page = Mock()
+
+        with (
+            patch.object(
+                chatgpt_worker,
+                "recover_pending_prompt_response",
+                return_value="Metadata recovered",
+            ) as recover_response,
+            patch.object(chatgpt_worker, "send_prompt") as send_prompt,
+        ):
+            response = chatgpt_worker.send_or_recover_generation_prompt(
+                page,
+                state,
+                "metadata",
+                prompt_text,
+            )
+
+        self.assertEqual(response, "Metadata recovered")
+        recover_response.assert_called_once_with(page, prompt_text)
+        send_prompt.assert_not_called()
+
+    def test_unresolved_pending_prompt_never_triggers_an_automatic_resend(self):
+        prompt_text = "Prompt metadata"
+        state = {
+            "current_step": "metadata",
+            "pending_prompt": {
+                "step": "metadata",
+                "fingerprint": chatgpt_worker.get_prompt_fingerprint(prompt_text),
+            },
+        }
+
+        with (
+            patch.object(
+                chatgpt_worker,
+                "recover_pending_prompt_response",
+                side_effect=RuntimeError("Response is still unavailable"),
+            ),
+            patch.object(chatgpt_worker, "send_prompt") as send_prompt,
+            self.assertRaisesRegex(RuntimeError, "still unavailable"),
+        ):
+            chatgpt_worker.send_or_recover_generation_prompt(
+                Mock(),
+                state,
+                "metadata",
+                prompt_text,
+            )
+
+        send_prompt.assert_not_called()
+
+    def test_generation_prompt_is_checkpointed_after_submission(self):
+        page = Mock(url="https://chatgpt.com/c/new-chat")
+        state = {"current_step": "metadata", "chat_url": ""}
+
+        def submit_prompt(_page, _prompt, **kwargs):
+            kwargs["on_prompt_submitted"]()
+            return "Metadata generated"
+
+        with (
+            patch.object(chatgpt_worker, "send_prompt", side_effect=submit_prompt),
+            patch.object(
+                chatgpt_worker,
+                "persist_generation_state",
+            ) as persist_state,
+        ):
+            response = chatgpt_worker.send_or_recover_generation_prompt(
+                page,
+                state,
+                "metadata",
+                "Prompt metadata",
+            )
+
+        self.assertEqual(response, "Metadata generated")
+        self.assertEqual(state["pending_prompt"]["step"], "metadata")
+        self.assertEqual(
+            state["pending_prompt"]["fingerprint"],
+            chatgpt_worker.get_prompt_fingerprint("Prompt metadata"),
+        )
+        self.assertEqual(state["chat_url"], page.url)
+        persist_state.assert_called_once_with(state)
+
     def test_external_app_permission_dialog_is_denied_without_app_specific_logic(self):
         page = Mock()
         dialog = Mock()
@@ -101,6 +374,12 @@ class ChatGptServiceTests(unittest.TestCase):
     def test_prompt_validation_allows_question_mark_without_following_space(self):
         chatgpt_worker.validate_prompt_text(
             "Ý kiến người xem: Chỉ khác nhau về thời điểm mà thôi?VD như sau."
+        )
+
+    def test_prompt_validation_allows_multiple_natural_questions(self):
+        chatgpt_worker.validate_prompt_text(
+            "Vì sao nhân vật rời đi? Ai là người kế tục? Điều gì xảy ra? "
+            "Kết quả có thay đổi hay không? Chúng ta học được gì?"
         )
 
     def test_prompt_validation_does_not_treat_json_viewer_text_as_corruption(self):
@@ -581,6 +860,75 @@ class ChatGptServiceTests(unittest.TestCase):
         send_thumbnail.assert_not_called()
         self.assertEqual(result["pipeline"], state["pipeline"])
         self.assertTrue(result["complete_for_audio"])
+
+    def test_video_pipeline_recovers_pending_metadata_without_resending(self):
+        page = Mock(url="https://chatgpt.com/c/saved-chat")
+        context = Mock(pages=[page])
+        state = {
+            "chat_url": page.url,
+            "current_step": "metadata",
+            "expected_body_parts": 1,
+            "outline_parts": ["Part one"],
+            "intro": "Intro complete",
+            "body_parts": ["Body complete"],
+            "outro": "Outro complete",
+            "metadata": "",
+            "chapters": "",
+            "thumb_text": "",
+            "thumb_notext": "",
+            "pending_prompt": {"step": "metadata", "fingerprint": "saved"},
+            "pipeline": {
+                "metadata": True,
+                "chapters": False,
+                "thumbnail_with_text": False,
+                "thumbnail_without_text": False,
+                "audio": False,
+            },
+        }
+        playwright_manager = Mock()
+        playwright_manager.__enter__ = Mock(
+            return_value=Mock(chromium=Mock())
+        )
+        playwright_manager.__exit__ = Mock(return_value=False)
+
+        with (
+            patch.object(chatgpt_worker, "gpt_profile_dir", return_value=Path.cwd()),
+            patch.object(
+                chatgpt_worker,
+                "sync_playwright",
+                return_value=playwright_manager,
+            ),
+            patch.object(
+                chatgpt_worker,
+                "launch_chatgpt_context",
+                return_value=context,
+            ),
+            patch.object(chatgpt_worker, "check_chatgpt_page_attention"),
+            patch.object(chatgpt_worker, "ensure_expected_conversation_page"),
+            patch.object(
+                chatgpt_worker,
+                "ensure_expected_project_conversation_page",
+            ),
+            patch.object(chatgpt_worker, "wait_for_conversation_history"),
+            patch.object(
+                chatgpt_worker,
+                "_pending_prompt_matches",
+                return_value=True,
+            ),
+            patch.object(
+                chatgpt_worker,
+                "recover_pending_prompt_response",
+                return_value="Metadata recovered",
+            ) as recover_response,
+            patch.object(chatgpt_worker, "send_prompt") as send_prompt,
+            patch.object(chatgpt_worker, "persist_generation_state"),
+        ):
+            result = chatgpt_worker._run_complete("Transcript", state)
+
+        self.assertIn("Metadata recovered", result["script"])
+        self.assertNotIn("pending_prompt", state)
+        recover_response.assert_called_once()
+        send_prompt.assert_not_called()
 
     def test_long_worker_is_not_limited_by_a_total_process_timeout(self):
         completed_process = Mock(

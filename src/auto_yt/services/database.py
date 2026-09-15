@@ -885,7 +885,8 @@ def get_all_videos(
         'SELECT id, url, '
         "COALESCE(NULLIF(generated_title, ''), title) AS title, "
         'created_at, is_published, video_status, chat_url, '
-        'prompt_version, voice_id, voice_name, audio_duration_seconds, '
+        'prompt_version, voice_id, voice_name, tts_provider_id, '
+        'audio_duration_seconds, '
         "COALESCE((SELECT status FROM audio_reviews WHERE video_id = videos.id), '') "
         'AS audio_review_status, '
         'SUBSTR(generated_script, 1, 300) as snippet, '

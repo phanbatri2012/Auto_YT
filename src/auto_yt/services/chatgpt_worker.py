@@ -7,6 +7,7 @@ import os
 import re
 import uuid
 import hashlib
+from collections.abc import Callable
 from contextlib import closing
 from urllib.parse import parse_qs, urlparse
 from playwright.sync_api import Error as PlaywrightError
@@ -57,6 +58,8 @@ ASSISTANT_RESPONSE_WAIT_SECONDS = 30
 ASSISTANT_RESPONSE_POLL_SECONDS = 0.5
 ASSISTANT_RESPONSE_STABLE_SECONDS = 5
 ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS = 1
+ASSISTANT_RESPONSE_RELOAD_WAIT_SECONDS = 60
+PENDING_RESPONSE_WAIT_SECONDS = 90
 CHATGPT_COMPOSER_RECOVERY_ATTEMPTS = 3
 CHATGPT_COMPOSER_WAIT_PER_ATTEMPT_MS = 20_000
 CHATGPT_PAGE_RECOVERY_SETTLE_MS = 1_500
@@ -114,7 +117,7 @@ URL_LIKE_TOKEN_PATTERN = re.compile(
 )
 JSON_STRING_LITERAL_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"', flags=re.DOTALL)
 CORRUPTED_UNICODE_PATTERN = re.compile(
-    r"(?:(?<=\w)\?|(?<=\?)\?|\?(?=\w)|\?(?=\?))",
+    r"(?:(?<=\w)\?(?=\w)|\?{2,}(?=\w))",
     flags=re.UNICODE,
 )
 MIN_CORRUPTED_UNICODE_MARKERS = 3
@@ -1376,9 +1379,10 @@ def validate_prompt_text(prompt_text: str) -> None:
     # application's own prompt text was damaged during decoding.
     trusted_prompt_text = JSON_STRING_LITERAL_PATTERN.sub('""', text_without_urls)
     corrupted_markers = CORRUPTED_UNICODE_PATTERN.findall(trusted_prompt_text)
+    corrupted_marker_count = sum(marker.count("?") for marker in corrupted_markers)
     if (
         "\ufffd" in prompt_text
-        or len(corrupted_markers) >= MIN_CORRUPTED_UNICODE_MARKERS
+        or corrupted_marker_count >= MIN_CORRUPTED_UNICODE_MARKERS
     ):
         raise ValueError(
             "The ChatGPT prompt contains corrupted Unicode text. "
@@ -1439,13 +1443,61 @@ def ensure_prompt_editor_integrity(
 
 
 def _read_assistant_message(message) -> str:
-    markdown = message.locator('.markdown').first
-    response_text = (
-        markdown.inner_text()
-        if markdown.count() > 0
-        else message.inner_text()
-    )
-    return clean_text(response_text)
+    markdown_nodes = message.locator('.markdown')
+    markdown_parts = []
+    markdown_count = markdown_nodes.count()
+    if not isinstance(markdown_count, int):
+        markdown_count = 1 if markdown_nodes.first.count() > 0 else 0
+    for index in range(markdown_count):
+        try:
+            markdown_node = (
+                markdown_nodes.first
+                if markdown_count == 1
+                else markdown_nodes.nth(index)
+            )
+            markdown_text = clean_text(markdown_node.inner_text())
+        except Exception:
+            continue
+        if markdown_text and markdown_text not in markdown_parts:
+            markdown_parts.append(markdown_text)
+    if markdown_parts:
+        return "\n\n".join(markdown_parts)
+    return clean_text(message.inner_text())
+
+
+def get_assistant_response_after_latest_user(
+    page: Page,
+    expected_user_text: str = "",
+) -> str:
+    """Read the reply following the latest user message without count baselines."""
+    try:
+        messages = page.locator('[data-message-author-role]')
+        latest_user_index = -1
+        for index in range(messages.count()):
+            role = messages.nth(index).get_attribute("data-message-author-role")
+            if role == "user":
+                latest_user_index = index
+        if latest_user_index < 0:
+            return ""
+
+        latest_user = messages.nth(latest_user_index)
+        if expected_user_text and not prompt_text_matches(
+            expected_user_text,
+            clean_text(latest_user.inner_text()),
+        ):
+            return ""
+
+        response_text = ""
+        for index in range(latest_user_index + 1, messages.count()):
+            message = messages.nth(index)
+            if message.get_attribute("data-message-author-role") != "assistant":
+                continue
+            candidate = _read_assistant_message(message)
+            if candidate:
+                response_text = candidate
+        return response_text
+    except Exception:
+        return ""
 
 
 def get_new_assistant_response(
@@ -1535,6 +1587,9 @@ def wait_for_assistant_response(
     allow_empty_response: bool = False,
     timeout: int = CHATGPT_RESPONSE_TIMEOUT_SECONDS,
     previous_assistant_count: int | None = None,
+    previous_user_turn: int | None = None,
+    previous_user_count: int | None = None,
+    submitted_prompt_text: str = "",
 ) -> str:
     """Wait for a new response without relying only on the stop button."""
     started_at = time.monotonic()
@@ -1553,6 +1608,18 @@ def wait_for_assistant_response(
             previous_assistant_turn,
             previous_assistant_count,
         )
+        new_user_observed = saw_busy_state
+        if not new_user_observed and previous_user_turn is not None:
+            new_user_observed = (
+                get_latest_conversation_turn(page, "user") > previous_user_turn
+            )
+        if not new_user_observed and previous_user_count is not None:
+            new_user_observed = get_user_message_count(page) > previous_user_count
+        if not response_text and new_user_observed:
+            response_text = get_assistant_response_after_latest_user(
+                page,
+                expected_user_text=submitted_prompt_text,
+            )
         now = time.monotonic()
 
         if response_text != last_response:
@@ -1592,12 +1659,97 @@ def wait_for_assistant_response(
                     previous_assistant_turn,
                     previous_assistant_count or 0,
                 )
+            if submitted_prompt_text:
+                recovered_response = recover_assistant_response_after_reload(
+                    page,
+                    submitted_prompt_text,
+                )
+                if recovered_response:
+                    _check_for_chatgpt_errors(recovered_response)
+                    return recovered_response
             raise RuntimeError(
                 "ChatGPT returned no readable text for this step. "
-                "No next prompt was sent."
+                "The same conversation was reloaded once and no next prompt "
+                "was sent."
             )
 
         time.sleep(ASSISTANT_RESPONSE_POLL_SECONDS)
+
+
+def wait_for_existing_assistant_response(
+    page: Page,
+    expected_user_text: str,
+    timeout: int,
+) -> str:
+    started_at = time.monotonic()
+    deadline = started_at + timeout
+    last_response = ""
+    last_change_at = started_at
+    saw_busy_state = False
+
+    while True:
+        dismiss_external_app_permission_dialog(page)
+        busy = is_chatgpt_generation_active(page)
+        saw_busy_state = saw_busy_state or busy
+        response_text = get_assistant_response_after_latest_user(
+            page,
+            expected_user_text=expected_user_text,
+        )
+        now = time.monotonic()
+        if response_text != last_response:
+            last_response = response_text
+            last_change_at = now
+        required_stability = (
+            ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS
+            if saw_busy_state
+            else ASSISTANT_RESPONSE_STABLE_SECONDS
+        )
+        if (
+            last_response
+            and not busy
+            and now - last_change_at >= required_stability
+        ):
+            _check_for_chatgpt_errors(last_response)
+            return last_response
+        if now >= deadline:
+            return ""
+        time.sleep(ASSISTANT_RESPONSE_POLL_SECONDS)
+
+
+def recover_assistant_response_after_reload(
+    page: Page,
+    expected_user_text: str,
+) -> str:
+    """Reload the same conversation once and read only the existing reply."""
+    expected_url = page.url
+    if not is_chatgpt_conversation_url(expected_url):
+        return ""
+    try:
+        page.reload(
+            wait_until="domcontentloaded",
+            timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+        )
+        check_chatgpt_page_attention(page)
+        ensure_expected_conversation_page(page.url, expected_url)
+        page.locator('#prompt-textarea').first.wait_for(
+            state="visible",
+            timeout=CHATGPT_COMPOSER_WAIT_PER_ATTEMPT_MS,
+        )
+        wait_for_conversation_history(page, composer_ready=True)
+        return wait_for_existing_assistant_response(
+            page,
+            expected_user_text,
+            ASSISTANT_RESPONSE_RELOAD_WAIT_SECONDS,
+        )
+    except ChatGPTAttentionRequiredError:
+        raise
+    except Exception as exc:
+        print(
+            ">>> Could not recover the submitted ChatGPT response after one "
+            f"same-conversation reload: {exc}",
+            file=sys.stderr,
+        )
+        return ""
 
 
 def wait_for_valid_chapter_response(
@@ -1606,6 +1758,7 @@ def wait_for_valid_chapter_response(
     initial_response: str = "",
     timeout: int = CHAPTER_LATE_RESPONSE_GRACE_SECONDS,
     previous_assistant_count: int | None = None,
+    expected_user_text: str = "",
 ) -> str:
     deadline = time.time() + timeout
     response_text = initial_response
@@ -1620,6 +1773,11 @@ def wait_for_valid_chapter_response(
             previous_assistant_turn,
             previous_assistant_count,
         )
+        if not response_text and expected_user_text:
+            response_text = get_assistant_response_after_latest_user(
+                page,
+                expected_user_text=expected_user_text,
+            )
 
 
 def get_reusable_chapter_response(page: Page) -> str:
@@ -1648,8 +1806,12 @@ def get_reusable_outline_response(page: Page) -> str:
     )
 
 
-def wait_for_conversation_history(page: Page) -> None:
-    wait_for_chatgpt_composer(page)
+def wait_for_conversation_history(
+    page: Page,
+    composer_ready: bool = False,
+) -> None:
+    if not composer_ready:
+        wait_for_chatgpt_composer(page)
     page.wait_for_function(
         """() => {
             const turns = [...document.querySelectorAll(
@@ -1679,7 +1841,8 @@ def send_prompt(
     page: Page,
     prompt_text: str,
     allow_empty_response: bool = False,
-    reference_image_base64: str | None = None
+    reference_image_base64: str | None = None,
+    on_prompt_submitted: Callable[[], None] | None = None,
 ) -> str:
     validate_prompt_text(prompt_text)
 
@@ -1707,6 +1870,7 @@ def send_prompt(
     page_url_before_send = page.url
     previous_assistant_turn = get_latest_conversation_turn(page, "assistant")
     previous_assistant_count = get_assistant_message_count(page)
+    previous_user_turn = get_latest_conversation_turn(page, "user")
     previous_user_count = get_user_message_count(page)
 
     # Mark existing messages so we can identify the new one
@@ -1864,6 +2028,9 @@ def send_prompt(
             "messages."
         ) from exc
 
+    if on_prompt_submitted is not None:
+        on_prompt_submitted()
+
     response_turn_baseline = get_response_turn_baseline(
         page_url_before_send,
         page.url,
@@ -1873,8 +2040,81 @@ def send_prompt(
         page,
         response_turn_baseline,
         previous_assistant_count=previous_assistant_count,
+        previous_user_turn=previous_user_turn,
+        previous_user_count=previous_user_count,
+        submitted_prompt_text=prompt_text,
         allow_empty_response=allow_empty_response,
     )
+
+
+def get_prompt_fingerprint(prompt_text: str) -> str:
+    normalized_prompt = re.sub(r"\s+", " ", prompt_text).strip()
+    return hashlib.sha256(normalized_prompt.encode("utf-8")).hexdigest()
+
+
+def _pending_prompt_matches(state: dict, step: str, prompt_text: str) -> bool:
+    pending_prompt = state.get("pending_prompt")
+    return bool(
+        isinstance(pending_prompt, dict)
+        and pending_prompt.get("step") == step
+        and pending_prompt.get("fingerprint") == get_prompt_fingerprint(prompt_text)
+    )
+
+
+def recover_pending_prompt_response(page: Page, prompt_text: str) -> str:
+    response_text = wait_for_existing_assistant_response(
+        page,
+        prompt_text,
+        PENDING_RESPONSE_WAIT_SECONDS,
+    )
+    if not response_text:
+        response_text = recover_assistant_response_after_reload(page, prompt_text)
+    if response_text:
+        return response_text
+    raise RuntimeError(
+        "A previously submitted ChatGPT prompt still has no readable response. "
+        "The existing conversation was inspected without resending the prompt."
+    )
+
+
+def send_or_recover_generation_prompt(
+    page: Page,
+    state: dict,
+    step: str,
+    prompt_text: str,
+) -> str:
+    pending_prompt = state.get("pending_prompt")
+    if pending_prompt:
+        if not _pending_prompt_matches(state, step, prompt_text):
+            raise RuntimeError(
+                "The checkpoint contains a different unresolved ChatGPT prompt. "
+                "No new prompt was sent."
+            )
+        return recover_pending_prompt_response(page, prompt_text)
+
+    def mark_prompt_submitted() -> None:
+        state["pending_prompt"] = {
+            "step": step,
+            "fingerprint": get_prompt_fingerprint(prompt_text),
+        }
+        if is_chatgpt_conversation_url(page.url):
+            state["chat_url"] = page.url
+        persist_generation_state(state)
+
+    return send_prompt(
+        page,
+        prompt_text,
+        on_prompt_submitted=mark_prompt_submitted,
+    )
+
+
+def clear_pending_generation_prompt(
+    state: dict,
+    step: str,
+    prompt_text: str,
+) -> None:
+    if _pending_prompt_matches(state, step, prompt_text):
+        state.pop("pending_prompt", None)
 
 
 def build_video_script(state: dict) -> str:
@@ -1975,7 +2215,12 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 print(">>> TÁI SỬ DỤNG DÀN Ý ĐÃ HOÀN THÀNH TRONG CHAT CŨ", file=sys.stderr)
             else:
                 try:
-                    outline = send_prompt(page, prompt2)
+                    outline = send_or_recover_generation_prompt(
+                        page,
+                        state,
+                        "outline",
+                        prompt2,
+                    )
                 finally:
                     if is_chatgpt_conversation_url(page.url):
                         ensure_expected_project_conversation_page(
@@ -2004,9 +2249,12 @@ def _run_complete(transcript: str, state: dict) -> dict:
 
             parts = split_outline_parts(outline)
             if not parts:
+                clear_pending_generation_prompt(state, "outline", prompt2)
+                persist_generation_state(state)
                 raise RuntimeError("ChatGPT returned an empty outline.")
             state["outline_parts"] = parts
             state["expected_body_parts"] = len(parts)
+            clear_pending_generation_prompt(state, "outline", prompt2)
             persist_generation_state(state)
             print(f"    -> Đã chia thành {len(parts)} phần.", file=sys.stderr)
         else:
@@ -2023,12 +2271,22 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 + NARRATIVE_ONLY_INSTRUCTION
             )
             state["current_step"] = "intro"
-            intro = sanitize_narrative_response(send_prompt(page, prompt3))
+            intro = sanitize_narrative_response(
+                send_or_recover_generation_prompt(
+                    page,
+                    state,
+                    "intro",
+                    prompt3,
+                )
+            )
             if not intro:
+                clear_pending_generation_prompt(state, "intro", prompt3)
+                persist_generation_state(state)
                 raise RuntimeError(
                     "ChatGPT returned no narrative INTRO content."
                 )
             state["intro"] = intro
+            clear_pending_generation_prompt(state, "intro", prompt3)
             persist_generation_state(state)
         else:
             intro = state["intro"]
@@ -2043,13 +2301,24 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 + STRICT_NO_FILLER
                 + NARRATIVE_ONLY_INSTRUCTION
             )
-            state["current_step"] = f"body {i + 1}/{len(parts)}"
-            res = sanitize_narrative_response(send_prompt(page, prompt4))
+            body_step = f"body {i + 1}/{len(parts)}"
+            state["current_step"] = body_step
+            res = sanitize_narrative_response(
+                send_or_recover_generation_prompt(
+                    page,
+                    state,
+                    body_step,
+                    prompt4,
+                )
+            )
             if not res:
+                clear_pending_generation_prompt(state, body_step, prompt4)
+                persist_generation_state(state)
                 raise RuntimeError(
                     "ChatGPT returned no narrative BODY content."
                 )
             body_parts_result.append(res)
+            clear_pending_generation_prompt(state, body_step, prompt4)
             persist_generation_state(state)
             
         # Step 5: Outro
@@ -2061,12 +2330,22 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 + NARRATIVE_ONLY_INSTRUCTION
             )
             state["current_step"] = "outro"
-            outro = sanitize_narrative_response(send_prompt(page, prompt5))
+            outro = sanitize_narrative_response(
+                send_or_recover_generation_prompt(
+                    page,
+                    state,
+                    "outro",
+                    prompt5,
+                )
+            )
             if not outro:
+                clear_pending_generation_prompt(state, "outro", prompt5)
+                persist_generation_state(state)
                 raise RuntimeError(
                     "ChatGPT returned no narrative OUTRO content."
                 )
             state["outro"] = outro
+            clear_pending_generation_prompt(state, "outro", prompt5)
             persist_generation_state(state)
         else:
             outro = state["outro"]
@@ -2083,8 +2362,14 @@ def _run_complete(transcript: str, state: dict) -> dict:
             print(">>> BƯỚC 6: TẠO METADATA & QUIZ", file=sys.stderr)
             prompt6 = prompts.get("metadata", "") + STRICT_NO_FILLER
             state["current_step"] = "metadata"
-            metadata = send_prompt(page, prompt6)
+            metadata = send_or_recover_generation_prompt(
+                page,
+                state,
+                "metadata",
+                prompt6,
+            )
             state["metadata"] = metadata
+            clear_pending_generation_prompt(state, "metadata", prompt6)
             persist_generation_state(state)
 
         # Step 7: Chapters
@@ -2093,17 +2378,24 @@ def _run_complete(transcript: str, state: dict) -> dict:
             prompt7 = prompts.get("chapters", "") + STRICT_NO_FILLER
             state["current_step"] = "chapters"
             try:
-                chapters = send_prompt(page, prompt7)
+                chapters = send_or_recover_generation_prompt(
+                    page,
+                    state,
+                    "chapters",
+                    prompt7,
+                )
             except ChatGPTGenerationTimeoutError as exc:
                 recovered_chapters = wait_for_valid_chapter_response(
                     page,
                     exc.previous_assistant_turn,
                     initial_response=exc.response_text.strip(),
                     previous_assistant_count=exc.previous_assistant_count,
+                    expected_user_text=prompt7,
                 )
                 if recovered_chapters:
                     state["chapters"] = recovered_chapters
                     state["current_step"] = "thumbnail with text"
+                    clear_pending_generation_prompt(state, "chapters", prompt7)
                     persist_generation_state(state)
                     raise RuntimeError(
                         "Chapter content was preserved, but ChatGPT remained busy. "
@@ -2111,6 +2403,7 @@ def _run_complete(transcript: str, state: dict) -> dict:
                     ) from exc
                 raise
             state["chapters"] = chapters
+            clear_pending_generation_prompt(state, "chapters", prompt7)
             persist_generation_state(state)
 
         # Helper for image extraction
@@ -2204,6 +2497,7 @@ def run(transcript: str) -> dict:
         "chapters": "",
         "thumb_text": "",
         "thumb_notext": "",
+        "pending_prompt": None,
         "pipeline": get_active_pipeline(),
         "transcript_fingerprint": transcript_fingerprint,
     }

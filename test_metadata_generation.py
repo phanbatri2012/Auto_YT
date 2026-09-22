@@ -53,6 +53,96 @@ D. Bốn
 
 
 class MetadataGenerationTests(unittest.TestCase):
+    def test_extracts_generated_slug(self):
+        self.assertEqual(
+            database.extract_generated_video_slug(SCRIPT),
+            "slug-cu",
+        )
+        self.assertEqual(
+            database.extract_generated_video_slug(NEW_METADATA),
+            "tieu-de-moi",
+        )
+        with_prefix = "### [METADATA & QUIZ]\nTIÊU ĐỀ: Bài học lịch sử\nSlug: khe-sanh-1968-my-rut-bo-can-cu\n"
+        self.assertEqual(
+            database.extract_generated_video_slug(with_prefix),
+            "khe-sanh-1968-my-rut-bo-can-cu",
+        )
+        with_url_slug_prefix = "### [METADATA & QUIZ]\nURL SLUG: URL Slug: khe-sanh-1968\n"
+        self.assertEqual(
+            database.extract_generated_video_slug(with_url_slug_prefix),
+            "khe-sanh-1968",
+        )
+        without_slug = "### [METADATA & QUIZ]\nTIÊU ĐỀ: Khe Sanh 1968 Rút Bỏ Căn Cứ\n"
+        self.assertEqual(
+            database.extract_generated_video_slug(without_slug),
+            "khe-sanh-1968-rut-bo-can-cu",
+        )
+
+    def test_resolve_render_filename_with_duplicates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "database.db"
+            renders_dir = Path(temp_dir) / "renders"
+            renders_dir.mkdir(parents=True, exist_ok=True)
+            with patch.object(database, "DB_PATH", database_path):
+                database.init_db()
+                video1_id = database.save_video(
+                    "https://www.youtube.com/watch?v=vid1",
+                    "Vid 1",
+                    "Transcript",
+                    "### [METADATA & QUIZ]\nSLUG: khe-sanh-1968",
+                )
+                video2_id = database.save_video(
+                    "https://www.youtube.com/watch?v=vid2",
+                    "Vid 2",
+                    "Transcript",
+                    "### [METADATA & QUIZ]\nSLUG: khe-sanh-1968",
+                )
+                video3_id = database.save_video(
+                    "https://www.youtube.com/watch?v=vid3",
+                    "Vid 3",
+                    "Transcript",
+                    "### [METADATA & QUIZ]\nSLUG: khe-sanh-1968",
+                )
+
+                # First video gets base slug
+                first_name = database.resolve_render_filename(video1_id, "khe-sanh-1968", renders_dir)
+                self.assertEqual(first_name, "khe-sanh-1968")
+
+                # Simulate first video artifact saved
+                artifact1_path = renders_dir / f"{first_name}.mp4"
+                artifact1_path.write_bytes(b"vid1")
+                database.upsert_video_artifact(
+                    video_id=video1_id,
+                    artifact_type="final_mp4",
+                    path=str(artifact1_path),
+                    content_hash="hash1",
+                    status="ready",
+                )
+
+                # First video resolving again should still get base slug
+                self.assertEqual(
+                    database.resolve_render_filename(video1_id, "khe-sanh-1968", renders_dir),
+                    "khe-sanh-1968",
+                )
+
+                # Second video should get -1
+                second_name = database.resolve_render_filename(video2_id, "khe-sanh-1968", renders_dir)
+                self.assertEqual(second_name, "khe-sanh-1968-1")
+
+                artifact2_path = renders_dir / f"{second_name}.mp4"
+                artifact2_path.write_bytes(b"vid2")
+                database.upsert_video_artifact(
+                    video_id=video2_id,
+                    artifact_type="final_mp4",
+                    path=str(artifact2_path),
+                    content_hash="hash2",
+                    status="ready",
+                )
+
+                # Third video should get -2
+                third_name = database.resolve_render_filename(video3_id, "khe-sanh-1968", renders_dir)
+                self.assertEqual(third_name, "khe-sanh-1968-2")
+
     def test_extracts_inline_and_multiline_generated_titles(self):
         self.assertEqual(
             database.extract_generated_video_title(SCRIPT),

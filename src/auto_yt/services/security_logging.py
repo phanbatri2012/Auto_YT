@@ -12,6 +12,7 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
     re.compile(r"(?i)((?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|password|cookie)\s*[:=]\s*)[^\s,;]+"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"EAA[A-Za-z0-9_-]{16,}"),
 )
 _WINDOWS_PATH = re.compile(r"(?i)\b[A-Z]:\\[^\r\n]*")
 
@@ -27,11 +28,11 @@ def redact_sensitive(value: object) -> str:
 def report_exception(context: str, exc: BaseException) -> str:
     error_id = uuid.uuid4().hex[:10]
     LOGGER.error(
-        "%s failed (error_id=%s): %s",
+        "%s failed (error_id=%s, error_type=%s): %s",
         context,
         error_id,
+        type(exc).__name__,
         redact_sensitive(exc),
-        exc_info=True,
     )
     return error_id
 

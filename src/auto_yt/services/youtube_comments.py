@@ -21,6 +21,7 @@ import urllib.request
 from pathlib import Path
 
 from auto_yt.paths import DATA_DIR
+from auto_yt.services.proxy_utils import create_proxy_opener
 
 
 OAUTH_CONFIG_PATH = DATA_DIR / "youtube_oauth.json"
@@ -344,7 +345,14 @@ def build_authorization_url(
     return f"{OAUTH_AUTHORIZE_URL}?{query}"
 
 
-def _request_json(url: str, *, method: str = "GET", data: dict | None = None, token: str = "") -> dict:
+def _request_json(
+    url: str,
+    *,
+    method: str = "GET",
+    data: dict | None = None,
+    token: str = "",
+    proxy: str | None = None,
+) -> dict:
     body = None
     headers = {"Accept": "application/json"}
     if data is not None:
@@ -353,8 +361,9 @@ def _request_json(url: str, *, method: str = "GET", data: dict | None = None, to
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    opener = create_proxy_opener(proxy, require_proxy=True)
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
+        with opener.open(request, timeout=45) as response:
             raw = response.read(MAX_API_RESPONSE_BYTES + 1)
             if len(raw) > MAX_API_RESPONSE_BYTES:
                 raise YouTubeCommentsError("YouTube API trả về dữ liệu quá lớn.")
@@ -374,6 +383,7 @@ def exchange_authorization_code(
     code: str,
     config: dict | None = None,
     code_verifier: str = "",
+    proxy: str | None = None,
 ) -> dict:
     config = config or load_oauth_config()
     payload = urllib.parse.urlencode(
@@ -392,8 +402,9 @@ def exchange_authorization_code(
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
+    opener = create_proxy_opener(proxy, require_proxy=True)
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
+        with opener.open(request, timeout=45) as response:
             raw = response.read(MAX_API_RESPONSE_BYTES + 1)
             if len(raw) > MAX_API_RESPONSE_BYTES:
                 raise YouTubeCommentsError("Google trả về dữ liệu xác thực quá lớn.")
@@ -403,7 +414,11 @@ def exchange_authorization_code(
         raise YouTubeCommentsError("Không thể xác thực YouTube với Google.") from exc
 
 
-def refresh_access_token(refresh_token: str, config: dict | None = None) -> dict:
+def refresh_access_token(
+    refresh_token: str,
+    config: dict | None = None,
+    proxy: str | None = None,
+) -> dict:
     config = config or load_oauth_config()
     payload = urllib.parse.urlencode(
         {
@@ -419,8 +434,9 @@ def refresh_access_token(refresh_token: str, config: dict | None = None) -> dict
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
+    opener = create_proxy_opener(proxy, require_proxy=True)
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
+        with opener.open(request, timeout=45) as response:
             raw = response.read(MAX_API_RESPONSE_BYTES + 1)
             if len(raw) > MAX_API_RESPONSE_BYTES:
                 raise YouTubeCommentsError("Google trả về dữ liệu xác thực quá lớn.")
@@ -439,7 +455,7 @@ def refresh_access_token(refresh_token: str, config: dict | None = None) -> dict
         raise YouTubeCommentsError(f"Không thể kết nối Google để làm mới quyền: {exc}") from exc
 
 
-def revoke_token(token: str) -> None:
+def revoke_token(token: str, proxy: str | None = None) -> None:
     token = str(token or "").strip()
     if not token:
         return
@@ -450,8 +466,9 @@ def revoke_token(token: str) -> None:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
+    opener = create_proxy_opener(proxy, require_proxy=True)
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
+        with opener.open(request, timeout=45) as response:
             response.read(1024)
     except urllib.error.HTTPError as exc:
         # Google returns 400 for an already-invalid token. That is equivalent
@@ -467,7 +484,7 @@ def token_expiry(expires_in: int | str | None) -> str:
     return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).isoformat()
 
 
-def access_token_for_channel(channel: dict, persist_refreshed_token) -> str:
+def access_token_for_channel(channel: dict, persist_refreshed_token, proxy: str | None = None) -> str:
     expiry_text = str(channel.get("token_expiry") or "")
     try:
         expiry = dt.datetime.fromisoformat(expiry_text)
@@ -491,10 +508,11 @@ def access_token_for_channel(channel: dict, persist_refreshed_token) -> str:
                 "Chưa có OAuth Client YouTube trong Settings; hãy cấu hình và kết nối lại kênh."
             )
 
+    effective_proxy = proxy or channel.get("gpm_proxy_info")
     last_error: Exception | None = None
     for config in configs:
         try:
-            refreshed = refresh_access_token(refresh_token, config=config)
+            refreshed = refresh_access_token(refresh_token, config=config, proxy=effective_proxy)
         except YouTubeCommentsError as exc:
             last_error = exc
             if bound_client_id:
@@ -522,9 +540,9 @@ def access_token_for_channel(channel: dict, persist_refreshed_token) -> str:
     ) from last_error
 
 
-def get_authenticated_channels(access_token: str) -> list[dict]:
+def get_authenticated_channels(access_token: str, proxy: str | None = None) -> list[dict]:
     query = urllib.parse.urlencode({"part": "snippet", "mine": "true", "maxResults": 50})
-    payload = _request_json(f"{YOUTUBE_API_BASE}/channels?{query}", token=access_token)
+    payload = _request_json(f"{YOUTUBE_API_BASE}/channels?{query}", token=access_token, proxy=proxy)
     return [
         {
             "channel_id": item.get("id", ""),
@@ -538,8 +556,8 @@ def get_authenticated_channels(access_token: str) -> list[dict]:
     ]
 
 
-def get_video_details(access_token: str, youtube_video_id: str) -> dict:
-    details = get_videos_details(access_token, [youtube_video_id])
+def get_video_details(access_token: str, youtube_video_id: str, proxy: str | None = None) -> dict:
+    details = get_videos_details(access_token, [youtube_video_id], proxy=proxy)
     if not details:
         raise YouTubeCommentsError("Không tìm thấy video đã đăng trên YouTube.")
     return details[0]
@@ -548,6 +566,7 @@ def get_video_details(access_token: str, youtube_video_id: str) -> dict:
 def get_videos_details(
     access_token: str,
     youtube_video_ids: list[str],
+    proxy: str | None = None,
 ) -> list[dict]:
     """Fetch authoritative metadata in YouTube's 50-ID batch size."""
     normalized_ids = list(
@@ -561,6 +580,7 @@ def get_videos_details(
         payload = _request_json(
             f"{YOUTUBE_API_BASE}/videos?{query}",
             token=access_token,
+            proxy=proxy,
         )
         for item in payload.get("items") or []:
             video_id = str(item.get("id") or "").strip()
@@ -592,6 +612,7 @@ def list_channel_videos(
     access_token: str,
     channel_id: str,
     max_videos: int = 1000,
+    proxy: str | None = None,
 ) -> list[dict]:
     """List uploaded videos for a managed channel, newest first."""
     max_videos = max(1, min(int(max_videos), 5000))
@@ -601,6 +622,7 @@ def list_channel_videos(
     channel_payload = _request_json(
         f"{YOUTUBE_API_BASE}/channels?{channel_query}",
         token=access_token,
+        proxy=proxy,
     )
     channel_items = channel_payload.get("items") or []
     if not channel_items:
@@ -626,6 +648,7 @@ def list_channel_videos(
         payload = _request_json(
             f"{YOUTUBE_API_BASE}/playlistItems?{urllib.parse.urlencode(params)}",
             token=access_token,
+            proxy=proxy,
         )
         for item in payload.get("items") or []:
             snippet = item.get("snippet") or {}
@@ -661,6 +684,7 @@ def list_channel_comment_threads(
     access_token: str,
     channel_id: str,
     max_comments: int = MAX_SYNC_COMMENTS,
+    proxy: str | None = None,
 ) -> list[dict]:
     max_comments = max(1, min(int(max_comments), MAX_SYNC_COMMENTS))
     comments: list[dict] = []
@@ -678,6 +702,7 @@ def list_channel_comment_threads(
         payload = _request_json(
             f"{YOUTUBE_API_BASE}/commentThreads?{urllib.parse.urlencode(params)}",
             token=access_token,
+            proxy=proxy,
         )
         for item in payload.get("items", []):
             snippet = item.get("snippet", {})
@@ -732,7 +757,7 @@ def list_channel_comment_threads(
             return comments
 
 
-def publish_reply(access_token: str, parent_comment_id: str, text: str) -> dict:
+def publish_reply(access_token: str, parent_comment_id: str, text: str, proxy: str | None = None) -> dict:
     text = validate_comment_reply(text)
     query = urllib.parse.urlencode({"part": "snippet"})
     payload = _request_json(
@@ -740,6 +765,7 @@ def publish_reply(access_token: str, parent_comment_id: str, text: str) -> dict:
         method="POST",
         token=access_token,
         data={"snippet": {"parentId": parent_comment_id, "textOriginal": text}},
+        proxy=proxy,
     )
     return {
         "reply_id": payload.get("id", ""),
@@ -752,6 +778,7 @@ def find_channel_reply(
     access_token: str,
     parent_comment_id: str,
     channel_id: str,
+    proxy: str | None = None,
 ) -> dict | None:
     """Find this channel's reply by enumerating the complete reply thread."""
     page_token = ""
@@ -767,6 +794,7 @@ def find_channel_reply(
         payload = _request_json(
             f"{YOUTUBE_API_BASE}/comments?{urllib.parse.urlencode(params)}",
             token=access_token,
+            proxy=proxy,
         )
         for item in payload.get("items", []):
             snippet = item.get("snippet", {})
@@ -802,6 +830,20 @@ def extract_youtube_video_id(url: str) -> str:
     return candidate
 
 
+def _compact_reply_sample(text: str, max_chars: int = 140) -> str:
+    """Trim a historical reply to its opening sentence or short prefix for negative few-shot avoidance."""
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not clean:
+        return ""
+    if len(clean) <= max_chars:
+        return clean
+    match = re.search(r"^(.*?[.!?])(?:\s|$)", clean[: max_chars + 1])
+    if match and len(match.group(1).strip()) >= 20:
+        return match.group(1).strip()
+    truncated = clean[:max_chars].rsplit(" ", 1)[0].strip()
+    return (truncated or clean[:max_chars]) + "..."
+
+
 def build_comment_reply_prompt(
     comments: list[dict],
     instruction: str = "",
@@ -818,11 +860,13 @@ def build_comment_reply_prompt(
         for item in comments
     ]
     custom_instruction = str(instruction or "").strip()
+    sample_limit = 2 if len(compact_comments) <= 1 else 4
+    max_chars_per_sample = 120 if len(compact_comments) <= 1 else 140
     recent_examples = [
-        str(reply).strip()[:500]
-        for reply in (recent_replies or [])[:10]
-        if str(reply).strip()
-    ]
+        sample
+        for reply in (recent_replies or [])
+        if (sample := _compact_reply_sample(reply, max_chars=max_chars_per_sample))
+    ][:sample_limit]
     return (
         "Dựa trên toàn bộ nội dung của CHÍNH phiên chat video này, hãy soạn câu trả lời "
         "cho các bình luận YouTube bên dưới với vai trò chủ kênh. Trả lời tự nhiên, lịch sự, "

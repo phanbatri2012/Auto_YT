@@ -45,19 +45,19 @@ Giải thích: Nội dung giải thích.
   assert.equal(result[1].content, 'SỰ THẬT LỊCH SỬ')
   assert.equal(result[2].content, 'su-that-lich-su')
   assert.match(result[3].content, /^Đây là phần mô tả/)
-  assert.match(result[3].content, /#LichSu #VietNam/)
   assert.match(result[3].content, /00:00 Mở đầu/)
+  assert.match(result[3].content, /#LichSu #VietNam$/)
   assert.doesNotMatch(result[3].content, /^(?:MÔ TẢ|TAG|CHAPTERS):/m)
   assert.match(result[4].content, /Theo Quý vị, sự kiện nào/)
   assert.doesNotMatch(result[4].content, /bài học lớn nhất/)
   assert.match(result[5].content, /bài học lớn nhất/)
 })
 
-test('supports explicitly labeled metadata fields', () => {
+test('supports explicitly labeled metadata fields and strips slug prefixes', () => {
   const result = parseVideoSections(`
 ### [METADATA & QUIZ]
 **Tiêu đề video:** Tiêu đề mới
-**URL SLUG:** tieu-de-moi
+**Slug:** khe-sanh-1968-my-rut-bo-can-cu
 **Mô tả:** Mô tả video
 **Tags:** #TagMot #TagHai
 **Bình luận ghim:** Nội dung bình luận
@@ -69,8 +69,8 @@ B) Hai
 `)
 
   assert.equal(result.find(section => section.title === 'TIÊU ĐỀ VIDEO')?.content, 'Tiêu đề mới')
-  assert.equal(result.find(section => section.title === 'URL SLUG')?.content, 'tieu-de-moi')
-  assert.match(result.find(section => section.title === 'MÔ TẢ, TAG & CHAPTERS')?.content, /#TagMot/)
+  assert.equal(result.find(section => section.title === 'URL SLUG')?.content, 'khe-sanh-1968-my-rut-bo-can-cu')
+  assert.match(result.find(section => section.title === 'MÔ TẢ, TAG & CHAPTERS')?.content, /00:00 Bắt đầu[\s\S]*#TagMot #TagHai/)
   assert.match(result.find(section => section.title === 'QUIZ')?.content, /Câu hỏi kiểm tra/)
   assert.equal(result.find(section => section.title === 'BÌNH LUẬN GHIM')?.content, 'Nội dung bình luận')
 })

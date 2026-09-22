@@ -44,6 +44,17 @@ class ChatGptServiceTests(unittest.TestCase):
 
         self.assertEqual(response, "Nội dung trong assistant message")
 
+    def test_assistant_reader_ignores_pure_thinking_indicator(self):
+        for thinking_text in ["Stopped thinking", "Thought for 12 seconds", "Thinking...", "Đã dừng suy nghĩ"]:
+            message = Mock()
+            markdown_nodes = Mock()
+            markdown_nodes.count.return_value = 0
+            message.locator.return_value = markdown_nodes
+            message.inner_text.return_value = thinking_text
+
+            response = chatgpt_worker._read_assistant_message(message)
+            self.assertEqual(response, "", f"Expected empty string for thinking text: {thinking_text}")
+
     def test_reads_assistant_after_latest_user_when_dom_counts_are_stable(self):
         page = Mock()
         messages = Mock()
@@ -84,7 +95,7 @@ class ChatGptServiceTests(unittest.TestCase):
         with (
             patch.object(
                 chatgpt_worker,
-                "dismiss_external_app_permission_dialog",
+                "accept_external_app_permission_dialog",
                 return_value=False,
             ),
             patch.object(
@@ -123,7 +134,7 @@ class ChatGptServiceTests(unittest.TestCase):
         with (
             patch.object(
                 chatgpt_worker,
-                "dismiss_external_app_permission_dialog",
+                "accept_external_app_permission_dialog",
                 return_value=False,
             ),
             patch.object(
@@ -221,7 +232,8 @@ class ChatGptServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(response, "Metadata recovered")
-        recover_response.assert_called_once_with(page, prompt_text)
+        from unittest.mock import ANY
+        recover_response.assert_called_once_with(page, prompt_text, on_prompt_submitted=ANY)
         send_prompt.assert_not_called()
 
     def test_unresolved_pending_prompt_never_triggers_an_automatic_resend(self):
@@ -283,7 +295,7 @@ class ChatGptServiceTests(unittest.TestCase):
         self.assertEqual(state["chat_url"], page.url)
         persist_state.assert_called_once_with(state)
 
-    def test_external_app_permission_dialog_is_denied_without_app_specific_logic(self):
+    def test_external_app_permission_dialog_is_accepted_without_app_specific_logic(self):
         page = Mock()
         dialog = Mock()
         deny_button = Mock()
@@ -291,30 +303,22 @@ class ChatGptServiceTests(unittest.TestCase):
         dialogs = Mock()
         buttons = Mock()
 
-        dialogs.count.return_value = 1
-        dialogs.nth.return_value = dialog
-        dialog.is_visible.return_value = True
-        dialog.inner_text.return_value = (
-            "Search outside this project?\n"
-            "ChatGPT will use Research Connector to help answer your request."
-        )
-        dialog.locator.return_value = buttons
         buttons.count.return_value = 2
-        buttons.nth.side_effect = [deny_button, allow_button]
+        buttons.nth.side_effect = lambda idx: [deny_button, allow_button][idx]
+        deny_button.is_visible.return_value = True
+        allow_button.is_visible.return_value = True
         deny_button.inner_text.return_value = "Deny"
         allow_button.inner_text.return_value = "Allow"
-        page.locator.return_value = dialogs
+        page.locator.return_value = buttons
 
-        dismissed = chatgpt_worker.dismiss_external_app_permission_dialog(page)
+        dismissed = chatgpt_worker.accept_external_app_permission_dialog(page)
 
         self.assertTrue(dismissed)
-        page.locator.assert_called_once_with(
-            chatgpt_worker.EXTERNAL_APP_PERMISSION_DIALOG_SELECTOR
-        )
-        deny_button.click.assert_called_once_with(
+        page.locator.assert_called_once_with("button")
+        allow_button.click.assert_called_once_with(
             timeout=chatgpt_worker.EXTERNAL_APP_PERMISSION_CLICK_TIMEOUT_MS
         )
-        allow_button.click.assert_not_called()
+        deny_button.click.assert_not_called()
 
     def test_unrelated_dialog_is_not_dismissed(self):
         page = Mock()
@@ -322,16 +326,14 @@ class ChatGptServiceTests(unittest.TestCase):
         deny_button = Mock()
         dialogs = Mock()
 
-        dialogs.count.return_value = 1
-        dialogs.nth.return_value = dialog
-        dialog.is_visible.return_value = True
-        dialog.inner_text.return_value = "Delete this conversation?"
-        dialog.locator.return_value.count.return_value = 1
-        dialog.locator.return_value.nth.return_value = deny_button
+        buttons = Mock()
+        buttons.count.return_value = 1
+        buttons.nth.return_value = deny_button
+        deny_button.is_visible.return_value = True
         deny_button.inner_text.return_value = "Deny"
-        page.locator.return_value = dialogs
+        page.locator.return_value = buttons
 
-        dismissed = chatgpt_worker.dismiss_external_app_permission_dialog(page)
+        dismissed = chatgpt_worker.accept_external_app_permission_dialog(page)
 
         self.assertFalse(dismissed)
         deny_button.click.assert_not_called()
@@ -342,7 +344,7 @@ class ChatGptServiceTests(unittest.TestCase):
         with (
             patch.object(
                 chatgpt_worker,
-                "dismiss_external_app_permission_dialog",
+                "accept_external_app_permission_dialog",
                 return_value=True,
             ) as dismiss_dialog,
             patch.object(
@@ -1093,6 +1095,9 @@ class ChatGptServiceTests(unittest.TestCase):
             "thumbnail_with_text": False,
             "thumbnail_without_text": False,
             "audio": True,
+            "video_render": False,
+            "youtube_upload": False,
+            "youtube_schedule": False,
         }
         checkpoint = {
             "chat_url": "https://chatgpt.com/c/saved",
@@ -1135,6 +1140,48 @@ class ChatGptServiceTests(unittest.TestCase):
             result = chatgpt_worker.run(transcript)
 
         self.assertEqual(result["pipeline"], pipeline)
+
+
+    def test_dedup_consecutive_paragraphs_removes_exact_repeats(self):
+        paragraph = (
+            "Muốn hiểu một con người, thưa quý vị, đừng chỉ nhìn cách họ đối xử "
+            "với mình trong những lúc đang yêu thương, chiều chuộng và cố gắng. " * 2
+        ).strip()
+        other_paragraph = (
+            "Và có một nguyên tắc rất quan trọng mà tôi muốn nhấn mạnh, đó là ngay "
+            "từ khi bắt đầu một mối quan hệ, chúng ta phải biết đặt ra giới hạn. " * 2
+        ).strip()
+        doubled_text = f"{paragraph}\n\n{paragraph}\n\n{other_paragraph}\n\n{other_paragraph}"
+        
+        result = chatgpt_worker.dedup_consecutive_paragraphs(doubled_text)
+        expected = f"{paragraph}\n\n{other_paragraph}"
+        self.assertEqual(result, expected)
+
+    def test_narrative_sanitizer_removes_consecutive_duplicate_prose(self):
+        paragraph = (
+            "Xin chào quý vị khán giả đang theo dõi kênh Thấu Hiểu Hôn Nhân, Thưa "
+            "quý vị, có những cuộc hôn nhân tan vỡ không phải vì người ta hết yêu. " * 2
+        ).strip()
+        doubled = f"{paragraph}\n\n{paragraph}"
+        result = chatgpt_worker.sanitize_narrative_response(doubled)
+        self.assertEqual(result, paragraph)
+
+    def test_outline_filter_removes_intro_and_outro_keywords(self):
+        outline_parts = [
+            "Mở bài: Xin chào quý vị khán giả",
+            "Phần 1: Những dấu hiệu ban đầu cần lưu ý",
+            "Phần 2: Cách ứng xử phù hợp",
+            "Kết luận: Tóm tắt bài học",
+        ]
+        filtered = [
+            p for p in outline_parts
+            if not any(k in p.lower()[:100] for k in chatgpt_worker.OUTLINE_INTRO_OUTRO_KEYWORDS)
+        ]
+        self.assertEqual(len(filtered), 2)
+        self.assertEqual(filtered, [
+            "Phần 1: Những dấu hiệu ban đầu cần lưu ý",
+            "Phần 2: Cách ứng xử phù hợp",
+        ])
 
 
 if __name__ == "__main__":

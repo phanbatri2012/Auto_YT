@@ -88,6 +88,18 @@ EXTERNAL_APP_PERMISSION_DENY_LABELS = (
     "không cho phép",
 )
 OUTLINE_PART_MAX_CHARS = 3000
+OUTLINE_INTRO_OUTRO_KEYWORDS = (
+    "m\u1edf b\xe0i",     # mở bài
+    "m\u1edf \u0111\u1ea7u",    # mở đầu
+    "intro",
+    "k\u1ebft b\xe0i",    # kết bài
+    "k\u1ebft lu\u1eadn",  # kết luận
+    "outro",
+    "mo bai",
+    "mo dau",
+    "ket bai",
+    "ket luan",
+)
 NARRATIVE_ARTIFACT_MAX_WORDS = 14
 THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS = 5 * 60
 THUMBNAIL_TURN_WAIT_TIMEOUT_SECONDS = 30
@@ -121,6 +133,15 @@ CORRUPTED_UNICODE_PATTERN = re.compile(
     flags=re.UNICODE,
 )
 MIN_CORRUPTED_UNICODE_MARKERS = 3
+THINKING_INDICATOR_PATTERN = re.compile(
+    r"^(?:stopped\s+thinking|thought\s+for\s+\d+.*|thinking\.{0,3}|đã\s+dừng\s+suy\s+nghĩ|đang\s+suy\s+nghĩ\.{0,3})$",
+    re.IGNORECASE,
+)
+
+
+def _is_pure_thinking_indicator(text: str) -> bool:
+    cleaned = text.strip()
+    return bool(not cleaned or THINKING_INDICATOR_PATTERN.match(cleaned))
 
 
 def download_chatgpt_image_via_page(page: Page, chatgpt_url: str) -> str:
@@ -327,40 +348,48 @@ def get_user_message_count(page: Page) -> int:
         return 0
 
 
-def dismiss_external_app_permission_dialog(page: Page) -> bool:
-    """Deny a connector request that would search outside the current Project."""
-    dialogs = page.locator(EXTERNAL_APP_PERMISSION_DIALOG_SELECTOR)
-    for dialog_index in range(dialogs.count()):
-        dialog = dialogs.nth(dialog_index)
-        if not dialog.is_visible():
+def accept_external_app_permission_dialog(page: Page) -> bool:
+    """Accept action/plugin consent dialogs (like vidIQ)."""
+    # Look for both modal dialogs and inline action cards
+    # Inline cards don't have role="dialog", so we search globally for consent-like buttons
+    
+    # We look for visible buttons that match our target labels
+    target_labels = ["always allow", "luôn cho phép", "allow", "cho phép", "đồng ý", "confirm", "xác nhận"]
+    
+    buttons = page.locator("button")
+    try:
+        count = buttons.count()
+    except Exception:
+        return False
+        
+    for button_index in range(count):
+        button = buttons.nth(button_index)
+        if not button.is_visible():
             continue
-
-        dialog_text = " ".join(dialog.inner_text().casefold().split())
-        is_external_app_permission = any(
-            all(marker in dialog_text for marker in marker_group)
-            for marker_group in EXTERNAL_APP_PERMISSION_DIALOG_MARKER_GROUPS
-        )
-        if not is_external_app_permission:
-            continue
-
-        buttons = dialog.locator("button")
-        for button_index in range(buttons.count()):
-            button = buttons.nth(button_index)
-            button_text = button.inner_text().strip()
-            if not button_text:
-                button_text = button.get_attribute("aria-label") or ""
-            normalized_label = " ".join(button_text.casefold().split())
-            if normalized_label not in EXTERNAL_APP_PERMISSION_DENY_LABELS:
-                continue
-
-            button.click(timeout=EXTERNAL_APP_PERMISSION_CLICK_TIMEOUT_MS)
-            print(
-                ">>> Denied ChatGPT access to an external app outside the "
-                "configured Project; continuing to wait for the current response.",
-                file=sys.stderr,
-            )
-            return True
-
+            
+        button_text = button.inner_text().strip()
+        if not button_text:
+            button_text = button.get_attribute("aria-label") or ""
+            
+        normalized_label = " ".join(button_text.casefold().split())
+        
+        # If it's a split button, the text might be something like "Allow Dropdown" or similar, 
+        # but inner_text() usually just gives "Allow" if the SVG is ignored.
+        # Let's do a loose match: if the normalized label EXACTLY matches one of our targets.
+        if normalized_label in target_labels:
+            # To be safe and avoid clicking random "Confirm" buttons elsewhere, 
+            # we check if there's context of an action consent.
+            # But in the generation wait loop, any "Allow" or "Confirm" button is highly likely to be the popup!
+            try:
+                button.click(timeout=EXTERNAL_APP_PERMISSION_CLICK_TIMEOUT_MS)
+                print(
+                    f">>> Accepted ChatGPT action dialog with button '{normalized_label}'; continuing to wait for the current response.",
+                    file=sys.stderr,
+                )
+                return True
+            except Exception as e:
+                print(f"Failed to click button '{normalized_label}': {e}", file=sys.stderr)
+                
     return False
 
 
@@ -1312,6 +1341,22 @@ def _is_short_narrative_artifact(block: str) -> tuple[bool, bool]:
     return True, explicit_editorial_note
 
 
+def dedup_consecutive_paragraphs(text: str, min_chars: int = 60) -> str:
+    """Remove consecutive duplicate paragraphs within a text block."""
+    if not isinstance(text, str) or not text:
+        return text
+    blocks = [b.strip() for b in re.split(r"\n[ \t]*\n+", text) if b.strip()]
+    deduped = []
+    for block in blocks:
+        normalized = re.sub(r"\s+", " ", block).strip()
+        if deduped and len(normalized) >= min_chars:
+            prev_normalized = re.sub(r"\s+", " ", deduped[-1]).strip()
+            if normalized == prev_normalized:
+                continue
+        deduped.append(block)
+    return "\n\n".join(deduped)
+
+
 def sanitize_narrative_response(response_text: str) -> str:
     """Remove isolated editorial notes without rewriting narrative prose."""
     cleaned_text = clean_text(response_text)
@@ -1344,8 +1389,8 @@ def sanitize_narrative_response(response_text: str) -> str:
     # remains the first line of defence, while this filter only removes notes
     # when genuine narrative text is left behind.
     if not kept_blocks:
-        return cleaned_text
-    return "\n\n".join(kept_blocks).strip()
+        return dedup_consecutive_paragraphs(cleaned_text)
+    return dedup_consecutive_paragraphs("\n\n".join(kept_blocks).strip())
 
 
 def sanitize_generated_script(script_text: str) -> str:
@@ -1354,18 +1399,36 @@ def sanitize_generated_script(script_text: str) -> str:
         return script_text
 
     section_pattern = re.compile(
-        r"(### \[(?:INTRO|BODY|OUTRO)\]\r?\n)(.*?)(?=\r?\n### \[)",
+        r"(### \[(?:INTRO|BODY|OUTRO)\]\r?\n)(.*?)(?=\r?\n### \[|\Z)",
         flags=re.DOTALL,
     )
+    
+    seen_paragraphs = set()
 
     def replace_section(match: re.Match) -> str:
         section_header = match.group(1)
         cleaned_content = sanitize_narrative_response(match.group(2))
-        separator = "\n" if cleaned_content else ""
-        return f"{section_header}{cleaned_content}{separator}"
+        
+        deduped_blocks = []
+        import re as local_re
+        for block in local_re.split(r"\n[ \t]*\n+", cleaned_content):
+            block_stripped = block.strip()
+            if not block_stripped:
+                continue
+                
+            normalized = local_re.sub(r"\s+", " ", block_stripped)
+            if len(normalized) >= 100 and len(local_re.findall(r"[^\W_]+(?:['’][^\W_]+)?", normalized, local_re.UNICODE)) >= 10:
+                if normalized in seen_paragraphs:
+                    continue
+                seen_paragraphs.add(normalized)
+            
+            deduped_blocks.append(block_stripped)
+            
+        final_content = "\n\n".join(deduped_blocks)
+        separator = "\n" if final_content else ""
+        return f"{section_header}{final_content}{separator}"
 
     return section_pattern.sub(replace_section, script_text)
-
 
 def validate_prompt_text(prompt_text: str) -> None:
     if not isinstance(prompt_text, str) or not prompt_text.strip():
@@ -1395,6 +1458,27 @@ def prompt_text_matches(expected_text: str, editor_text: str) -> bool:
         return re.sub(r"\s+", " ", value.replace("\u00a0", " ")).strip()
 
     return normalize(expected_text) == normalize(editor_text)
+
+
+def history_prompt_text_matches(expected_text: str, rendered_text: str) -> bool:
+    def normalize(value: str) -> str:
+        return re.sub(r"\s+", " ", value.replace("\u00a0", " ")).strip()
+
+    expected = normalize(expected_text)
+    actual = normalize(rendered_text)
+
+    if expected == actual:
+        return True
+
+    if len(actual) >= 100 and expected.startswith(actual):
+        return True
+
+    if len(actual) >= 100 and len(expected) >= 100:
+        if expected[:100] == actual[:100]:
+            return True
+
+    return False
+
 
 
 def replace_prompt_text_with_javascript(page: Page, prompt_text: str) -> None:
@@ -1458,11 +1542,18 @@ def _read_assistant_message(message) -> str:
             markdown_text = clean_text(markdown_node.inner_text())
         except Exception:
             continue
-        if markdown_text and markdown_text not in markdown_parts:
+        if (
+            markdown_text
+            and not _is_pure_thinking_indicator(markdown_text)
+            and markdown_text not in markdown_parts
+        ):
             markdown_parts.append(markdown_text)
     if markdown_parts:
         return "\n\n".join(markdown_parts)
-    return clean_text(message.inner_text())
+    fallback = clean_text(message.inner_text())
+    if _is_pure_thinking_indicator(fallback):
+        return ""
+    return fallback
 
 
 def get_assistant_response_after_latest_user(
@@ -1481,7 +1572,7 @@ def get_assistant_response_after_latest_user(
             return ""
 
         latest_user = messages.nth(latest_user_index)
-        if expected_user_text and not prompt_text_matches(
+        if expected_user_text and not history_prompt_text_matches(
             expected_user_text,
             clean_text(latest_user.inner_text()),
         ):
@@ -1600,7 +1691,7 @@ def wait_for_assistant_response(
     saw_busy_state = False
 
     while True:
-        dismiss_external_app_permission_dialog(page)
+        accept_external_app_permission_dialog(page)
         busy = is_chatgpt_generation_active(page)
         saw_busy_state = saw_busy_state or busy
         response_text = get_new_assistant_response(
@@ -1688,7 +1779,7 @@ def wait_for_existing_assistant_response(
     saw_busy_state = False
 
     while True:
-        dismiss_external_app_permission_dialog(page)
+        accept_external_app_permission_dialog(page)
         busy = is_chatgpt_generation_active(page)
         saw_busy_state = saw_busy_state or busy
         response_text = get_assistant_response_after_latest_user(
@@ -2061,7 +2152,32 @@ def _pending_prompt_matches(state: dict, step: str, prompt_text: str) -> bool:
     )
 
 
-def recover_pending_prompt_response(page: Page, prompt_text: str) -> str:
+def is_prompt_in_conversation(page: Page, expected_user_text: str) -> bool:
+    try:
+        messages = page.locator('[data-message-author-role]')
+        latest_user_index = -1
+        for index in range(messages.count()):
+            role = messages.nth(index).get_attribute("data-message-author-role")
+            if role == "user":
+                latest_user_index = index
+        if latest_user_index < 0:
+            return False
+
+        latest_user = messages.nth(latest_user_index)
+        return history_prompt_text_matches(
+            expected_user_text,
+            clean_text(latest_user.inner_text()),
+        )
+    except Exception:
+        return False
+
+
+
+def recover_pending_prompt_response(
+    page: Page, 
+    prompt_text: str,
+    on_prompt_submitted = None,
+) -> str:
     response_text = wait_for_existing_assistant_response(
         page,
         prompt_text,
@@ -2071,6 +2187,10 @@ def recover_pending_prompt_response(page: Page, prompt_text: str) -> str:
         response_text = recover_assistant_response_after_reload(page, prompt_text)
     if response_text:
         return response_text
+        
+    if not is_prompt_in_conversation(page, prompt_text):
+        return send_prompt(page, prompt_text, on_prompt_submitted=on_prompt_submitted)
+        
     raise RuntimeError(
         "A previously submitted ChatGPT prompt still has no readable response. "
         "The existing conversation was inspected without resending the prompt."
@@ -2084,13 +2204,19 @@ def send_or_recover_generation_prompt(
     prompt_text: str,
 ) -> str:
     pending_prompt = state.get("pending_prompt")
+    def mark_submitted() -> None:
+        state["pending_prompt"]["status"] = "submitted"
+        if is_chatgpt_conversation_url(page.url):
+            state["chat_url"] = page.url
+        persist_generation_state(state)
+
     if pending_prompt:
         if not _pending_prompt_matches(state, step, prompt_text):
             raise RuntimeError(
                 "The checkpoint contains a different unresolved ChatGPT prompt. "
                 "No new prompt was sent."
             )
-        return recover_pending_prompt_response(page, prompt_text)
+        return recover_pending_prompt_response(page, prompt_text, on_prompt_submitted=mark_submitted)
 
     def mark_prompt_submitted() -> None:
         state["pending_prompt"] = {
@@ -2118,14 +2244,14 @@ def clear_pending_generation_prompt(
 
 
 def build_video_script(state: dict) -> str:
-    intro = sanitize_narrative_response(state.get("intro", ""))
+    intro = dedup_consecutive_paragraphs(sanitize_narrative_response(state.get("intro", "")))
     body = "\n\n".join(
         sanitized_part
         for part in state.get("body_parts", [])
-        if (sanitized_part := sanitize_narrative_response(part))
+        if (sanitized_part := dedup_consecutive_paragraphs(sanitize_narrative_response(part)))
     )
-    outro = sanitize_narrative_response(state.get("outro", ""))
-    return (
+    outro = dedup_consecutive_paragraphs(sanitize_narrative_response(state.get("outro", "")))
+    raw_script = (
         f"### [INTRO]\n{intro}\n\n"
         f"### [BODY]\n{body}\n\n"
         f"### [OUTRO]\n{outro}\n\n"
@@ -2134,6 +2260,7 @@ def build_video_script(state: dict) -> str:
         f"### [THUMBNAIL CÓ CHỮ]\n{state.get('thumb_text', '')}\n\n"
         f"### [THUMBNAIL KHÔNG CHỮ]\n{state.get('thumb_notext', '')}"
     )
+    return sanitize_generated_script(raw_script)
 
 
 def _checkpoint_video_id() -> int | None:
@@ -2252,6 +2379,22 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 clear_pending_generation_prompt(state, "outline", prompt2)
                 persist_generation_state(state)
                 raise RuntimeError("ChatGPT returned an empty outline.")
+                
+            filtered_parts = []
+            removed_count = 0
+            for part in parts:
+                header = part.lower()[:100]
+                if any(x in header for x in OUTLINE_INTRO_OUTRO_KEYWORDS):
+                    removed_count += 1
+                    continue
+                filtered_parts.append(part)
+                
+            if removed_count > 0:
+                print(f"    -> Đã loại bỏ {removed_count} phần Intro/Outro bị lẫn vào dàn ý.", file=sys.stderr)
+                parts = filtered_parts
+                if not parts:
+                    raise RuntimeError("Tất cả dàn ý đều bị lọc bỏ vì chứa từ khóa Intro/Outro.")
+
             state["outline_parts"] = parts
             state["expected_body_parts"] = len(parts)
             clear_pending_generation_prompt(state, "outline", prompt2)
@@ -2271,14 +2414,14 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 + NARRATIVE_ONLY_INSTRUCTION
             )
             state["current_step"] = "intro"
-            intro = sanitize_narrative_response(
+            intro = dedup_consecutive_paragraphs(sanitize_narrative_response(
                 send_or_recover_generation_prompt(
                     page,
                     state,
                     "intro",
                     prompt3,
                 )
-            )
+            ))
             if not intro:
                 clear_pending_generation_prompt(state, "intro", prompt3)
                 persist_generation_state(state)
@@ -2303,14 +2446,14 @@ def _run_complete(transcript: str, state: dict) -> dict:
             )
             body_step = f"body {i + 1}/{len(parts)}"
             state["current_step"] = body_step
-            res = sanitize_narrative_response(
+            res = dedup_consecutive_paragraphs(sanitize_narrative_response(
                 send_or_recover_generation_prompt(
                     page,
                     state,
                     body_step,
                     prompt4,
                 )
-            )
+            ))
             if not res:
                 clear_pending_generation_prompt(state, body_step, prompt4)
                 persist_generation_state(state)
@@ -2330,14 +2473,14 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 + NARRATIVE_ONLY_INSTRUCTION
             )
             state["current_step"] = "outro"
-            outro = sanitize_narrative_response(
+            outro = dedup_consecutive_paragraphs(sanitize_narrative_response(
                 send_or_recover_generation_prompt(
                     page,
                     state,
                     "outro",
                     prompt5,
                 )
-            )
+            ))
             if not outro:
                 clear_pending_generation_prompt(state, "outro", prompt5)
                 persist_generation_state(state)

@@ -139,10 +139,18 @@ class ApiAndResourceLimitTests(unittest.IsolatedAsyncioTestCase):
 
     def test_error_redaction_removes_tokens_and_local_paths(self):
         redacted = security_logging.redact_sensitive(
-            "api_key=secret-value C:\\Users\\Tri\\private.txt"
+            "api_key=secret-value XEAAExampleFacebookToken1234567890 "
+            "C:\\Users\\Tri\\private.txt"
         )
         self.assertNotIn("secret-value", redacted)
+        self.assertNotIn("EAAExampleFacebookToken1234567890", redacted)
         self.assertNotIn("C:\\Users", redacted)
+
+    def test_exception_reporting_does_not_restore_redacted_token_in_traceback(self):
+        token = "EAAExampleFacebookToken1234567890"
+        with self.assertLogs("auto_yt.security", level="ERROR") as captured:
+            security_logging.report_exception("facebook_test", RuntimeError(token))
+        self.assertNotIn(token, "\n".join(captured.output))
 
 
 if __name__ == "__main__":

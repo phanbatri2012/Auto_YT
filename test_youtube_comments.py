@@ -9,6 +9,10 @@ from unittest.mock import patch
 from auto_yt.services import database
 from auto_yt.services import chatgpt_worker
 from auto_yt.services import youtube_comments
+from auto_yt.services.chatgpt_runtime import (
+    CHATGPT_LOGIN_REQUIRED_MESSAGE,
+    ChatGPTAttentionRequiredError,
+)
 from auto_yt import main
 
 
@@ -180,8 +184,13 @@ class YouTubeCommentDatabaseTests(unittest.TestCase):
                 FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE,
                 FOREIGN KEY(youtube_channel_id) REFERENCES youtube_channels(id) ON DELETE CASCADE
             );
-            INSERT INTO video_publications_old_schema
-            SELECT * FROM video_publications;
+            INSERT INTO video_publications_old_schema (
+                id, video_id, youtube_channel_id, youtube_video_id,
+                published_url, published_title, published_at, created_at, updated_at
+            )
+            SELECT id, video_id, youtube_channel_id, youtube_video_id,
+                   published_url, published_title, published_at, created_at, updated_at
+            FROM video_publications;
             DROP TABLE video_publications;
             ALTER TABLE video_publications_old_schema RENAME TO video_publications;
             CREATE INDEX idx_video_publications_video ON video_publications(video_id);
@@ -440,6 +449,47 @@ class YouTubeCommentHelperTests(unittest.TestCase):
 
         self.assertIn("TRÁNH lặp", prompt)
         self.assertIn("không lặp lời cảm ơn khuôn mẫu", prompt)
+
+    def test_compact_reply_sample_trims_cleanly(self):
+        long_reply = (
+            "📌 Góp ý này rất chính xác về bối cảnh lịch sử của sự kiện. "
+            "Sau giải phóng năm 1975, tình hình biên giới Tây Nam vô cùng phức tạp "
+            "với hàng loạt xung đột kéo dài nhiều năm tiếp theo."
+        )
+        compact = youtube_comments._compact_reply_sample(long_reply, max_chars=120)
+        self.assertEqual(
+            compact,
+            "📌 Góp ý này rất chính xác về bối cảnh lịch sử của sự kiện.",
+        )
+
+        long_sentence_no_period = "Một câu dài không có dấu chấm phân tách câu rõ ràng nhưng vẫn phải được cắt gãy gọn gàng theo ranh giới từ mà không đứt chữ"
+        compact_word = youtube_comments._compact_reply_sample(long_sentence_no_period, max_chars=60)
+        self.assertTrue(compact_word.endswith("..."))
+        self.assertLessEqual(len(compact_word), 63)
+
+    def test_reply_prompt_scales_recent_replies_dynamically(self):
+        ten_replies = [f"Câu trả lời số {i} rất chi tiết về lịch sử." for i in range(10)]
+
+        # Single comment gets at most 2 samples
+        single_prompt = youtube_comments.build_comment_reply_prompt(
+            [{"comment_id": "1", "text": "Comment lẻ"}],
+            recent_replies=ten_replies,
+        )
+        self.assertIn("Câu trả lời số 0", single_prompt)
+        self.assertIn("Câu trả lời số 1", single_prompt)
+        self.assertNotIn("Câu trả lời số 2", single_prompt)
+
+        # Batch comments get at most 4 samples
+        batch_prompt = youtube_comments.build_comment_reply_prompt(
+            [
+                {"comment_id": "1", "text": "Cmt 1"},
+                {"comment_id": "2", "text": "Cmt 2"},
+            ],
+            recent_replies=ten_replies,
+        )
+        self.assertIn("Câu trả lời số 0", batch_prompt)
+        self.assertIn("Câu trả lời số 3", batch_prompt)
+        self.assertNotIn("Câu trả lời số 4", batch_prompt)
 
     @patch("auto_yt.services.youtube_comments._request_json")
     def test_lists_all_channel_upload_pages(self, request_json):
@@ -913,6 +963,35 @@ class YouTubeCommentJobTests(unittest.TestCase):
         self.assertIn("đồng bộ bình luận YouTube", saved["progress"])
         self.assertIsNone(database.claim_next_system_job("comment_sync"))
 
+    def test_expired_login_starts_automatic_login_for_comment_job(self):
+        job = main._create_comment_system_job(
+            "comment_draft",
+            title="Comment login",
+            payload={"comment_ids": ["comment-1"]},
+        )
+        login_error = ChatGPTAttentionRequiredError(
+            CHATGPT_LOGIN_REQUIRED_MESSAGE
+        )
+
+        with (
+            patch.object(
+                main,
+                "_execute_comment_draft_job",
+                side_effect=login_error,
+            ),
+            patch.object(
+                main,
+                "_schedule_automatic_chatgpt_login",
+                return_value=True,
+            ) as schedule_login,
+        ):
+            main._comment_queue_worker()
+
+        saved = database.get_system_job(job["id"])
+        self.assertEqual(saved["status"], "paused")
+        self.assertEqual(saved["result"]["automatic_login"], "pending")
+        schedule_login.assert_called_once_with(job["id"], login_error)
+
     def test_future_sync_retry_does_not_block_another_due_channel(self):
         future = database.create_system_job(
             "sync-future",
@@ -1144,7 +1223,7 @@ class YouTubeOAuthIsolationTests(unittest.TestCase):
         ]
         persisted = []
 
-        def refresh(_refresh_token, *, config):
+        def refresh(_refresh_token, *, config, **_kwargs):
             if config["client_id"] == "client-wrong":
                 raise youtube_comments.OAuthTokenRefreshError("unauthorized_client")
             return {"access_token": "fresh-access", "expires_in": 3600}
@@ -1224,8 +1303,18 @@ class YouTubeOAuthStateTests(unittest.TestCase):
                 "build_authorization_url",
                 return_value="https://accounts.google.com/oauth",
             ) as build_url,
+            patch.object(
+                main.gpm_service,
+                "get_gpm_profile_detail",
+                return_value={
+                    "name": "OAuth profile",
+                    "raw_proxy": "127.0.0.1:8899:user:pass",
+                },
+            ),
         ):
-            response = main.start_youtube_oauth(client_id="client-a")
+            response = main.start_youtube_oauth(
+                client_id="client-a", gpm_profile_id="gpm-oauth"
+            )
 
         self.assertEqual(response["authorization_url"], "https://accounts.google.com/oauth")
         self.assertIn("other-state", main._youtube_oauth_states)
@@ -1234,6 +1323,7 @@ class YouTubeOAuthStateTests(unittest.TestCase):
             "client-a",
         )
         self.assertEqual(build_url.call_args.kwargs["config"]["client_id"], "client-a")
+        self.assertNotIn("gpm_proxy_info", response)
         main._youtube_oauth_states.clear()
 
     def test_reconnect_state_is_locked_to_the_expected_channel(self):
@@ -1255,7 +1345,13 @@ class YouTubeOAuthStateTests(unittest.TestCase):
             patch.object(
                 database,
                 "get_youtube_channel_by_channel_id",
-                return_value={"channel_id": "UC-target", "title": "Target channel"},
+                return_value={
+                    "channel_id": "UC-target",
+                    "title": "Target channel",
+                    "gpm_profile_id": "gpm-target",
+                    "gpm_profile_name": "Target profile",
+                    "gpm_proxy_info": "127.0.0.1:8899:user:pass",
+                },
             ),
         ):
             main.start_youtube_oauth(

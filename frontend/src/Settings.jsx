@@ -1,13 +1,33 @@
 import { useState, useEffect } from 'react';
 import './Settings.css';
-import YouTubeChannelSettings from './YouTubeChannelSettings';
 
 const DEFAULT_PIPELINE = {
   metadata: true,
   chapters: true,
   thumbnail_with_text: true,
   thumbnail_without_text: true,
-  audio: true
+  audio: true,
+  video_render: false,
+  youtube_upload: false,
+  youtube_schedule: false
+};
+
+const DEFAULT_IMAGE_GENERATION_SETTINGS = {
+  style_prompt: '',
+  avoid_prompt: '',
+  negative_prompt: '',
+  thumbnail_variant: 'without_text',
+  scene_duration_min_seconds: 25,
+  scene_duration_target_seconds: 30,
+  scene_duration_max_seconds: 35
+};
+
+const DEFAULT_PUBLISHING_SETTINGS = {
+  category_id: '',
+  language: 'vi',
+  made_for_kids: null,
+  notify_subscribers: true,
+  contains_synthetic_media: true
 };
 
 const PIPELINE_STEPS = [
@@ -35,8 +55,84 @@ const PIPELINE_STEPS = [
     key: 'audio',
     label: 'Tự động tạo audio',
     description: 'Tự kiểm duyệt kịch bản và gửi đúng nhà cung cấp của giọng đã chọn.'
+  },
+  {
+    key: 'video_render',
+    label: 'Dựng MP4',
+    description: 'Lập cảnh theo SRT, tạo ảnh RealVisXL/IP-Adapter và dựng MP4 1080p.'
+  },
+  {
+    key: 'youtube_upload',
+    label: 'Upload Private',
+    description: 'Upload video, thumbnail và phụ đề lên đúng kênh, luôn giữ Private.'
+  },
+  {
+    key: 'youtube_schedule',
+    label: 'Đặt lịch đăng',
+    description: 'Giữ khung giờ hợp lệ của kênh và đặt lịch sau khi YouTube xử lý xong.'
   }
 ];
+
+const PIPELINE_STEP_LABELS = Object.fromEntries(
+  PIPELINE_STEPS.map(step => [step.key, step.label])
+);
+
+function pipelineDependencies(thumbnailVariant) {
+  return {
+    video_render: ['audio', 'chapters'],
+    youtube_upload: [
+      'video_render',
+      'metadata',
+      thumbnailVariant === 'with_text'
+        ? 'thumbnail_with_text'
+        : 'thumbnail_without_text'
+    ],
+    youtube_schedule: ['youtube_upload']
+  };
+}
+
+function resolvePipelineDependencies(pipeline, thumbnailVariant) {
+  const resolved = { ...DEFAULT_PIPELINE, ...pipeline };
+  const enabled = [];
+  const dependencies = pipelineDependencies(thumbnailVariant);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    Object.entries(dependencies).forEach(([step, requiredSteps]) => {
+      if (!resolved[step]) return;
+      requiredSteps.forEach(requiredStep => {
+        if (resolved[requiredStep]) return;
+        resolved[requiredStep] = true;
+        enabled.push(requiredStep);
+        changed = true;
+      });
+    });
+  }
+  return { pipeline: resolved, enabled: [...new Set(enabled)] };
+}
+
+function pipelineDependents(pipeline, stepKey, thumbnailVariant) {
+  const dependencies = pipelineDependencies(thumbnailVariant);
+  const dependents = [];
+  let frontier = [stepKey];
+  while (frontier.length) {
+    const source = frontier.shift();
+    Object.entries(dependencies).forEach(([step, requiredSteps]) => {
+      if (!pipeline[step] || dependents.includes(step) || !requiredSteps.includes(source)) return;
+      dependents.push(step);
+      frontier.push(step);
+    });
+  }
+  return dependents;
+}
+
+function pipelineOutcome(pipeline) {
+  if (pipeline.youtube_schedule) return 'Dựng, upload và đặt lịch';
+  if (pipeline.youtube_upload) return 'Upload và giữ Private';
+  if (pipeline.video_render) return 'Tạo MP4, không upload';
+  if (pipeline.audio) return 'Kết thúc ở Audio';
+  return 'Kết thúc sau khi tạo nội dung đã chọn';
+}
 
 function ProviderVoiceOptions({ voices }) {
   const providerNames = { genmax: 'Genmax', omnivoice: 'OmniVoice' };
@@ -64,6 +160,7 @@ export default function Settings({
   const [promptsData, setPromptsData] = useState(null);
   const [voicesData, setVoicesData] = useState(null);
   const [youtubeChannels, setYoutubeChannels] = useState([]);
+  const [pipelineNotice, setPipelineNotice] = useState('');
   const [browserAutomation, setBrowserAutomation] = useState({
     worker_headless: true,
     game_mode: false
@@ -80,6 +177,103 @@ export default function Settings({
   const [resultMsg, setResultMsg] = useState('');
   const [resultSection, setResultSection] = useState('');
   const [savingSection, setSavingSection] = useState('');
+  const [promptAssets, setPromptAssets] = useState([]);
+  const [promptAssetsFolder, setPromptAssetsFolder] = useState('');
+  const [loadingAssets, setLoadingAssets] = useState(false);
+  const [uploadingAsset, setUploadingAsset] = useState(false);
+  const [assetMessage, setAssetMessage] = useState('');
+
+  const fetchPromptAssets = async (version) => {
+    if (!version) return;
+    setLoadingAssets(true);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(version)}/assets`
+      );
+      if (response.ok) {
+        const data = await response.json();
+        setPromptAssets(data.assets || []);
+        setPromptAssetsFolder(data.folder_path || '');
+      }
+    } catch (err) {
+      console.error('Lỗi khi lấy danh sách assets của prompt:', err);
+    } finally {
+      setLoadingAssets(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeVersion) {
+      fetchPromptAssets(activeVersion);
+    }
+  }, [activeVersion]);
+
+  const handleOpenAssetsFolder = async () => {
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(activeVersion)}/open-folder`,
+        { method: 'POST' }
+      );
+      const data = await response.json();
+      if (data.success) {
+        setAssetMessage('Đã mở thư mục trên máy tính.');
+        setTimeout(() => setAssetMessage(''), 4000);
+      } else {
+        setAssetMessage('Không thể mở thư mục.');
+        setTimeout(() => setAssetMessage(''), 4000);
+      }
+    } catch (err) {
+      console.error('Lỗi khi mở thư mục assets:', err);
+      setAssetMessage('Lỗi khi mở thư mục.');
+    }
+  };
+
+  const handleUploadAsset = async (event) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    setUploadingAsset(true);
+    setAssetMessage('Đang tải ảnh lên...');
+    try {
+      for (let i = 0; i < files.length; i++) {
+        const formData = new FormData();
+        formData.append('file', files[i]);
+        await fetch(
+          `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(activeVersion)}/assets/upload`,
+          {
+            method: 'POST',
+            body: formData
+          }
+        );
+      }
+      await fetchPromptAssets(activeVersion);
+      setAssetMessage(`Đã tải lên thành công ${files.length} ảnh.`);
+      setTimeout(() => setAssetMessage(''), 4000);
+    } catch (err) {
+      console.error('Lỗi khi tải ảnh lên:', err);
+      setAssetMessage('Lỗi khi tải ảnh lên.');
+    } finally {
+      setUploadingAsset(false);
+      event.target.value = '';
+    }
+  };
+
+  const handleDeleteAsset = async (filename) => {
+    if (!window.confirm(`Bạn có chắc muốn xóa ảnh "${filename}" khỏi bộ prompt này?`)) return;
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(activeVersion)}/assets/${encodeURIComponent(filename)}`,
+        { method: 'DELETE' }
+      );
+      if (response.ok) {
+        await fetchPromptAssets(activeVersion);
+        setAssetMessage(`Đã xóa ảnh "${filename}".`);
+        setTimeout(() => setAssetMessage(''), 3000);
+      }
+    } catch (err) {
+      console.error('Lỗi khi xóa ảnh:', err);
+    }
+  };
+
 
   const fetchBrowserServiceStatus = async () => {
     try {
@@ -198,20 +392,102 @@ export default function Settings({
   };
 
   const handlePipelineChange = (stepKey, enabled) => {
+    const version = promptsData.versions[activeVersion];
+    const imageSettings = {
+      ...DEFAULT_IMAGE_GENERATION_SETTINGS,
+      ...version.image_generation_settings
+    };
+    const current = { ...DEFAULT_PIPELINE, ...version.pipeline };
+    let nextPipeline = { ...current, [stepKey]: enabled };
+    if (enabled) {
+      const resolved = resolvePipelineDependencies(
+        nextPipeline,
+        imageSettings.thumbnail_variant
+      );
+      nextPipeline = resolved.pipeline;
+      setPipelineNotice(
+        resolved.enabled.length
+          ? `Đã tự bật: ${resolved.enabled.map(key => PIPELINE_STEP_LABELS[key]).join(', ')}.`
+          : ''
+      );
+    } else {
+      const dependents = pipelineDependents(
+        current,
+        stepKey,
+        imageSettings.thumbnail_variant
+      );
+      if (dependents.length) {
+        const labels = dependents.map(key => PIPELINE_STEP_LABELS[key]).join(', ');
+        if (!window.confirm(`Tắt bước này cũng sẽ tắt: ${labels}. Tiếp tục?`)) return;
+        dependents.forEach(key => { nextPipeline[key] = false; });
+        setPipelineNotice(`Đã tắt dây chuyền: ${labels}.`);
+      } else {
+        setPipelineNotice('');
+      }
+    }
     setPromptsData(prev => ({
       ...prev,
       versions: {
         ...prev.versions,
         [activeVersion]: {
           ...prev.versions[activeVersion],
-          pipeline: {
-            ...DEFAULT_PIPELINE,
-            ...prev.versions[activeVersion].pipeline,
-            [stepKey]: enabled
-          }
+          pipeline: nextPipeline
         }
       }
     }));
+  };
+
+  const handlePromptSettingChange = (section, field, value) => {
+    setPromptsData(prev => {
+      const currentSection = {
+        ...(section === 'image_generation_settings'
+          ? DEFAULT_IMAGE_GENERATION_SETTINGS
+          : DEFAULT_PUBLISHING_SETTINGS),
+        ...prev.versions[activeVersion][section],
+        [field]: value
+      };
+      if (section === 'image_generation_settings') {
+        if (field === 'negative_prompt') {
+          currentSection.avoid_prompt = value;
+        } else if (field === 'avoid_prompt') {
+          currentSection.negative_prompt = value;
+        }
+      }
+      return {
+        ...prev,
+        versions: {
+          ...prev.versions,
+          [activeVersion]: {
+            ...prev.versions[activeVersion],
+            [section]: currentSection
+          }
+        }
+      };
+    });
+  };
+
+  const handleThumbnailVariantChange = (thumbnailVariant) => {
+    const version = promptsData.versions[activeVersion];
+    const current = { ...DEFAULT_PIPELINE, ...version.pipeline };
+    const resolved = resolvePipelineDependencies(current, thumbnailVariant);
+    handlePromptSettingChange('image_generation_settings', 'thumbnail_variant', thumbnailVariant);
+    if (current.youtube_upload) {
+      setPromptsData(prev => ({
+        ...prev,
+        versions: {
+          ...prev.versions,
+          [activeVersion]: {
+            ...prev.versions[activeVersion],
+            pipeline: resolved.pipeline
+          }
+        }
+      }));
+      setPipelineNotice(
+        resolved.enabled.length
+          ? `Đã tự bật thumbnail được chọn: ${resolved.enabled.map(key => PIPELINE_STEP_LABELS[key]).join(', ')}.`
+          : ''
+      );
+    }
   };
 
   const handleVersionChange = (e) => {
@@ -240,6 +516,14 @@ export default function Settings({
         pipeline: {
           ...DEFAULT_PIPELINE,
           ...(newData.versions[activeVersion].pipeline || {})
+        },
+        image_generation_settings: {
+          ...DEFAULT_IMAGE_GENERATION_SETTINGS,
+          ...(newData.versions[activeVersion].image_generation_settings || {})
+        },
+        publishing_settings: {
+          ...DEFAULT_PUBLISHING_SETTINGS,
+          ...(newData.versions[activeVersion].publishing_settings || {})
         },
         prompts: currentPrompts
       };
@@ -425,6 +709,70 @@ export default function Settings({
           }
         }
       }));
+      if (Array.isArray(result.auto_enabled) && result.auto_enabled.length) {
+        setPipelineNotice(
+          `Backend đã tự bật: ${result.auto_enabled.map(key => PIPELINE_STEP_LABELS[key]).join(', ')}.`
+        );
+      }
+    }
+  };
+
+  const handleSaveImageGeneration = async () => {
+    const versionId = activeVersion;
+    const currentImg = promptsData.versions[versionId]?.image_generation_settings || {};
+    const negPrompt = currentImg.negative_prompt ?? currentImg.avoid_prompt ?? '';
+    const settings = {
+      ...DEFAULT_IMAGE_GENERATION_SETTINGS,
+      ...currentImg,
+      negative_prompt: negPrompt,
+      avoid_prompt: negPrompt
+    };
+    const result = await saveSection(
+      'image-generation',
+      'Đang lưu cấu hình tạo ảnh và thumbnail...',
+      'Đã lưu cấu hình tạo ảnh và thumbnail.',
+      () => fetch(
+        `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/image-generation`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(settings)
+        }
+      )
+    );
+    if (result?.version && activeVersion === versionId) {
+      setPromptsData(prev => ({
+        ...prev,
+        versions: { ...prev.versions, [versionId]: result.version }
+      }));
+    }
+  };
+
+  const handleSavePublishing = async () => {
+    const versionId = activeVersion;
+    const settings = {
+      ...DEFAULT_PUBLISHING_SETTINGS,
+      ...promptsData.versions[versionId].publishing_settings,
+      contains_synthetic_media: true
+    };
+    const result = await saveSection(
+      'publishing',
+      'Đang lưu cấu hình đăng YouTube...',
+      'Đã lưu cấu hình đăng YouTube.',
+      () => fetch(
+        `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/publishing`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(settings)
+        }
+      )
+    );
+    if (result?.version && activeVersion === versionId) {
+      setPromptsData(prev => ({
+        ...prev,
+        versions: { ...prev.versions, [versionId]: result.version }
+      }));
     }
   };
 
@@ -580,6 +928,24 @@ export default function Settings({
   const currentPipeline = {
     ...DEFAULT_PIPELINE,
     ...currentVersion.pipeline
+  };
+  const currentImageGeneration = {
+    ...DEFAULT_IMAGE_GENERATION_SETTINGS,
+    ...currentVersion.image_generation_settings,
+    negative_prompt: (
+      currentVersion.image_generation_settings?.negative_prompt ??
+      currentVersion.image_generation_settings?.avoid_prompt ??
+      ''
+    ),
+    avoid_prompt: (
+      currentVersion.image_generation_settings?.avoid_prompt ??
+      currentVersion.image_generation_settings?.negative_prompt ??
+      ''
+    )
+  };
+  const currentPublishing = {
+    ...DEFAULT_PUBLISHING_SETTINGS,
+    ...currentVersion.publishing_settings
   };
 
   const promptFields = [
@@ -746,8 +1112,9 @@ export default function Settings({
             <label>🕶️ Trình duyệt ChatGPT cho job tự động</label>
             <div className="help-text" style={{ marginTop: '5px' }}>
               Hệ thống khởi động Chromium một lần và mọi job dùng lại cùng phiên qua
-              kết nối nội bộ. Nếu phiên nền mất kết nối, job sẽ tạm dừng thay vì tự mở
-              cửa sổ mới. Auto Login và Open Profile chỉ hiện khi chính bạn bấm.
+              kết nối nội bộ. Khi Playwright xác nhận phiên đăng nhập hết hạn, hệ thống
+              tự chạy Auto Login một lần rồi tiếp tục đúng các job vừa bị tạm dừng.
+              CAPTCHA, MFA thiếu mã và xác minh thiết bị vẫn cần bạn xử lý thủ công.
             </div>
           </div>
           <button
@@ -854,11 +1221,18 @@ export default function Settings({
         )}
       </div>
 
-      <YouTubeChannelSettings
-        onChannelsChange={setYoutubeChannels}
-        promptVersions={promptsData.versions}
-        activePromptVersion={activeVersion}
-      />
+      <div className="result-panel" style={{ marginBottom: '20px', padding: '16px', border: '1px solid rgba(139, 92, 246, 0.4)', background: 'rgba(139, 92, 246, 0.08)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px' }}>
+          <div>
+            <strong style={{ color: '#fff', fontSize: '1rem', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span>📡 Quản lý Kênh & Cô lập Profile GPM</span>
+            </strong>
+            <div className="help-text" style={{ marginTop: '4px', color: '#cbd5e1' }}>
+              Toàn bộ cấu hình kết nối kênh (YouTube, Facebook) và cô lập Proxy Profile GPM-Login đã được chuyển sang menu riêng <strong>Channel Hub</strong>.
+            </div>
+          </div>
+        </div>
+      </div>
       
       <div className="version-control">
         <div className="version-editor">
@@ -1003,7 +1377,7 @@ export default function Settings({
         </select>
         {!youtubeChannels.length && (
           <div className="help-text" style={{ marginTop: 8, color: '#f5b041' }}>
-            Hãy kết nối kênh YouTube ở mục phía trên trước khi chọn.
+            Chưa có kênh YouTube nào được kết nối. Hãy kết nối kênh trong menu Channel Hub.
           </div>
         )}
         {resultSection === 'prompt-default-youtube-channel' &&
@@ -1052,11 +1426,306 @@ export default function Settings({
             </label>
           ))}
         </div>
+        <div className="pipeline-outcome" role="status">
+          Kết quả: <strong>{pipelineOutcome(currentPipeline)}</strong>
+        </div>
+        {pipelineNotice && (
+          <div className="help-text" style={{ marginTop: 8, color: '#4dd0e1' }}>
+            {pipelineNotice}
+          </div>
+        )}
         <div className="help-text pipeline-snapshot-help">
           Mỗi job lưu một bản chụp pipeline khi được thêm vào hàng đợi. Sửa cấu
           hình tại đây không thay đổi job đã xếp hàng hoặc đang phục hồi.
         </div>
       </div>
+
+      {currentPipeline.video_render && (
+        <div className="prompt-item" style={{ marginBottom: '20px' }}>
+          <div className="prompt-header">
+            <div>
+              <label>🖼️ Cấu hình phân cảnh & tạo ảnh cho video MP4</label>
+              <div className="help-text" style={{ marginTop: 5 }}>
+                Hệ thống chia phân cảnh theo câu từ phụ đề SRT (25–35s), tạo ảnh cảnh và dựng thành video MP4 hoàn chỉnh kèm hiệu ứng Zoom/Pan & phụ đề.
+              </div>
+            </div>
+            <button
+              className="btn-save section-save-button"
+              onClick={handleSaveImageGeneration}
+              disabled={Boolean(savingSection) || activeVersionLocked}
+            >
+              💾 Lưu cấu hình ảnh
+            </button>
+          </div>
+          <div className="production-settings-grid">
+            <label>
+              Thumbnail dùng để upload
+              <select
+                className="version-select"
+                value={currentImageGeneration.thumbnail_variant}
+                onChange={event => handleThumbnailVariantChange(event.target.value)}
+                disabled={activeVersionLocked}
+              >
+                <option value="without_text">Không chữ</option>
+                <option value="with_text">Có chữ</option>
+              </select>
+            </label>
+            {[
+              ['scene_duration_min_seconds', 'Tối thiểu (giây)'],
+              ['scene_duration_target_seconds', 'Mục tiêu (giây)'],
+              ['scene_duration_max_seconds', 'Tối đa (giây)']
+            ].map(([key, label]) => (
+              <label key={key}>
+                {label}
+                <input
+                  type="number"
+                  min="10"
+                  max="90"
+                  value={currentImageGeneration[key]}
+                  onChange={event => handlePromptSettingChange(
+                    'image_generation_settings', key, Number(event.target.value)
+                  )}
+                  disabled={activeVersionLocked}
+                />
+              </label>
+            ))}
+          </div>
+          <div className="help-text" style={{ marginBottom: 12 }}>
+            Hệ thống ưu tiên biên câu trong khoảng 25–35 giây, rồi dùng ChatGPT qua
+            Playwright để tạo visual bible và prompt riêng cho từng cảnh.
+          </div>
+          <label className="production-field-label">
+            Style prompt
+            <textarea
+              className="prompt-textarea"
+              rows={3}
+              value={currentImageGeneration.style_prompt}
+              onChange={event => handlePromptSettingChange(
+                'image_generation_settings', 'style_prompt', event.target.value
+              )}
+              disabled={activeVersionLocked}
+              placeholder="Phong cách hình ảnh dùng chung cho các scene"
+            />
+          </label>
+          <label className="production-field-label">
+            Negative prompt (Tránh tạo)
+            <textarea
+              className="prompt-textarea"
+              rows={3}
+              value={currentImageGeneration.negative_prompt}
+              onChange={event => handlePromptSettingChange(
+                'image_generation_settings', 'negative_prompt', event.target.value
+              )}
+              disabled={activeVersionLocked}
+              placeholder="Các đặc điểm cần loại trừ"
+            />
+          </label>
+        </div>
+      )}
+
+      <div className="prompt-item" style={{ marginBottom: '20px' }}>
+        <div className="prompt-header">
+          <div>
+            <label>🎭 Thư viện nhân vật & bối cảnh tham chiếu (Reference Assets)</label>
+            <div className="help-text" style={{ marginTop: 5 }}>
+              Mỗi bộ prompt có một thư mục riêng. Đặt ảnh nhân vật/địa danh vào đây với tên file tương ứng (ví dụ: <code>bac_ba.png</code>, <code>chua_mot_cot.jpg</code>).
+              Hệ thống tự động so khớp tên nhân vật với phụ đề từng cảnh để gửi ảnh mẫu vào Google Flow, giúp nhân vật luôn đồng nhất trong suốt video.
+            </div>
+          </div>
+          <div className="prompt-header-actions">
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={handleOpenAssetsFolder}
+              title={promptAssetsFolder ? `Đường dẫn: ${promptAssetsFolder}` : 'Mở thư mục'}
+            >
+              📁 Mở thư mục trên máy tính
+            </button>
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={() => fetchPromptAssets(activeVersion)}
+              title="Quét lại các file ảnh mới thêm vào thư mục"
+            >
+              🔄 Làm mới
+            </button>
+          </div>
+        </div>
+
+        <div style={{ marginTop: 12 }}>
+          {promptAssetsFolder && (
+            <div style={{ fontSize: '0.8rem', color: '#888', marginBottom: 10, fontFamily: 'monospace', wordBreak: 'break-all' }}>
+              📂 Đường dẫn thư mục: {promptAssetsFolder}
+            </div>
+          )}
+
+          {assetMessage && (
+            <div className="help-text" style={{ color: '#4ce0b3', marginBottom: 10, display: 'inline-block' }}>
+              {assetMessage}
+            </div>
+          )}
+
+          <div style={{ marginBottom: 15, display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+            <label
+              className="btn-secondary"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                cursor: activeVersionLocked ? 'not-allowed' : 'pointer',
+                padding: '8px 16px',
+                margin: 0,
+                opacity: activeVersionLocked ? 0.6 : 1
+              }}
+            >
+              {uploadingAsset ? '⏳ Đang tải lên...' : '➕ Tải thêm ảnh nhân vật / bối cảnh'}
+              <input
+                type="file"
+                multiple
+                accept="image/png, image/jpeg, image/webp"
+                style={{ display: 'none' }}
+                onChange={handleUploadAsset}
+                disabled={activeVersionLocked || uploadingAsset}
+              />
+            </label>
+            <span className="help-text">
+              Chấp nhận .png, .jpg, .webp. Tên file nên viết không dấu hoặc gạch dưới (vd: <code>bac_ba.png</code>, <code>chi_lan.jpg</code>).
+            </span>
+          </div>
+
+          {loadingAssets ? (
+            <div style={{ color: '#888', padding: '16px 0' }}>Đang tải danh sách ảnh tham chiếu...</div>
+          ) : promptAssets.length === 0 ? (
+            <div style={{
+              padding: '24px',
+              textAlign: 'center',
+              background: '#181818',
+              borderRadius: '8px',
+              border: '1px dashed #444',
+              color: '#aaa'
+            }}>
+              <div style={{ fontSize: '2rem', marginBottom: 8 }}>🖼️</div>
+              <div>Chưa có ảnh nhân vật hoặc bối cảnh nào trong bộ prompt <strong>{currentVersion?.name || activeVersion}</strong>.</div>
+              <div style={{ fontSize: '0.85rem', color: '#777', marginTop: 6 }}>
+                Nhấn <strong>"📁 Mở thư mục trên máy tính"</strong> để copy ảnh vào hoặc bấm <strong>"➕ Tải thêm ảnh..."</strong> ở trên.
+              </div>
+            </div>
+          ) : (
+            <div className="prompt-assets-grid">
+              {promptAssets.map(asset => (
+                <div key={asset.filename} className="prompt-asset-card">
+                  <div className="prompt-asset-thumb-wrap">
+                    <img
+                      src={`http://127.0.0.1:8080/api/prompts/${encodeURIComponent(activeVersion)}/assets/${encodeURIComponent(asset.filename)}`}
+                      alt={asset.display_name}
+                      className="prompt-asset-thumb"
+                      loading="lazy"
+                    />
+                    <button
+                      type="button"
+                      className="prompt-asset-delete-btn"
+                      onClick={() => handleDeleteAsset(asset.filename)}
+                      disabled={activeVersionLocked}
+                      title={`Xóa ảnh ${asset.filename}`}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <div className="prompt-asset-info">
+                    <div className="prompt-asset-name" title={asset.filename}>
+                      {asset.filename}
+                    </div>
+                    <div className="prompt-asset-keywords" title={`Từ khóa nhận diện: ${asset.keywords?.join(', ')}`}>
+                      🔑 {asset.keywords?.slice(0, 3).join(', ')}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {currentPipeline.youtube_upload && (
+        <div className="prompt-item" style={{ marginBottom: '20px' }}>
+          <div className="prompt-header">
+            <div>
+              <label>📤 Thiết lập upload YouTube của bộ prompt</label>
+              <div className="help-text" style={{ marginTop: 5 }}>
+                Video luôn được upload Private. Không có chế độ tự Public ngay.
+              </div>
+            </div>
+            <button
+              className="btn-save section-save-button"
+              onClick={handleSavePublishing}
+              disabled={Boolean(savingSection) || activeVersionLocked}
+            >
+              💾 Lưu thiết lập upload
+            </button>
+          </div>
+          <div className="production-settings-grid">
+            <label>
+              YouTube Category ID
+              <input
+                className="version-select"
+                value={currentPublishing.category_id}
+                onChange={event => handlePromptSettingChange(
+                  'publishing_settings', 'category_id', event.target.value
+                )}
+                placeholder="Ví dụ: 22"
+                disabled={activeVersionLocked}
+              />
+            </label>
+            <label>
+              Ngôn ngữ
+              <input
+                className="version-select"
+                value={currentPublishing.language}
+                onChange={event => handlePromptSettingChange(
+                  'publishing_settings', 'language', event.target.value
+                )}
+                placeholder="vi"
+                disabled={activeVersionLocked}
+              />
+            </label>
+            <label>
+              Dành cho trẻ em
+              <select
+                className="version-select"
+                value={currentPublishing.made_for_kids === null ? '' : String(currentPublishing.made_for_kids)}
+                onChange={event => handlePromptSettingChange(
+                  'publishing_settings',
+                  'made_for_kids',
+                  event.target.value === '' ? null : event.target.value === 'true'
+                )}
+                disabled={activeVersionLocked}
+              >
+                <option value="">Bắt buộc chọn</option>
+                <option value="false">Không dành cho trẻ em</option>
+                <option value="true">Dành cho trẻ em</option>
+              </select>
+            </label>
+          </div>
+          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 12 }}>
+            <label>
+              <input
+                type="checkbox"
+                checked={currentPublishing.notify_subscribers}
+                onChange={event => handlePromptSettingChange(
+                  'publishing_settings', 'notify_subscribers', event.target.checked
+                )}
+                disabled={activeVersionLocked}
+              /> Thông báo người đăng ký khi video được công khai
+            </label>
+            <span style={{ color: '#4dd0e1' }}>✓ Luôn khai báo nội dung tổng hợp bằng AI</span>
+          </div>
+          {currentPipeline.youtube_schedule && (
+            <div className="help-text" style={{ marginTop: 10, color: '#f5b041' }}>
+              Lịch đăng, timezone, giới hạn ngày và nút pause được cấu hình tại phần kênh YouTube phía trên.
+            </div>
+          )}
+        </div>
+      )}
 
       {(loadingMsg || resultMsg) &&
         resultSection !== 'prompt-default-youtube-channel' && (

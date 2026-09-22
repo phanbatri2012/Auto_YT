@@ -95,3 +95,51 @@ Use Puppeteer to search Official Docs or StackOverflow ONLY when:
 ## 9. Auto-YT Project Policy
 - **ALWAYS** use Playwright to interact with ChatGPT for this project. Do not rely on direct API calls or other methods for fetching data or prompting ChatGPT, as the project's core functionality relies on utilizing the authenticated browser session via Playwright.
 - **ALWAYS** implement features and fixes generically for every video. Never hardcode behavior for a specific video ID, YouTube URL, title, ChatGPT conversation, prompt version, or stored record. Video-specific data may only be used to reproduce and verify a general solution.
+
+## 10. Auto_YT Multi-Service Lifecycle Policy
+- **Complete Pipeline Invariant**: Auto_YT relies on interdependent services to produce videos end-to-end:
+  1. **Backend API** (FastAPI on port `8080`): Orchestration, SQLite DB, queue workers, video muxing.
+  2. **Frontend UI** (Vite + React on port `5173`): User management, progress tracking, preview & download.
+  3. **OmniVoice TTS Worker** (FastAPI on port `8011`): Local Vietnamese voice cloning & TTS audio generation.
+  4. **ChatGPT Browser Service** (Playwright Chromium CDP with profile `PROFILE_GPT_1`): Outlines, scripts, scene plans, metadata.
+  5. **Google Flow Browser Service** (Playwright Chromium CDP with profile `PROFILE_GOOGLE_FLOW_1`): Scene visual image generation.
+- **Future-Proofing & Service Extensibility (MANDATORY)**:
+  Whenever ANY new service, background worker, external tool, or automation daemon is added to the Auto_YT pipeline in the future:
+  1. **Start Script (`start_autoyt.ps1` / `run_autoyt.bat`)**: MUST be updated to initialize the new service, check its health/readiness probe, and include its status in the terminal summary.
+  2. **Stop Script (`stop_autoyt.ps1` / `run_autoyt_stop.bat`)**: MUST be updated to safely terminate the new service, release its listening ports, kill associated browser/helper processes, and remove its lock/state files.
+  3. **Restart Script (`run_autoyt_restart.bat`)**: Automatically inherits clean stop and startup so the new service restarts seamlessly without leaks or port collisions.
+  Never allow a new service to run as an unmonitored orphan outside this unified lifecycle trio.
+- **Startup Invariant**: Any startup routine must verify the readiness of all registered services before declaring the system ready.
+- **Shutdown & Cleanup Invariant**: Any shutdown routine must:
+  - Free all registered service ports (`8080`, `5173`, `8011`, and any future ports).
+  - Terminate project-specific Chromium processes (`PROFILE_GPT_*`, `PROFILE_GOOGLE_FLOW_*`) without touching the user's personal browser.
+  - Remove stale `SingletonLock` files and state markers (`*.stop.json`, `worker.pid`) to guarantee conflict-free restarts.
+- **Dual Directory Parity**: Always maintain identical execution wrappers (`run_autoyt.bat`, `run_autoyt_restart.bat`, `run_autoyt_stop.bat`) at both the project root (`Auto_YT\`) and subfolder (`Tool-auto-login-GPT\`).
+- **Post-Fix Safe Restart & Idle Verification Invariant (MANDATORY)**:
+  Whenever code fixes or modifications are completed:
+  1. **Idle Verification First**: MUST check whether any generation, TTS, rendering, or browser pipeline processes/jobs are currently running (e.g. active `system_jobs` in `processing`/`running` states, background worker loops, or active Playwright browser sessions).
+  2. **Active Process Handling**: If any background job or process is active, DO NOT restart immediately. Wait and monitor until all active jobs have completed and the system returns to an idle state.
+  3. **Clean Restart**: Only once the system is verified idle, trigger `run_autoyt_restart.bat` to safely apply the code updates across all services without interrupting active work.
+
+## 11. Anti-Detect Browser (GPM-Login) & Zero-Footprint Channel Isolation Policy
+- **GPM-Login API Versioning**:
+  - Always target GPM-Login v3 endpoints (`/api/v3/profiles`, `/api/v3/profiles/start/{id}`, `/api/v3/profiles/stop/{id}`) for local API communication (`http://127.0.0.1:19995`).
+  - Gracefully handle GPM v3 plain-text response (`b"GPM-Login"`) for unmapped routes and prioritize `/api/v3` before falling back to `/api/v1`.
+- **Complete Zero-Footprint Network Isolation (MANDATORY)**:
+  - Every YouTube channel MUST be assigned a dedicated GPM Profile with its own proxy and browser fingerprint.
+  - **Dual Isolation Invariant**:
+    1. **Browser Operations**: YouTube Studio uploads, UI verification, and manual management MUST execute inside the channel's GPM profile via Playwright CDP.
+    2. **Background REST API Operations**: ALL background HTTP requests for a managed channel (OAuth token refresh, comment sync, video sync, resumable video chunk uploads, caption/thumbnail uploads) MUST be routed through the channel's assigned GPM proxy via `proxy_utils.py`.
+  - NEVER allow background REST API calls for a proxy-assigned channel to leak through the host machine's raw WAN IP.
+
+## 12. Secret & Access Token Security Policy (MANDATORY)
+- This policy applies to every credential handled by the project, including API keys, OAuth access/refresh tokens, Page Access Tokens, app secrets, session cookies, passwords, and proxy credentials.
+- **Encrypted at Rest**: Never persist credentials as plaintext in SQLite, JSON, backups, cache files, browser storage, or generated artifacts. On Windows, store them through the centralized DPAPI-backed secret store. Migrate legacy plaintext values and clear the original fields.
+- **Backend-Only / Write-Only**: Credentials may enter through an authenticated backend endpoint but MUST NOT be returned by any API response. Frontend state may receive only non-sensitive metadata such as `token_configured`, expiry, scopes, or account ID. Never store credentials in `localStorage`, `sessionStorage`, URLs, or DOM attributes.
+- **Safe Transport**: Send bearer tokens through the `Authorization` header and secrets through request bodies when an upstream API requires them. Never place credentials in query strings, request URLs, redirects, command-line arguments, or exception messages.
+- **Safe Logging and Errors**: Pass all external errors, tracebacks, job errors, and diagnostic output through centralized secret redaction before logging, persisting, or returning them. Logs may record credential type or configured state, never prefixes, suffixes, hashes, or recoverable fragments.
+- **Identity and Lifetime Validation**: Verify that a returned token belongs to the explicitly requested account/Page and validate its actual expiry/scopes before labeling it long-lived. Never silently select the first account or claim a token is permanent without authoritative validation.
+- **Proxy Fail-Closed**: For any channel assigned to a GPM proxy, credential refreshes and authenticated REST requests MUST fail if that proxy is missing or unusable. They must never fall back to the host WAN IP.
+- **Required Regression Checks**: Every credential-related change must include tests proving that API responses contain no secret fields or token patterns, persisted plaintext count is zero, logs/errors are redacted, sensitive API responses use `Cache-Control: no-store`, and proxy-assigned requests fail closed.
+- **Exposure Response**: If plaintext credentials are found, remove them from active data, backups, logs, and browser storage; add a regression test; and report that the affected credential must be rotated. Do not revoke or rotate an external credential without explicit user authorization.
+- Review debug scripts, tests, migration code, backups, and manual tooling under the same rules as production code. No security exception is allowed merely because code is local or temporary.

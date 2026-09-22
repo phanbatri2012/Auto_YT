@@ -162,3 +162,11 @@ input:checked + .slider:before {
   color: #2ecc71;
   font-weight: bold;
 }
+
+.result.error {
+  color: #e74c3c;
+}
+
+.result.success {
+  color: #2ecc71;
+}

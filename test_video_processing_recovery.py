@@ -9,7 +9,10 @@ from auto_yt.services.chatgpt_worker import (
     select_reusable_outline_response,
     split_outline_parts,
 )
-from auto_yt.services.chatgpt_runtime import ChatGPTAttentionRequiredError
+from auto_yt.services.chatgpt_runtime import (
+    CHATGPT_LOGIN_REQUIRED_MESSAGE,
+    ChatGPTAttentionRequiredError,
+)
 
 
 class ImmediateThread:
@@ -155,9 +158,16 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
             "thumbnail_with_text": False,
             "thumbnail_without_text": True,
             "audio": False,
+            "video_render": False,
+            "youtube_upload": False,
+            "youtube_schedule": False,
         }
         with (
-            patch.object(main, "_get_prompt_pipeline", return_value=pipeline),
+            patch.object(
+                main,
+                "_get_prompt_production_snapshot",
+                return_value={"prompt_version": "version-key", "pipeline": pipeline},
+            ),
             patch.object(main, "_kick_video_queue"),
         ):
             response = main.process_video(
@@ -371,7 +381,7 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
         update_generation.assert_not_called()
         ensure_audio.assert_not_called()
 
-    def test_chatgpt_verification_pauses_job_without_automatic_retry(self):
+    def test_expired_chatgpt_login_pauses_job_and_starts_automatic_login(self):
         with (
             patch.object(main, "_try_start_chatgpt_operation", return_value=True),
             patch.object(main, "_finish_chatgpt_operation"),
@@ -381,9 +391,16 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
             patch.object(
                 main,
                 "process_prompt_via_chatgpt",
-                side_effect=ChatGPTAttentionRequiredError("Login required"),
+                side_effect=ChatGPTAttentionRequiredError(
+                    CHATGPT_LOGIN_REQUIRED_MESSAGE
+                ),
             ),
             patch.object(main.db, "save_video", return_value=731),
+            patch.object(
+                main,
+                "_schedule_automatic_chatgpt_login",
+                return_value=True,
+            ) as schedule_login,
             patch.object(main, "_ensure_audio_task") as ensure_audio,
         ):
             response = main.process_video(
@@ -399,8 +416,11 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
             job["result"]["attention_required"],
             "chatgpt_verification",
         )
-        self.assertIn("xác minh", job["progress"])
+        self.assertEqual(job["result"]["automatic_login"], "pending")
+        self.assertIn("Auto Login", job["progress"])
         self.assertEqual(job["recovery_count"], 0)
+        schedule_login.assert_called_once()
+        self.assertEqual(schedule_login.call_args.args[0], response["job_id"])
         ensure_audio.assert_not_called()
 
     def test_transient_chatgpt_start_failure_retries_saved_draft(self):
@@ -632,6 +652,9 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
             "thumbnail_with_text": False,
             "thumbnail_without_text": False,
             "audio": False,
+            "video_render": False,
+            "youtube_upload": False,
+            "youtube_schedule": False,
         }
         worker_result = {
             "script": (
@@ -646,7 +669,11 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
         }
 
         with (
-            patch.object(main, "_get_prompt_pipeline", return_value=pipeline),
+            patch.object(
+                main,
+                "_get_prompt_production_snapshot",
+                return_value={"prompt_version": "version-key", "pipeline": pipeline},
+            ),
             patch.object(main, "_try_start_chatgpt_operation", return_value=True),
             patch.object(main, "_finish_chatgpt_operation"),
             patch.object(main.threading, "Thread", ImmediateThread),

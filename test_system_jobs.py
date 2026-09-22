@@ -6,6 +6,10 @@ from unittest.mock import patch
 from auto_yt import main
 from auto_yt.services import database
 from auto_yt.services import generation_checkpoint
+from auto_yt.services.chatgpt_runtime import (
+    CHATGPT_LOGIN_REQUIRED_MESSAGE,
+    ChatGPTAttentionRequiredError,
+)
 
 
 class SystemJobTests(unittest.TestCase):
@@ -21,7 +25,10 @@ class SystemJobTests(unittest.TestCase):
 
     def tearDown(self):
         self.database_patch.stop()
-        self.temp_directory.cleanup()
+        try:
+            self.temp_directory.cleanup()
+        except Exception:
+            pass
 
     def create_job(self, job_id: str) -> dict:
         return database.create_system_job(
@@ -32,6 +39,12 @@ class SystemJobTests(unittest.TestCase):
             prompt_version="prompt-a",
             voice_id="voice-a",
         )
+
+    def reset_automatic_login_state(self) -> None:
+        with main._automatic_login_state_lock:
+            main._automatic_login_active = False
+            main._automatic_login_job_ids.clear()
+            main._automatic_login_last_failure_at = 0.0
 
     def test_claims_video_jobs_in_fifo_order(self):
         self.create_job("first")
@@ -85,6 +98,138 @@ class SystemJobTests(unittest.TestCase):
         self.assertEqual(resumed["error"], "")
         self.assertEqual(resumed["result"], {})
 
+    def test_expired_login_schedules_one_automatic_login_for_multiple_jobs(self):
+        self.reset_automatic_login_state()
+        error = ChatGPTAttentionRequiredError(
+            f"{CHATGPT_LOGIN_REQUIRED_MESSAGE} Hãy đăng nhập lại."
+        )
+        thread = unittest.mock.Mock()
+
+        with patch.object(main.threading, "Thread", return_value=thread) as create_thread:
+            first = main._schedule_automatic_chatgpt_login("first", error)
+            second = main._schedule_automatic_chatgpt_login("second", error)
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        create_thread.assert_called_once()
+        thread.start.assert_called_once_with()
+        self.assertEqual(main._automatic_login_job_ids, {"first", "second"})
+        self.reset_automatic_login_state()
+
+    def test_captcha_attention_does_not_start_automatic_login(self):
+        self.reset_automatic_login_state()
+        error = ChatGPTAttentionRequiredError("ChatGPT yêu cầu CAPTCHA/Cloudflare.")
+
+        with patch.object(main.threading, "Thread") as create_thread:
+            scheduled = main._schedule_automatic_chatgpt_login("captcha", error)
+
+        self.assertFalse(scheduled)
+        create_thread.assert_not_called()
+        self.assertFalse(main._automatic_login_active)
+
+    def test_successful_automatic_login_resumes_only_incident_jobs(self):
+        self.reset_automatic_login_state()
+        for job_id in ("incident", "older-paused"):
+            self.create_job(job_id)
+            database.update_system_job(
+                job_id,
+                status="paused",
+                error="Login expired",
+                result_json={
+                    "attention_required": "chatgpt_verification",
+                    "automatic_login": "pending",
+                },
+            )
+        with main._automatic_login_state_lock:
+            main._automatic_login_active = True
+            main._automatic_login_job_ids.add("incident")
+
+        with (
+            patch.object(main, "_run_chatgpt_login_blocking", return_value={"success": True}),
+            patch.object(main, "_kick_video_queue") as kick_video,
+            patch.object(main, "_kick_comment_queue") as kick_comment,
+        ):
+            main._run_automatic_chatgpt_login()
+
+        incident = database.get_system_job("incident")
+        older = database.get_system_job("older-paused")
+        self.assertEqual(incident["status"], "queued")
+        self.assertEqual(incident["result"], {})
+        self.assertEqual(older["status"], "paused")
+        kick_video.assert_called_once_with()
+        kick_comment.assert_called_once_with()
+        self.assertFalse(main._automatic_login_active)
+
+    def test_failed_automatic_login_keeps_job_paused_and_enforces_cooldown(self):
+        self.reset_automatic_login_state()
+        self.create_job("failed-login")
+        database.update_system_job(
+            "failed-login",
+            status="paused",
+            error="Login expired",
+            result_json={
+                "attention_required": "chatgpt_verification",
+                "automatic_login": "pending",
+            },
+        )
+        with main._automatic_login_state_lock:
+            main._automatic_login_active = True
+            main._automatic_login_job_ids.add("failed-login")
+
+        with patch.object(
+            main,
+            "_run_chatgpt_login_blocking",
+            side_effect=RuntimeError("Wrong password"),
+        ):
+            main._run_automatic_chatgpt_login()
+
+        failed = database.get_system_job("failed-login")
+        self.assertEqual(failed["status"], "paused")
+        self.assertEqual(failed["result"]["automatic_login"], "failed")
+        self.assertIn("Auto Login", failed["progress"])
+        self.assertGreater(main._automatic_login_last_failure_at, 0)
+
+        error = ChatGPTAttentionRequiredError(CHATGPT_LOGIN_REQUIRED_MESSAGE)
+        with patch.object(main.threading, "Thread") as create_thread:
+            scheduled = main._schedule_automatic_chatgpt_login("next", error)
+        self.assertFalse(scheduled)
+        create_thread.assert_not_called()
+        self.reset_automatic_login_state()
+
+    def test_run_chatgpt_login_blocking_success(self):
+        fake_account = {"email": "user@example.com", "password": "secret_password"}
+        fake_result = {"success": True, "cookies": [{"name": "session", "value": "123"}]}
+        mock_page = unittest.mock.AsyncMock()
+        mock_page.set_default_timeout = unittest.mock.MagicMock()
+        mock_context = unittest.mock.AsyncMock()
+        mock_context.pages = [mock_page]
+        mock_context.new_page.return_value = mock_page
+
+        async def _mock_launch(*args, **kwargs):
+            return mock_context
+
+        mock_p = unittest.mock.MagicMock()
+        mock_p.chromium.launch_persistent_context = _mock_launch
+        mock_playwright_cm = unittest.mock.AsyncMock()
+        mock_playwright_cm.__aenter__.return_value = mock_p
+
+        with (
+            patch("auto_yt.services.account_store.load_account", return_value=fake_account),
+            patch("auto_yt.services.account_store.save_account") as mock_save,
+            patch("auto_yt.services.chatgpt_browser_service.stop_browser_service") as mock_stop,
+            patch("auto_yt.services.chatgpt_browser_service.start_browser_service") as mock_start,
+            patch("playwright.async_api.async_playwright", return_value=mock_playwright_cm),
+            patch("auto_yt.services.chatgpt_login.login_gpt_auto", return_value=fake_result) as mock_login,
+        ):
+            res = main._run_chatgpt_login_blocking()
+
+        self.assertTrue(res.get("success"))
+        mock_stop.assert_called_once()
+        mock_start.assert_called_once()
+        mock_login.assert_called_once_with(fake_account, mock_page)
+        mock_save.assert_called_once()
+        self.assertEqual(mock_save.call_args[0][0]["session_cookie"], fake_result["cookies"])
+
     def test_legacy_queued_verification_job_is_paused_on_startup(self):
         self.create_job("legacy-verification")
         database.update_system_job(
@@ -99,6 +244,24 @@ class SystemJobTests(unittest.TestCase):
         self.assertEqual(paused_count, 1)
         self.assertEqual(job["status"], "paused")
         self.assertIsNone(database.claim_next_system_job("video_generation"))
+
+    def test_interrupted_automatic_login_is_not_left_pending_after_restart(self):
+        self.create_job("interrupted-login")
+        database.update_system_job(
+            "interrupted-login",
+            status="paused",
+            result_json={
+                "attention_required": "chatgpt_verification",
+                "automatic_login": "pending",
+            },
+        )
+
+        database.pause_queued_attention_jobs()
+
+        job = database.get_system_job("interrupted-login")
+        self.assertEqual(job["status"], "paused")
+        self.assertEqual(job["result"]["automatic_login"], "interrupted")
+        self.assertIn("gián đoạn", job["progress"])
 
     def test_running_job_is_requeued_after_restart(self):
         self.create_job("interrupted")
@@ -792,6 +955,222 @@ class SystemJobTests(unittest.TestCase):
         self.assertTrue(main._job_matches_video_search(item, "lich su viet nam"))
         self.assertTrue(main._job_matches_video_search(item, "history-id"))
         self.assertFalse(main._job_matches_video_search(item, "khong ton tai"))
+
+    def test_fail_interrupted_system_jobs(self):
+        database.create_system_job(
+            job_id="render-running",
+            job_type="video_render",
+            title="Render Running",
+            payload={"video_id": 1},
+        )
+        database.update_system_job("render-running", status="running")
+
+        database.create_system_job(
+            job_id="render-cancel-req",
+            job_type="video_render",
+            title="Render Cancel Requested",
+            payload={"video_id": 1},
+        )
+        database.update_system_job(
+            "render-cancel-req",
+            status="running",
+            cancel_requested=1,
+        )
+
+        database.create_system_job(
+            job_id="render-completed",
+            job_type="video_render",
+            title="Render Completed",
+            payload={"video_id": 1},
+        )
+        database.update_system_job("render-completed", status="completed")
+
+        recovered = database.fail_interrupted_system_jobs(
+            "video_render",
+            "Tác vụ bị gián đoạn do hệ thống khởi động lại.",
+        )
+        self.assertEqual(recovered, 2)
+
+        j1 = database.get_system_job("render-running")
+        self.assertEqual(j1["status"], "failed")
+        self.assertEqual(j1["error"], "Tác vụ bị gián đoạn do hệ thống khởi động lại.")
+
+        j2 = database.get_system_job("render-cancel-req")
+        self.assertEqual(j2["status"], "canceled")
+
+        j3 = database.get_system_job("render-completed")
+        self.assertEqual(j3["status"], "completed")
+
+    def test_cancel_render_video_endpoint(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=render-test",
+            "Render Test",
+            "transcript",
+            "script",
+        )
+        database.create_system_job(
+            job_id="job-render-active",
+            job_type="video_render",
+            title="Render Active",
+            payload={"video_id": video_id},
+        )
+        database.update_system_job("job-render-active", video_id=video_id, status="queued")
+
+        res = main.cancel_render_video(video_id)
+        self.assertTrue(res["success"])
+        job = database.get_system_job("job-render-active")
+        self.assertEqual(job["status"], "canceled")
+
+    def test_job_center_includes_and_filters_production_jobs(self):
+        database.create_system_job(
+            job_id="job-render-1",
+            job_type="video_render",
+            title="Dựng video MP4 #1",
+            payload={"video_id": 10},
+        )
+        database.create_system_job(
+            job_id="job-scene-1",
+            job_type="visual_scene_plan",
+            title="Kế hoạch cảnh #1",
+            payload={"video_id": 10},
+        )
+        database.create_system_job(
+            job_id="job-upload-1",
+            job_type="youtube_upload",
+            title="Upload YT #1",
+            payload={"video_id": 10},
+        )
+        database.create_system_job(
+            job_id="job-fb-1",
+            job_type="fb_crosspost",
+            title="Đăng chéo Facebook #1",
+            payload={"page_id": "page_123"},
+        )
+
+        all_res = main.list_jobs(job_type="all")
+        all_ids = {item["id"] for item in all_res["items"]}
+        self.assertIn("job-render-1", all_ids)
+        self.assertIn("job-scene-1", all_ids)
+        self.assertIn("job-upload-1", all_ids)
+        self.assertIn("job-fb-1", all_ids)
+
+        render_res = main.list_jobs(job_type="video_render")
+        self.assertEqual(len(render_res["items"]), 1)
+        self.assertEqual(render_res["items"][0]["id"], "job-render-1")
+        self.assertEqual(render_res["items"][0]["type_label"], "Dựng video MP4")
+
+        scene_res = main.list_jobs(job_type="visual_scene_plan")
+        self.assertEqual(len(scene_res["items"]), 1)
+        self.assertEqual(scene_res["items"][0]["id"], "job-scene-1")
+        self.assertEqual(scene_res["items"][0]["type_label"], "Lập kế hoạch cảnh")
+
+        yt_res = main.list_jobs(job_type="youtube_publish")
+        self.assertEqual(len(yt_res["items"]), 1)
+        self.assertEqual(yt_res["items"][0]["id"], "job-upload-1")
+        self.assertEqual(yt_res["items"][0]["type_label"], "Upload / đặt lịch YouTube")
+
+        fb_res = main.list_jobs(job_type="fb_crosspost")
+        self.assertEqual(len(fb_res["items"]), 1)
+        self.assertEqual(fb_res["items"][0]["id"], "job-fb-1")
+        self.assertEqual(fb_res["items"][0]["type_label"], "Đăng chéo Facebook")
+
+    def test_job_center_production_job_actions(self):
+        database.create_system_job(
+            job_id="job-render-act",
+            job_type="video_render",
+            title="Dựng video MP4 Action",
+            payload={"video_id": 20},
+        )
+        with patch.object(main, "_kick_production_queue"):
+            # Pause
+            paused = main.pause_job("job-render-act")
+            self.assertTrue(paused["success"])
+            self.assertEqual(database.get_system_job("job-render-act")["status"], "paused")
+
+            # Resume
+            resumed = main.resume_job("job-render-act")
+            self.assertTrue(resumed["success"])
+            self.assertEqual(database.get_system_job("job-render-act")["status"], "queued")
+
+            # Cancel
+            canceled = main.cancel_job("job-render-act")
+            self.assertTrue(canceled["success"])
+            self.assertEqual(database.get_system_job("job-render-act")["status"], "canceled")
+
+            # Retry
+            retried = main.retry_job("job-render-act")
+            self.assertTrue(retried["success"])
+            self.assertEqual(database.get_system_job("job-render-act")["status"], "queued")
+
+    def test_job_center_fb_crosspost_cancel_action(self):
+        database.create_system_job(
+            job_id="fb-crosspost-task_test1",
+            job_type="fb_crosspost",
+            title="FB Test",
+            payload={"task_id": "task_test1", "page_id": "p1"},
+        )
+        database.update_system_job("fb-crosspost-task_test1", status="running")
+        with patch("auto_yt.services.fb_crossposter_service.cancel_schedule_ahead_batch"):
+            canceled = main.cancel_job("fb-crosspost-task_test1")
+            self.assertTrue(canceled["success"])
+            job = database.get_system_job("fb-crosspost-task_test1")
+            self.assertEqual(job["cancel_requested"], 1)
+
+    def test_job_center_fb_crosspost_retry_action(self):
+        database.create_system_job(
+            job_id="fb-crosspost-task_retry1",
+            job_type="fb_crosspost",
+            title="FB Retry Test",
+            payload={"page_id": "page_123", "days_ahead": 2},
+        )
+        database.update_system_job("fb-crosspost-task_retry1", status="error", error="Meta timeout")
+        with patch("auto_yt.services.fb_crossposter_service.start_schedule_ahead_batch") as mock_start:
+            retried = main.retry_job("fb-crosspost-task_retry1")
+            self.assertTrue(retried["success"])
+            job = database.get_system_job("fb-crosspost-task_retry1")
+            self.assertEqual(job["status"], "queued")
+            mock_start.assert_called_once_with(target_page_id="page_123", days_ahead=2)
+
+    def test_job_center_supports_all_new_publishing_and_utility_jobs(self):
+        database.create_system_job(
+            job_id="fb-sync-1",
+            job_type="fb_crosspost_sync",
+            title="FB Sync Test",
+            payload={"channel_url": "https://youtube.com/@test"},
+        )
+        database.create_system_job(
+            job_id="thumb-1",
+            job_type="thumbnail_generation",
+            title="Thumb Test",
+            payload={"video_id": 1},
+        )
+        database.create_system_job(
+            job_id="tiktok-1",
+            job_type="tiktok_publish",
+            title="TikTok Test",
+            payload={"video_path": "test.mp4"},
+        )
+
+        all_jobs = main.list_jobs(job_type="all")
+        job_types = {j["type"] for j in all_jobs["items"]}
+        self.assertIn("fb_crosspost_sync", job_types)
+        self.assertIn("thumbnail_generation", job_types)
+        self.assertIn("tiktok_publish", job_types)
+
+        # Filter by fb_crosspost_sync
+        fb_sync_jobs = main.list_jobs(job_type="fb_crosspost_sync")
+        self.assertEqual(len(fb_sync_jobs["items"]), 1)
+        self.assertEqual(fb_sync_jobs["items"][0]["type_label"], "Đồng bộ video Facebook")
+
+        # Filter by thumbnail_generation
+        thumb_jobs = main.list_jobs(job_type="thumbnail_generation")
+        self.assertEqual(len(thumb_jobs["items"]), 1)
+        self.assertEqual(thumb_jobs["items"][0]["type_label"], "Sinh ảnh Thumbnail")
+
+        # Filter by tiktok_publish
+        tiktok_jobs = main.list_jobs(job_type="tiktok_publish")
+        self.assertEqual(len(tiktok_jobs["items"]), 1)
+        self.assertEqual(tiktok_jobs["items"][0]["type_label"], "Đăng video TikTok")
 
 
 if __name__ == "__main__":

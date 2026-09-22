@@ -47,9 +47,8 @@ async function ensureLocalSession(nativeFetch, force = false) {
 }
 
 function protectedRequest(baseRequest) {
-  const method = baseRequest.method.toUpperCase()
   const headers = new Headers(baseRequest.headers)
-  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+  if (csrfToken) {
     headers.set(CSRF_HEADER, csrfToken)
   }
   return new Request(baseRequest, {
@@ -71,7 +70,7 @@ export function installSecurityFetch() {
     const baseRequest = new Request(input, init)
     await ensureLocalSession(nativeFetch)
     let response = await nativeFetch(protectedRequest(baseRequest.clone()))
-    if (response.status === 401) {
+    if (response.status === 401 || response.status === 403) {
       await ensureLocalSession(nativeFetch, true)
       response = await nativeFetch(protectedRequest(baseRequest.clone()))
     }

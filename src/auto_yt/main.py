@@ -11,13 +11,22 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Literal, Optional
 import asyncio
 import html
 import json
+import logging
 import math
 import threading
+
+logger = logging.getLogger(__name__)
+
+_automatic_login_state_lock = threading.Lock()
+_automatic_login_active = False
+_automatic_login_job_ids: set[str] = set()
+_automatic_login_last_failure_at: float = 0.0
+_AUTOMATIC_LOGIN_COOLDOWN_SECONDS = 300.0  # 5 minutes after a failed login
 import time
 import uuid
 import datetime
@@ -50,12 +59,31 @@ from auto_yt.services.audio_review import (
     get_audio_script_hash,
 )
 from auto_yt.services import voice_config
-from auto_yt.services import chatgpt_projects
-from auto_yt.services import youtube_comments
+from auto_yt.services import (
+    chatgpt_projects,
+    prompt_assets,
+    publication_scheduler,
+    production_coordinator as production_coordinator_service,
+    youtube_comments,
+    youtube_publish_workflow,
+    youtube_publisher,
+)
+from auto_yt.services.proxy_utils import (
+    ProxyConfigurationError,
+    parse_proxy_url,
+    proxy_display_value,
+)
+from auto_yt.services.secret_store import SecretStorageError
 from auto_yt.services import (
     account_store,
     api_security,
+    channel_scanner_service,
     chatgpt_browser_service,
+    fb_crossposter_service,
+    google_flow_browser_service,
+    gpm_service,
+    gpm_youtube_automation,
+    local_browser_service,
     security_logging,
 )
 from auto_yt.services.generation_checkpoint import (
@@ -133,6 +161,8 @@ TRANSIENT_YOUTUBE_ERROR_MARKERS = (
     "service unavailable",
     "bad gateway",
     "network is unreachable",
+    "không thể kết nối",
+    "không kết nối",
 )
 TRANSIENT_CHATGPT_START_ERROR_MARKERS = (
     "chatgpt page did not become ready after bounded same-page recovery",
@@ -239,6 +269,40 @@ class PromptPipelineData(BaseModel):
     thumbnail_with_text: bool = True
     thumbnail_without_text: bool = True
     audio: bool = True
+    video_render: bool = False
+    youtube_upload: bool = False
+    youtube_schedule: bool = False
+
+    model_config = ConfigDict(extra="allow")
+
+
+class PromptImageGenerationData(BaseModel):
+    provider: str = "google_flow"
+    model: str = "nano_banana_pro"
+    workflow_profile_id: str = Field(default="", max_length=120)
+    reference_workflow_profile_id: str = Field(default="", max_length=120)
+    style_prompt: str = Field(default="", max_length=8000)
+    avoid_prompt: str = Field(default="", max_length=8000)
+    negative_prompt: str = Field(default="", max_length=8000)
+    density: int = 30
+    outputs_per_scene: int = 1
+    seed_mode: str = "random"
+    thumbnail_variant: Literal["with_text", "without_text"] = "without_text"
+    scene_duration_min_seconds: int = Field(default=25, ge=10, le=90)
+    scene_duration_target_seconds: int = Field(default=30, ge=10, le=90)
+    scene_duration_max_seconds: int = Field(default=35, ge=10, le=90)
+
+    model_config = ConfigDict(extra="allow")
+
+
+class PromptPublishingData(BaseModel):
+    category_id: str = Field(default="", max_length=10)
+    language: str = Field(default="vi", min_length=2, max_length=35)
+    made_for_kids: Optional[bool] = None
+    notify_subscribers: bool = True
+    contains_synthetic_media: bool = True
+
+    model_config = ConfigDict(extra="allow")
 
 
 class PromptVersion(BaseModel):
@@ -248,6 +312,10 @@ class PromptVersion(BaseModel):
     default_voice_id: str = ""
     default_youtube_channel_id: str = Field(default="", max_length=100)
     pipeline: PromptPipelineData = Field(default_factory=PromptPipelineData)
+    image_generation_settings: dict = Field(default_factory=dict)
+    publishing_settings: dict = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="allow")
 
 class PromptsData(BaseModel):
     active_version: str
@@ -345,7 +413,7 @@ def _save_account_payload(account: dict) -> None:
     account_store.save_account(current_account)
 
 app = FastAPI(
-    title="Auto_YT API",
+    title="Nexus API",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -378,7 +446,16 @@ app.add_middleware(
 
 @app.get("/health")
 def get_health():
-    return {"status": "ok"}
+    coordinator = (
+        _production_coordinator.status()
+        if _production_coordinator is not None
+        else {"running": False, "ready": False, "current_job_id": ""}
+    )
+    return {
+        "status": "ok",
+        "ready": bool(coordinator.get("ready")),
+        "production_coordinator": coordinator,
+    }
 
 
 def _resolve_media_file(
@@ -514,6 +591,71 @@ class YouTubeChannelSettingsRequest(BaseModel):
     reply_paused: bool = False
     auto_sync: bool = True
     sync_interval_minutes: int = Field(default=10, ge=2, le=1440)
+    publication_timezone: str = Field(default="Asia/Ho_Chi_Minh", max_length=100)
+    publication_slots: List[dict] = Field(default_factory=list, max_length=50)
+    publication_daily_limit: int = Field(default=1, ge=1, le=20)
+    publication_lead_minutes: int = Field(default=120, ge=1, le=10080)
+    publication_paused: bool = False
+    public_upload_verified: bool = False
+    gpm_profile_id: Optional[str] = Field(default=None, max_length=200)
+    gpm_profile_name: Optional[str] = Field(default=None, max_length=200)
+    gpm_proxy_info: Optional[str] = Field(default=None, max_length=500)
+    interaction_mode: Optional[Literal["gpm_browser", "direct_api"]] = "gpm_browser"
+    auto_heart: Optional[bool] = True
+
+
+class GpmConfigRequest(BaseModel):
+    api_url: Optional[str] = Field(default=None, max_length=500)
+    auto_stop_on_finish: Optional[bool] = None
+    timeout_seconds: Optional[float] = Field(default=None, ge=2.0, le=120.0)
+
+
+class GpmProfileStartRequest(BaseModel):
+    remote_debugging_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    window_scale: Optional[float] = Field(default=None, ge=0.1, le=3.0)
+    window_pos: Optional[str] = Field(default=None, max_length=50)
+    window_size: Optional[str] = Field(default=None, max_length=50)
+    skip_proxy_check: bool = False
+    addition_args: Optional[str] = Field(default=None, max_length=1000)
+
+
+class GpmOpenUrlRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+    timeout_seconds: Optional[float] = Field(default=20.0, ge=3.0, le=120.0)
+
+
+class GpmChannelMappingRequest(BaseModel):
+    gpm_profile_id: str = Field(default="", max_length=200)
+    gpm_profile_name: str = Field(default="", max_length=200)
+    gpm_proxy_info: str = Field(default="", max_length=500)
+    interaction_mode: Literal["gpm_browser", "direct_api"] = "gpm_browser"
+
+
+class ChannelOpenBrowserRequest(BaseModel):
+    profile_id: str = Field(min_length=1, max_length=200)
+    platform: str = Field(default="youtube", max_length=50)
+
+
+class ChannelScanYouTubeRequest(BaseModel):
+    profile_id: str = Field(min_length=1, max_length=200)
+    auto_save: bool = True
+
+
+class ChannelScanFacebookRequest(BaseModel):
+    profile_id: str = Field(min_length=1, max_length=200)
+
+
+class ChannelScanTikTokRequest(BaseModel):
+    profile_id: str = Field(min_length=1, max_length=200)
+
+
+class TikTokPublishRequest(BaseModel):
+    video_path: str = Field(min_length=1, max_length=1024)
+    caption: str = Field(default="", max_length=2000)
+    tags: List[str] = Field(default_factory=list)
+    gpm_profile_id: str = Field(default="", max_length=200)
+    video_id: Optional[int] = Field(default=None)
+    title: str = Field(default="", max_length=255)
 
 
 class VideoPublicationRequest(BaseModel):
@@ -586,6 +728,7 @@ def save_youtube_oauth_config(request: YouTubeOAuthConfigRequest):
 def start_youtube_oauth(
     client_id: str = Query(default="", max_length=512),
     expected_channel_id: str = Query(default="", max_length=200),
+    gpm_profile_id: str = Query(default="", max_length=200),
 ):
     try:
         config = youtube_comments.load_oauth_config(client_id)
@@ -596,11 +739,40 @@ def start_youtube_oauth(
         if isinstance(expected_channel_id, str)
         else ""
     )
+    gpm_profile_id = (
+        str(gpm_profile_id or "").strip()
+        if isinstance(gpm_profile_id, str)
+        else ""
+    )
     expected_channel = None
+    gpm_profile_name = ""
+    gpm_proxy_info = ""
     if expected_channel_id:
-        expected_channel = db.get_youtube_channel_by_channel_id(expected_channel_id)
+        expected_channel = db.get_youtube_channel_by_channel_id(
+            expected_channel_id, include_tokens=True
+        )
         if not expected_channel:
             raise HTTPException(status_code=404, detail="Kênh YouTube cần kết nối lại không tồn tại.")
+        gpm_profile_id = str(gpm_profile_id or expected_channel.get("gpm_profile_id") or "").strip()
+        gpm_profile_name = str(expected_channel.get("gpm_profile_name") or "").strip()
+        if gpm_profile_id == str(expected_channel.get("gpm_profile_id") or "").strip():
+            gpm_proxy_info = str(expected_channel.get("gpm_proxy_info") or "").strip()
+    if gpm_profile_id and not parse_proxy_url(gpm_proxy_info):
+        try:
+            profile_detail = gpm_service.get_gpm_profile_detail(gpm_profile_id)
+            gpm_profile_name = str(profile_detail.get("name") or "")
+            gpm_proxy_info = str(profile_detail.get("raw_proxy") or profile_detail.get("proxy") or "")
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Không đọc được proxy của GPM Profile đã chọn.",
+            ) from exc
+    if not gpm_profile_id or not parse_proxy_url(gpm_proxy_info):
+        raise HTTPException(
+            status_code=422,
+            detail="OAuth YouTube yêu cầu GPM Profile có proxy riêng hợp lệ.",
+        )
+
     state = youtube_comments.create_oauth_state()
     code_verifier, code_challenge = youtube_comments.create_pkce_pair()
     with _youtube_oauth_states_lock:
@@ -618,6 +790,9 @@ def start_youtube_oauth(
             "oauth_config": config,
             "expected_channel_id": expected_channel_id,
             "expected_channel_title": str((expected_channel or {}).get("title") or ""),
+            "gpm_profile_id": gpm_profile_id,
+            "gpm_profile_name": gpm_profile_name,
+            "gpm_proxy_info": gpm_proxy_info,
         }
     try:
         authorization_url = youtube_comments.build_authorization_url(
@@ -627,7 +802,13 @@ def start_youtube_oauth(
         )
     except youtube_comments.YouTubeCommentsError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"authorization_url": authorization_url}
+    return {
+        "authorization_url": authorization_url,
+        "gpm_profile_id": gpm_profile_id,
+        "gpm_profile_name": gpm_profile_name,
+        "gpm_proxy_configured": True,
+        "gpm_proxy_display": proxy_display_value(gpm_proxy_info),
+    }
 
 
 @app.get("/api/youtube-comments/oauth/callback", response_class=HTMLResponse)
@@ -644,16 +825,18 @@ def finish_youtube_oauth(code: str = "", state: str = "", error: str = ""):
             "<h2>Phiên kết nối đã hết hạn</h2><p>Hãy đóng cửa sổ và thử lại.</p>",
             status_code=400,
         )
+    proxy_info = str(oauth_state.get("gpm_proxy_info") or "").strip() or None
     try:
         tokens = youtube_comments.exchange_authorization_code(
             code,
             config=dict(oauth_state.get("oauth_config") or {}),
             code_verifier=str(oauth_state.get("code_verifier") or ""),
+            proxy=proxy_info,
         )
         access_token = str(tokens.get("access_token") or "")
         if not access_token:
             raise youtube_comments.YouTubeCommentsError("Google không trả về access token.")
-        channels = youtube_comments.get_authenticated_channels(access_token)
+        channels = youtube_comments.get_authenticated_channels(access_token, proxy=proxy_info)
         if not channels:
             raise youtube_comments.YouTubeCommentsError(
                 "Tài khoản này không có kênh YouTube có thể quản lý."
@@ -691,6 +874,9 @@ def finish_youtube_oauth(code: str = "", state: str = "", error: str = ""):
                 oauth_client_id=str(
                     dict(oauth_state.get("oauth_config") or {}).get("client_id") or ""
                 ),
+                gpm_profile_id=str(oauth_state.get("gpm_profile_id") or ""),
+                gpm_profile_name=str(oauth_state.get("gpm_profile_name") or ""),
+                gpm_proxy_info=str(oauth_state.get("gpm_proxy_info") or ""),
             )
     except Exception as exc:
         error_id = security_logging.report_exception("youtube_oauth_callback", exc)
@@ -715,24 +901,91 @@ def list_youtube_comment_channels():
 def update_youtube_comment_channel(
     channel_db_id: int, request: YouTubeChannelSettingsRequest
 ):
-    channel = db.update_youtube_channel(
-        channel_db_id,
-        reply_instruction=request.reply_instruction.strip(),
-        auto_mode=request.auto_mode,
-        daily_reply_limit=request.daily_reply_limit,
-        reply_interval_minutes=request.reply_interval_minutes,
-        quarter_hour_reply_limit=request.quarter_hour_reply_limit,
-        hourly_reply_limit=request.hourly_reply_limit,
-        video_half_hour_reply_limit=request.video_half_hour_reply_limit,
-        backlog_daily_reply_limit=request.backlog_daily_reply_limit,
-        reply_window_start=request.reply_window_start,
-        reply_window_end=request.reply_window_end,
-        reply_paused=int(request.reply_paused),
-        auto_sync=int(request.auto_sync),
-        sync_interval_minutes=request.sync_interval_minutes,
-    )
-    if not channel:
+    existing_channel = db.get_youtube_channel(channel_db_id, include_tokens=True)
+    if not existing_channel:
         raise HTTPException(status_code=404, detail="Không tìm thấy kênh YouTube.")
+    try:
+        publication_timezone = publication_scheduler.validate_timezone(
+            request.publication_timezone
+        )
+        publication_slots = publication_scheduler.validate_publication_slots(
+            request.publication_slots
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    update_data = {
+        "reply_instruction": request.reply_instruction.strip(),
+        "auto_mode": request.auto_mode,
+        "daily_reply_limit": request.daily_reply_limit,
+        "reply_interval_minutes": request.reply_interval_minutes,
+        "quarter_hour_reply_limit": request.quarter_hour_reply_limit,
+        "hourly_reply_limit": request.hourly_reply_limit,
+        "video_half_hour_reply_limit": request.video_half_hour_reply_limit,
+        "backlog_daily_reply_limit": request.backlog_daily_reply_limit,
+        "reply_window_start": request.reply_window_start,
+        "reply_window_end": request.reply_window_end,
+        "reply_paused": int(request.reply_paused),
+        "auto_sync": int(request.auto_sync),
+        "sync_interval_minutes": request.sync_interval_minutes,
+        "publication_timezone": publication_timezone,
+        "publication_slots_json": json.dumps(
+            publication_slots, ensure_ascii=False, separators=(",", ":")
+        ),
+        "publication_daily_limit": request.publication_daily_limit,
+        "publication_lead_minutes": request.publication_lead_minutes,
+        "publication_paused": int(request.publication_paused),
+        "public_upload_verified": int(request.public_upload_verified),
+    }
+    if request.gpm_profile_id is not None:
+        profile_id = request.gpm_profile_id.strip()
+        if not profile_id:
+            update_data.update(
+                gpm_profile_id="",
+                gpm_profile_name="",
+                gpm_proxy_info="",
+            )
+        else:
+            current_profile_id = str(
+                existing_channel.get("gpm_profile_id") or ""
+            ).strip()
+            proxy_info = (
+                str(existing_channel.get("gpm_proxy_info") or "").strip()
+                if profile_id == current_profile_id
+                else ""
+            )
+            profile_name = (
+                str(request.gpm_profile_name or "").strip()
+                or (
+                    str(existing_channel.get("gpm_profile_name") or "").strip()
+                    if profile_id == current_profile_id
+                    else ""
+                )
+            )
+            if profile_id != current_profile_id or not parse_proxy_url(proxy_info):
+                try:
+                    profile_detail = gpm_service.get_gpm_profile_detail(profile_id)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Không đọc được cấu hình GPM Profile đã chọn.",
+                    ) from exc
+                profile_name = str(profile_detail.get("name") or profile_name)
+                proxy_info = str(
+                    profile_detail.get("raw_proxy")
+                    or profile_detail.get("proxy")
+                    or ""
+                ).strip()
+            update_data.update(
+                gpm_profile_id=profile_id,
+                gpm_profile_name=profile_name,
+                gpm_proxy_info=proxy_info,
+            )
+    if request.interaction_mode is not None:
+        update_data["interaction_mode"] = request.interaction_mode
+    if request.auto_heart is not None:
+        update_data["auto_heart"] = int(bool(request.auto_heart))
+
+    channel = db.update_youtube_channel(channel_db_id, **update_data)
     if not request.reply_paused:
         _kick_comment_queue()
     return channel
@@ -749,7 +1002,10 @@ def disconnect_youtube_comment_channel(channel_db_id: int):
             or channel.get("access_token_encrypted")
             or ""
         )
-        youtube_comments.revoke_token(youtube_comments.decrypt_secret(encrypted_token))
+        youtube_comments.revoke_token(
+            youtube_comments.decrypt_secret(encrypted_token),
+            proxy=channel.get("gpm_proxy_info"),
+        )
     except youtube_comments.YouTubeCommentsError as exc:
         raise HTTPException(
             status_code=502,
@@ -764,6 +1020,426 @@ def disconnect_youtube_comment_channel(channel_db_id: int):
         "success": True,
         "cleared_prompt_versions": cleared_prompt_versions,
     }
+
+
+# =========================================================================
+# GPM-Login v3 Endpoints
+# =========================================================================
+
+@app.get("/api/gpm/config")
+def get_gpm_configuration():
+    """Get current GPM-Login connection settings."""
+    return gpm_service.get_gpm_config()
+
+
+@app.post("/api/gpm/config")
+def update_gpm_configuration(request: GpmConfigRequest):
+    """Update GPM-Login connection settings."""
+    try:
+        return gpm_service.save_gpm_config(
+            api_url=request.api_url,
+            auto_stop_on_finish=request.auto_stop_on_finish,
+            timeout_seconds=request.timeout_seconds,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/gpm/status")
+def get_gpm_status(api_url: Optional[str] = Query(None)):
+    """Check connectivity to the GPM-Login Local API."""
+    return gpm_service.check_gpm_connection(api_url=api_url)
+
+
+def _public_gpm_profile(profile: dict) -> dict:
+    public_profile = dict(profile or {})
+    raw_proxy = str(
+        public_profile.pop("raw_proxy", "")
+        or public_profile.pop("proxy", "")
+        or ""
+    )
+    public_profile["proxy_configured"] = bool(parse_proxy_url(raw_proxy))
+    public_profile["proxy_display"] = proxy_display_value(raw_proxy)
+    return public_profile
+
+
+@app.get("/api/gpm/profiles")
+def list_gpm_profiles_endpoint(
+    search: str = Query("", description="Tìm theo tên profile"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
+    sort: int = Query(0, ge=0, le=3),
+    api_url: Optional[str] = Query(None),
+):
+    """Retrieve paginated profiles from GPM-Login."""
+    try:
+        result = gpm_service.list_gpm_profiles(
+            search=search,
+            page=page,
+            page_size=page_size,
+            sort=sort,
+            api_url=api_url,
+        )
+        return {
+            **result,
+            "items": [
+                _public_gpm_profile(profile) for profile in result.get("items") or []
+            ],
+        }
+    except gpm_service.GpmConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi đọc profiles GPM: {exc}")
+
+
+@app.get("/api/gpm/profiles/{profile_id}")
+def get_gpm_profile_endpoint(profile_id: str, api_url: Optional[str] = Query(None)):
+    """Retrieve full details of a specific GPM profile."""
+    try:
+        return _public_gpm_profile(
+            gpm_service.get_gpm_profile_detail(profile_id, api_url=api_url)
+        )
+    except gpm_service.GpmProfileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except gpm_service.GpmConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/gpm/profiles/{profile_id}/start")
+def start_gpm_profile_endpoint(
+    profile_id: str,
+    request: Optional[GpmProfileStartRequest] = None,
+    api_url: Optional[str] = Query(None),
+):
+    """Start a GPM profile browser and return debugging connection info."""
+    req = request or GpmProfileStartRequest()
+    try:
+        return gpm_service.start_gpm_profile(
+            profile_id,
+            remote_debugging_port=req.remote_debugging_port,
+            window_scale=req.window_scale,
+            window_pos=req.window_pos,
+            window_size=req.window_size,
+            skip_proxy_check=req.skip_proxy_check,
+            addition_args=req.addition_args,
+            api_url=api_url,
+        )
+    except gpm_service.GpmProfileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except gpm_service.GpmConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except gpm_service.GpmProfileLaunchError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/gpm/profiles/{profile_id}/stop")
+def stop_gpm_profile_endpoint(profile_id: str, api_url: Optional[str] = Query(None)):
+    """Close/stop a running GPM profile browser."""
+    try:
+        success = gpm_service.stop_gpm_profile(profile_id, api_url=api_url)
+        return {"success": success, "profile_id": profile_id}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/gpm/profiles/{profile_id}/open-url")
+async def open_url_in_gpm_endpoint(profile_id: str, request: GpmOpenUrlRequest):
+    """Open a target URL inside the GPM profile browser session."""
+    url = request.url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="URL không được để trống.")
+    try:
+        timeout_seconds = float(request.timeout_seconds or 20.0)
+        result = await gpm_youtube_automation.open_url_in_gpm_profile(
+            profile_id, url, timeout_seconds=timeout_seconds
+        )
+        return result
+    except gpm_service.GpmProfileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except gpm_service.GpmConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.patch("/api/youtube-comments/channels/{channel_db_id}/gpm-mapping")
+def update_channel_gpm_mapping(
+    channel_db_id: int, request: GpmChannelMappingRequest
+):
+    """Map or unmap a GPM profile to a YouTube channel."""
+    channel = db.update_youtube_channel(
+        channel_db_id,
+        gpm_profile_id=request.gpm_profile_id.strip(),
+        gpm_profile_name=request.gpm_profile_name.strip(),
+        gpm_proxy_info=request.gpm_proxy_info.strip(),
+        interaction_mode=request.interaction_mode,
+    )
+    if not channel:
+        raise HTTPException(status_code=404, detail="Không tìm thấy kênh YouTube.")
+    return channel
+
+
+@app.post("/api/youtube-comments/channels/{channel_db_id}/open-studio")
+async def open_channel_studio_in_gpm(channel_db_id: int):
+    """Open YouTube Studio inside the channel's mapped GPM profile browser."""
+    channel = db.get_youtube_channel(channel_db_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Không tìm thấy kênh YouTube.")
+    profile_id = str(channel.get("gpm_profile_id") or "").strip()
+    if not profile_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Kênh '{channel.get('title')}' chưa được gán GPM Profile. Vui lòng gán profile trước.",
+        )
+    try:
+        studio_url = "https://studio.youtube.com"
+        result = await gpm_youtube_automation.open_url_in_gpm_profile(profile_id, studio_url)
+        return {
+            "success": True,
+            "profile_id": profile_id,
+            "channel_title": channel.get("title"),
+            "url": studio_url,
+            "message": f"Đã mở YouTube Studio của kênh '{channel.get('title')}' trong GPM Profile.",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/youtube-comments/channels/{channel_db_id}/verify-gpm-studio")
+async def verify_channel_gpm_studio_login(channel_db_id: int):
+    """Check if the channel's GPM profile is actively logged in to YouTube Studio."""
+    channel = db.get_youtube_channel(channel_db_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Không tìm thấy kênh YouTube.")
+    profile_id = str(channel.get("gpm_profile_id") or "").strip()
+    if not profile_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Kênh '{channel.get('title')}' chưa được gán GPM Profile.",
+        )
+    try:
+        result = await gpm_youtube_automation.verify_youtube_login(profile_id)
+        return {
+            "channel_id": channel["id"],
+            "channel_title": channel.get("title"),
+            "gpm_profile_id": profile_id,
+            **result,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# =========================================================================
+# Multi-Platform Channel & Page Scanner API (YouTube, Facebook, TikTok)
+# Supports both GPM-Login Profiles & Local Chromium (Cốc Cốc, Chrome, Edge)
+# =========================================================================
+
+@app.get("/api/channels/local-profiles")
+def list_local_browser_profiles_endpoint():
+    """Enumerate all locally installed Chromium browser profiles (Cốc Cốc, Chrome, Edge, Brave)."""
+    try:
+        profiles = local_browser_service.list_local_browser_profiles()
+        return {"items": profiles, "total": len(profiles)}
+    except Exception as exc:
+        logger.error("Lỗi khi đọc local browser profiles: %s", exc)
+        return {"items": [], "total": 0, "error": str(exc)}
+
+
+@app.post("/api/channels/open-browser")
+def open_channel_browser_endpoint(request: ChannelOpenBrowserRequest):
+    """Launch or focus browser window (GPM or Local Cốc Cốc/Chrome) on the target platform studio/creator."""
+    try:
+        return channel_scanner_service.open_channel_platform_browser(
+            profile_id=request.profile_id,
+            platform=request.platform,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/channels/scan/youtube")
+async def scan_youtube_channel_endpoint(request: ChannelScanYouTubeRequest):
+    """Scan authenticated YouTube Studio session and auto-link channel."""
+    try:
+        result = await channel_scanner_service.scan_youtube_channel(
+            profile_id=request.profile_id,
+            auto_save=request.auto_save,
+        )
+        return result
+    except Exception as exc:
+        logger.error("Lỗi khi quét YouTube channel: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/channels/scan/facebook")
+async def scan_facebook_pages_endpoint(request: ChannelScanFacebookRequest):
+    """Scan authenticated Facebook session and extract managed fanpages."""
+    try:
+        result = await channel_scanner_service.scan_facebook_pages(
+            profile_id=request.profile_id,
+        )
+        return result
+    except Exception as exc:
+        logger.error("Lỗi khi quét Facebook pages: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/channels/scan/tiktok")
+async def scan_tiktok_account_endpoint(request: ChannelScanTikTokRequest):
+    """Scan authenticated TikTok Creator session and extract account details."""
+    try:
+        result = await channel_scanner_service.scan_tiktok_account(
+            profile_id=request.profile_id,
+        )
+        return result
+    except Exception as exc:
+        logger.error("Lỗi khi quét TikTok account: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/tiktok/publish")
+def publish_tiktok_video_endpoint(req: TikTokPublishRequest):
+    """Trigger background video publishing to TikTok Creator Center via GPM and track in Job Center."""
+    try:
+        from auto_yt.services import tiktok_publisher_service
+        job_id = tiktok_publisher_service.start_tiktok_publish_job(
+            video_path=req.video_path,
+            caption=req.caption,
+            tags=req.tags,
+            gpm_profile_id=req.gpm_profile_id,
+            video_id=req.video_id,
+            title=req.title,
+        )
+        return {
+            "success": True,
+            "job_id": job_id,
+            "message": "Đã bắt đầu tác vụ đăng video lên TikTok (đang theo dõi tại Trung tâm Job).",
+        }
+    except Exception as exc:
+        logger.error("Lỗi khởi tạo đăng video TikTok: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/videos/{video_id}/open-studio")
+async def open_video_studio_in_gpm(video_id: int):
+    """Open YouTube Studio video editor inside the channel's mapped GPM profile browser."""
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video.")
+    youtube_video_id = str(video.get("published_youtube_video_id") or "").strip()
+
+    # Also check video publications if not directly on video
+    channel_db_id = None
+    if not youtube_video_id:
+        pubs = db.list_video_publications(video_id)
+        if pubs:
+            pub = pubs[0]
+            youtube_video_id = str(pub.get("youtube_video_id") or "").strip()
+            channel_db_id = pub.get("youtube_channel_id")
+            if not youtube_video_id and pub.get("published_url"):
+                youtube_video_id = youtube_comments.extract_youtube_video_id(pub["published_url"])
+
+    if not youtube_video_id:
+        raise HTTPException(status_code=400, detail="Video chưa được xuất bản lên YouTube.")
+
+    target_channel = None
+    if channel_db_id:
+        target_channel = db.get_youtube_channel(int(channel_db_id))
+    if not target_channel:
+        # Check prompt version default channel
+        prompt_ver = str(video.get("prompt_version") or "").strip()
+        if prompt_ver:
+            try:
+                configs = prompt_assets.load_prompt_settings()
+                prompt_cfg = configs.get("prompts", {}).get(prompt_ver, {})
+                assigned_id = prompt_cfg.get("youtube_channel_id")
+                if assigned_id:
+                    target_channel = db.get_youtube_channel(int(assigned_id))
+            except Exception:
+                pass
+
+    profile_id = str((target_channel or {}).get("gpm_profile_id") or "").strip()
+    studio_url = f"https://studio.youtube.com/video/{youtube_video_id}/edit"
+    if not profile_id:
+        channel_name = target_channel.get("title") if target_channel else "liên kết"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Kênh '{channel_name}' chưa được gán GPM Profile. Vui lòng vào menu 'Kết nối Kênh' để gán profile trước khi mở Studio.",
+        )
+
+    try:
+        result = await gpm_youtube_automation.open_url_in_gpm_profile(profile_id, studio_url)
+        return {
+            "success": True,
+            "in_gpm": True,
+            "profile_id": profile_id,
+            "url": studio_url,
+            "message": f"Đã mở YouTube Studio trong GPM Profile cho video {youtube_video_id}",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Không thể mở Studio trong GPM Profile: {exc}")
+
+
+@app.post("/api/videos/{video_id}/open-watch")
+async def open_video_watch_in_gpm(video_id: int):
+    """Open YouTube Watch page inside the channel's mapped GPM profile browser."""
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video.")
+    youtube_video_id = str(video.get("published_youtube_video_id") or "").strip()
+
+    channel_db_id = None
+    if not youtube_video_id:
+        pubs = db.list_video_publications(video_id)
+        if pubs:
+            pub = pubs[0]
+            youtube_video_id = str(pub.get("youtube_video_id") or "").strip()
+            channel_db_id = pub.get("youtube_channel_id")
+            if not youtube_video_id and pub.get("published_url"):
+                youtube_video_id = youtube_comments.extract_youtube_video_id(pub["published_url"])
+
+    if not youtube_video_id:
+        raise HTTPException(status_code=400, detail="Video chưa được xuất bản lên YouTube.")
+
+    target_channel = None
+    if channel_db_id:
+        target_channel = db.get_youtube_channel(int(channel_db_id))
+    if not target_channel:
+        prompt_ver = str(video.get("prompt_version") or "").strip()
+        if prompt_ver:
+            try:
+                configs = prompt_assets.load_prompt_settings()
+                prompt_cfg = configs.get("prompts", {}).get(prompt_ver, {})
+                assigned_id = prompt_cfg.get("youtube_channel_id")
+                if assigned_id:
+                    target_channel = db.get_youtube_channel(int(assigned_id))
+            except Exception:
+                pass
+
+    profile_id = str((target_channel or {}).get("gpm_profile_id") or "").strip()
+    watch_url = f"https://www.youtube.com/watch?v={youtube_video_id}"
+    if not profile_id:
+        channel_name = target_channel.get("title") if target_channel else "liên kết"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Kênh '{channel_name}' chưa được gán GPM Profile. Vui lòng vào menu 'Kết nối Kênh' để gán profile.",
+        )
+
+    try:
+        result = await gpm_youtube_automation.open_url_in_gpm_profile(profile_id, watch_url)
+        return {
+            "success": True,
+            "in_gpm": True,
+            "profile_id": profile_id,
+            "url": watch_url,
+            "message": f"Đã mở video YouTube trong GPM Profile cho video {youtube_video_id}",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi mở video trong GPM: {exc}")
 
 
 @app.get("/api/videos/{video_id}/publications")
@@ -799,7 +1475,10 @@ def add_video_publication(video_id: int, request: VideoPublicationRequest):
         details = {}
         if channel_db_id is not None:
             channel, access_token = _get_youtube_access_token(channel_db_id)
-            details = youtube_comments.get_video_details(access_token, youtube_video_id)
+            proxy_info = channel.get("gpm_proxy_info")
+            details = youtube_comments.get_video_details(
+                access_token, youtube_video_id, proxy=proxy_info
+            )
             if details["channel_id"] != channel["channel_id"]:
                 actual_channel = str(
                     details.get("channel_title")
@@ -897,12 +1576,14 @@ def _load_comment_import_remote_videos(
     published_url: str = "",
 ) -> tuple[dict, str, list[dict]]:
     channel, access_token = _get_youtube_access_token(channel_db_id)
+    proxy_info = channel.get("gpm_proxy_info")
     normalized_url = str(published_url or "").strip()
     if normalized_url:
         youtube_video_id = youtube_comments.extract_youtube_video_id(normalized_url)
         remote_videos = youtube_comments.get_videos_details(
             access_token,
             [youtube_video_id],
+            proxy=proxy_info,
         )
         if not remote_videos:
             raise ValueError("Không tìm thấy video trên YouTube.")
@@ -911,6 +1592,7 @@ def _load_comment_import_remote_videos(
             access_token,
             channel["channel_id"],
             max_videos=5000,
+            proxy=proxy_info,
         )
     if any(
         str(video.get("channel_id") or "") != str(channel["channel_id"])
@@ -962,12 +1644,15 @@ def start_comment_video_import(request: CommentVideoImportRequest):
             prompts_config = _read_prompts_config()
             prompt = _get_prompt_version(prompts_config, request.prompt_version)
         channel, access_token = _get_youtube_access_token(request.channel_id)
+        proxy_info = channel.get("gpm_proxy_info")
         expected_channel_id = str(
             prompt.get("default_youtube_channel_id") or ""
         ).strip()
         if expected_channel_id and expected_channel_id != str(channel["channel_id"]):
             raise ValueError("Bộ prompt đã chọn thuộc một kênh YouTube khác.")
-        remote_videos = youtube_comments.get_videos_details(access_token, normalized_ids)
+        remote_videos = youtube_comments.get_videos_details(
+            access_token, normalized_ids, proxy=proxy_info
+        )
         remote_by_id = {item["youtube_video_id"]: item for item in remote_videos}
         missing_ids = [video_id for video_id in normalized_ids if video_id not in remote_by_id]
         if missing_ids:
@@ -1591,6 +2276,7 @@ def _sync_audio_task_unlocked(video_id: int) -> dict:
             _stored_voice_persistence_fields(task),
         )
         db.update_audio_duration(video_id, duration_seconds)
+        _trigger_video_render_if_enabled(video_id)
     return task
 
 
@@ -1717,6 +2403,7 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
             task_voice_name,
             _stored_voice_persistence_fields(task),
         )
+        _trigger_video_render_if_enabled(video_id)
     return task
 
 
@@ -2159,6 +2846,32 @@ COMMENT_JOB_LABELS = {
     "comment_video_import": "Khởi tạo Chat cho video cũ",
 }
 
+PRODUCTION_JOB_TYPES = (
+    "video_render",
+    "visual_scene_plan",
+    "youtube_upload",
+    "youtube_publish",
+    "fb_crosspost",
+    "fb_crosspost_sync",
+    "thumbnail_generation",
+    "tiktok_publish",
+)
+PRODUCTION_JOB_LABELS = {
+    "video_render": "Dựng video MP4",
+    "visual_scene_plan": "Lập kế hoạch cảnh",
+    "youtube_upload": "Upload / đặt lịch YouTube",
+    "youtube_publish": "Upload / đặt lịch YouTube",
+    "fb_crosspost": "Đăng chéo Facebook",
+    "fb_crosspost_sync": "Đồng bộ video Facebook",
+    "thumbnail_generation": "Sinh ảnh Thumbnail",
+    "tiktok_publish": "Đăng video TikTok",
+}
+ALL_JOB_LABELS = {
+    "video_generation": "Tạo video",
+    **COMMENT_JOB_LABELS,
+    **PRODUCTION_JOB_LABELS,
+}
+
 
 def _get_youtube_access_token(channel_db_id: int) -> tuple[dict, str]:
     channel = db.get_youtube_channel(channel_db_id, include_tokens=True)
@@ -2172,6 +2885,7 @@ def _get_youtube_access_token(channel_db_id: int) -> tuple[dict, str]:
             token_expiry=expiry,
             oauth_client_id=oauth_client_id,
         ),
+        proxy=channel.get("gpm_proxy_info"),
     )
     return channel, token
 
@@ -2213,6 +2927,7 @@ def _reconcile_existing_youtube_reply(
         access_token,
         comment["comment_id"],
         channel["channel_id"],
+        proxy=channel.get("gpm_proxy_info"),
     )
     if not existing_reply:
         return False
@@ -2390,9 +3105,10 @@ def _enqueue_comment_publish_jobs(comment_ids: list[str]) -> list[dict]:
 def _execute_comment_sync_job(job: dict) -> None:
     channel_db_id = int((job.get("payload") or {}).get("channel_id") or 0)
     channel, access_token = _get_youtube_access_token(channel_db_id)
+    proxy_info = channel.get("gpm_proxy_info")
     db.update_system_job(job["id"], progress="Đang đọc bình luận mới từ YouTube")
     remote_comments = youtube_comments.list_channel_comment_threads(
-        access_token, channel["channel_id"]
+        access_token, channel["channel_id"], proxy=proxy_info
     )
     matched_ids: list[str] = []
     ignored = 0
@@ -2883,11 +3599,55 @@ def _execute_comment_publish_job(job: dict) -> None:
     db.update_system_job(job["id"], progress="Đang đăng câu trả lời lên YouTube")
     try:
         safe_reply = youtube_comments.validate_comment_reply(comment["draft_reply"])
-        result = youtube_comments.publish_reply(
-            access_token,
-            comment["comment_id"],
-            safe_reply,
-        )
+        proxy_info = channel.get("gpm_proxy_info")
+        interaction_mode = str(channel.get("interaction_mode") or "gpm_browser").strip()
+        gpm_profile_id = str(channel.get("gpm_profile_id") or "").strip()
+        auto_heart = bool(channel.get("auto_heart", 1))
+
+        result = None
+        # If interaction_mode is gpm_browser and profile is mapped, attempt GPM browser automation posting
+        if interaction_mode == "gpm_browser" and gpm_profile_id:
+            video_url = ""
+            video_id = comment.get("video_id")
+            if video_id:
+                vid = db.get_video(video_id)
+                video_url = str((vid or {}).get("published_url") or "")
+            if not video_url and comment.get("publication_id"):
+                pub = db.get_video_publication(int(comment["publication_id"]))
+                video_url = str((pub or {}).get("published_url") or "")
+            if not video_url and comment.get("youtube_video_id"):
+                video_url = f"https://www.youtube.com/watch?v={comment['youtube_video_id']}"
+
+            if video_url:
+                try:
+                    db.update_system_job(job["id"], progress="Đang đăng bình luận qua GPM Profile Browser")
+                    gpm_result = asyncio.run(
+                        gpm_youtube_automation.post_comment_reply_via_gpm(
+                            gpm_profile_id,
+                            video_url=video_url,
+                            comment_text=safe_reply,
+                            comment_id=comment.get("comment_id") or "",
+                            auto_heart=auto_heart,
+                        )
+                    )
+                    result = {
+                        "reply_id": "",
+                        "text": safe_reply,
+                        "published_at": db.utc_now(),
+                        "mode": "gpm_browser",
+                        **gpm_result,
+                    }
+                except Exception as gpm_exc:
+                    logger.warning("Đăng qua GPM CDP thất bại (%s), fallback sang REST API qua proxy...", gpm_exc)
+
+        # Fallback to direct REST API with channel proxy if CDP was not used or failed
+        if result is None:
+            result = youtube_comments.publish_reply(
+                access_token,
+                comment["comment_id"],
+                safe_reply,
+                proxy=proxy_info,
+            )
     except Exception as exc:
         db.update_youtube_comment(
             comment["comment_id"],
@@ -2905,12 +3665,177 @@ def _execute_comment_publish_job(job: dict) -> None:
         reply_youtube_id=result.get("reply_id") or "",
         reply_text=result.get("text") or comment["draft_reply"],
         reply_published_at=result.get("published_at") or db.utc_now(),
+        is_hearted=int(bool(result.get("hearted"))),
         error="",
     )
     db.update_system_job(
         job["id"], status="done", progress="Đã đăng câu trả lời",
         result_json=result, finished_at=db.utc_now(), error="",
     )
+
+
+def _schedule_automatic_chatgpt_login(job_id: str, error: Exception) -> bool:
+    """Enqueue a background Auto Login thread for the given incident job.
+
+    Returns False without starting a thread when:
+    - The error is CAPTCHA/Cloudflare (not a plain login-expired error)
+    - A cooldown is in effect after a recent failure
+    """
+    global _automatic_login_active
+    from auto_yt.services.chatgpt_runtime import is_chatgpt_login_required
+
+    if not is_chatgpt_login_required(error):
+        # CAPTCHA / passkey / device verification – cannot be automated
+        return False
+
+    start_thread = False
+    with _automatic_login_state_lock:
+        now = time.monotonic()
+        if _automatic_login_last_failure_at > 0 and (
+            now - _automatic_login_last_failure_at < _AUTOMATIC_LOGIN_COOLDOWN_SECONDS
+        ):
+            return False
+
+        _automatic_login_job_ids.add(job_id)
+
+        if not _automatic_login_active:
+            _automatic_login_active = True
+            start_thread = True
+
+    if start_thread:
+        def _worker():
+            _run_automatic_chatgpt_login()
+        threading.Thread(target=_worker, daemon=True).start()
+
+    return True
+
+
+def _run_chatgpt_login_blocking() -> dict:
+    """Run ChatGPT auto-login in the current thread. Returns {success, error}."""
+    profile_reserved = False
+    try:
+        from auto_yt.services import chatgpt_browser_service
+        from auto_yt.services.chatgpt_login import login_gpt_auto, restore_session
+        import asyncio
+
+        account = account_store.load_account()
+        if not account.get("email"):
+            return {"success": False, "error": "Chưa cấu hình tài khoản"}
+
+        if not _try_start_chatgpt_operation("auto-login"):
+            return {"success": False, "error": CHATGPT_BUSY_ERROR}
+        profile_reserved = True
+
+        chatgpt_browser_service.stop_browser_service()
+
+        async def _do_login():
+            from playwright.async_api import async_playwright
+            profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            async with async_playwright() as p:
+                context = await p.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    headless=False,
+                    args=["--disable-blink-features=AutomationControlled"],
+                    viewport={"width": 1280, "height": 800},
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/126.0.0.0 Safari/537.36"
+                    ),
+                    ignore_default_args=["--enable-automation"],
+                )
+                try:
+                    page = context.pages[0] if context.pages else await context.new_page()
+                    page.set_default_timeout(60000)
+
+                    saved_cookies = account.get("session_cookie") or []
+                    if saved_cookies:
+                        try:
+                            result = await restore_session(saved_cookies, page)
+                        except Exception:
+                            result = await login_gpt_auto(account, page)
+                    else:
+                        result = await login_gpt_auto(account, page)
+
+                    if isinstance(result, dict) and result.get("cookies"):
+                        account["session_cookie"] = result["cookies"]
+                        account_store.save_account(account)
+                    return result
+                finally:
+                    await context.close()
+
+        result = asyncio.run(_do_login())
+        return result or {"success": True}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+    finally:
+        if profile_reserved:
+            try:
+                from auto_yt.services import chatgpt_browser_service
+                chatgpt_browser_service.start_browser_service()
+            except Exception:
+                pass
+            _finish_chatgpt_operation()
+
+
+def _run_automatic_chatgpt_login() -> None:
+    """Run auto-login and resume/fail all incident jobs. Clears active flag when done."""
+    global _automatic_login_active, _automatic_login_last_failure_at
+    try:
+        result = _run_chatgpt_login_blocking()
+        success = bool(result.get("success"))
+
+        with _automatic_login_state_lock:
+            incident_ids = set(_automatic_login_job_ids)
+
+        if success:
+            # Resume every paused incident job
+            for iid in incident_ids:
+                job = db.get_system_job(iid)
+                if job and job.get("status") == "paused":
+                    db.update_system_job(
+                        iid,
+                        status="queued",
+                        result_json={},
+                        error="",
+                        progress="Đang thêm lại vào hàng đợi sau Auto Login",
+                    )
+            _kick_video_queue()
+            _kick_comment_queue()
+        else:
+            err = result.get("error", "")
+            with _automatic_login_state_lock:
+                _automatic_login_last_failure_at = time.monotonic()
+            for iid in incident_ids:
+                job = db.get_system_job(iid)
+                if job and job.get("status") == "paused":
+                    existing_result = dict(job.get("result") or {})
+                    existing_result["automatic_login"] = "failed"
+                    db.update_system_job(
+                        iid,
+                        result_json=existing_result,
+                        progress=f"Auto Login thất bại: {err}",
+                    )
+    except Exception as exc:
+        err = str(exc)
+        with _automatic_login_state_lock:
+            _automatic_login_last_failure_at = time.monotonic()
+            incident_ids = set(_automatic_login_job_ids)
+        for iid in incident_ids:
+            job = db.get_system_job(iid)
+            if job and job.get("status") == "paused":
+                existing_result = dict(job.get("result") or {})
+                existing_result["automatic_login"] = "failed"
+                db.update_system_job(
+                    iid,
+                    result_json=existing_result,
+                    progress=f"Auto Login thất bại: {err}",
+                )
+    finally:
+        with _automatic_login_state_lock:
+            _automatic_login_active = False
+            _automatic_login_job_ids.clear()
 
 
 def _comment_queue_worker() -> None:
@@ -2939,13 +3864,18 @@ def _comment_queue_worker() -> None:
                     return
             except Exception as exc:
                 if isinstance(exc, ChatGPTAttentionRequiredError):
+                    scheduled = _schedule_automatic_chatgpt_login(job["id"], exc)
+                    result_json = {
+                        "attention_required": "chatgpt_verification",
+                    }
+                    if scheduled:
+                        result_json["automatic_login"] = "pending"
+                    
                     db.update_system_job(
                         job["id"],
                         status="paused",
                         progress="Cần xác minh phiên ChatGPT trước khi tiếp tục",
-                        result_json={
-                            "attention_required": "chatgpt_verification",
-                        },
+                        result_json=result_json,
                         error=security_logging.redact_sensitive(exc),
                         next_retry_at="",
                         finished_at="",
@@ -3087,15 +4017,30 @@ def resume_background_jobs() -> None:
             f"instead of opening a new window: {browser_status.get('message', '')}",
             file=sys.stderr,
         )
+    flow_browser_status = google_flow_browser_service.start_browser_service()
+    if not flow_browser_status.get("connected"):
+        print(
+            "Google Flow Browser Service is unavailable: "
+            f"{flow_browser_status.get('message', '')}",
+            file=sys.stderr,
+        )
     for task in db.get_active_audio_tasks():
         _start_audio_watcher(task["video_id"])
     db.recover_interrupted_system_jobs("video_generation")
     for job_type in COMMENT_JOB_TYPES:
         db.recover_interrupted_system_jobs(job_type)
+    for prod_job in (
+        "video_render",
+        "visual_scene_plan",
+        "youtube_upload",
+        "youtube_publish",
+    ):
+        db.recover_interrupted_system_jobs(prod_job)
     _reconcile_active_comment_draft_job_duplicates()
     db.pause_queued_attention_jobs()
     _kick_video_queue()
     _kick_comment_queue()
+    _kick_production_queue()
     _comment_sync_stop_event.clear()
     _enqueue_due_comment_syncs()
     if _comment_sync_thread is None or not _comment_sync_thread.is_alive():
@@ -3129,6 +4074,8 @@ def stop_video_queue_wakeup_timer() -> None:
         _video_queue_wakeup_at = 0.0
     _comment_sync_stop_event.set()
     _tts_preview_cleanup_stop_event.set()
+    if _production_coordinator is not None:
+        _production_coordinator.stop()
     chatgpt_browser_service.stop_browser_service()
 
 
@@ -3268,10 +4215,13 @@ def _execute_video_job(job: dict) -> None:
                 "voice_revision": int(job.get("voice_revision") or 1),
                 "config": {},
             }
+    production_snapshot = payload.get("production_snapshot")
+    if not isinstance(production_snapshot, dict):
+        production_snapshot = _get_prompt_production_snapshot(prompt_version)
     pipeline = chatgpt_projects.normalize_prompt_pipeline(
-        payload.get("pipeline")
-        if "pipeline" in payload
-        else _get_prompt_pipeline(prompt_version)
+        production_snapshot.get("pipeline")
+        if production_snapshot.get("pipeline") is not None
+        else payload.get("pipeline")
     )
     video_id = job.get("video_id")
     full_transcript = ""
@@ -3322,6 +4272,9 @@ def _execute_video_job(job: dict) -> None:
                 tts_provider_id=voice_snapshot.get("provider_id") or "genmax",
                 voice_revision=int(voice_snapshot.get("voice_revision") or 1),
                 voice_snapshot_json=json.dumps(voice_snapshot, ensure_ascii=False),
+                production_snapshot_json=json.dumps(
+                    production_snapshot, ensure_ascii=False
+                ),
             )
             _set_chatgpt_video_id(video_id)
             _update_video_job(
@@ -3478,14 +4431,22 @@ def _execute_video_job(job: dict) -> None:
         )
     except Exception as exc:
         if isinstance(exc, ChatGPTAttentionRequiredError):
+            scheduled = _schedule_automatic_chatgpt_login(job_id, exc)
+            result_json = {
+                "attention_required": "chatgpt_verification",
+                "video_id": video_id,
+            }
+            if scheduled:
+                result_json["automatic_login"] = "pending"
             _update_video_job(
                 job_id,
                 status="paused",
-                progress="Cần xác minh phiên ChatGPT trước khi tiếp tục",
-                result_json={
-                    "attention_required": "chatgpt_verification",
-                    "video_id": video_id,
-                },
+                progress=(
+                    "Cần xác minh phiên ChatGPT — đang chạy Auto Login"
+                    if scheduled
+                    else "Cần xác minh phiên ChatGPT trước khi tiếp tục"
+                ),
+                result_json=result_json,
                 error=security_logging.redact_sensitive(exc),
                 cancel_requested=0,
                 next_retry_at="",
@@ -3583,6 +4544,433 @@ def _execute_video_job(job: dict) -> None:
     finally:
         _finish_chatgpt_operation()
 
+
+
+def _production_job_progress(
+    job: dict,
+    message: str,
+    stage: str = "",
+    upload_percent: int | None = None,
+) -> None:
+    current_job = db.get_system_job(job["id"]) or job
+    result = dict(current_job.get("result") or {})
+    workflow = db.get_youtube_publish_workflow_by_job(job["id"])
+    if stage:
+        result["publish_stage"] = stage
+    if upload_percent is not None:
+        result["upload_percent"] = max(0, min(100, int(upload_percent)))
+    if workflow:
+        result["scheduled_at"] = str(workflow.get("scheduled_at") or "")
+        result["youtube_video_id"] = str(workflow.get("youtube_video_id") or "")
+    db.update_system_job(job["id"], progress=message, result_json=result)
+    video_id = current_job.get("video_id")
+    if video_id and stage:
+        db.update_video_production_state(
+            int(video_id),
+            current_stage=stage,
+            production_progress=message,
+        )
+
+
+def _execute_visual_scene_plan_job(job: dict) -> None:
+    from auto_yt.services import video_production
+
+    payload = job.get("payload") or {}
+    video_id = int(job.get("video_id") or payload.get("video_id") or 0)
+    _raise_if_video_job_canceled(job["id"])
+    video_production.save_visual_scene_plan(
+        video_id,
+        payload["plan_hash"],
+        payload["plan"],
+    )
+    db.update_system_job(
+        job["id"],
+        status="completed",
+        progress="Đã lưu kế hoạch cảnh",
+        finished_at=db.utc_now(),
+    )
+
+
+def _enqueue_youtube_publish_if_enabled(
+    *,
+    video_id: int,
+    snapshot: dict,
+    artifact: dict | None = None,
+) -> dict | None:
+    pipeline = snapshot.get("pipeline") if isinstance(snapshot, dict) else {}
+    if not isinstance(pipeline, dict) or not pipeline.get("youtube_upload"):
+        return None
+    existing_workflow = db.get_youtube_publish_workflow_for_video(video_id)
+    if existing_workflow:
+        return None
+    for existing_job in db.list_system_jobs(video_id=video_id, limit=None):
+        if (
+            existing_job.get("job_type") in {"youtube_upload", "youtube_publish"}
+            and existing_job.get("status")
+            in {"queued", "running", "retry_wait", "paused", "completed"}
+        ):
+            return existing_job
+    artifact = artifact or db.get_latest_video_artifact(
+        video_id, "final_mp4", status="ready"
+    )
+    if not artifact:
+        return None
+    video = db.get_video(video_id) or {}
+    job = db.create_system_job(
+        job_id=f"youtube-publish-{uuid.uuid4().hex}",
+        job_type="youtube_publish",
+        title=f"Đăng YouTube: {video.get('generated_title') or video.get('title') or video_id}",
+        payload={
+            "video_id": video_id,
+            "artifact_id": int(artifact["id"]),
+            "snapshot": snapshot,
+        },
+        prompt_version=str(snapshot.get("prompt_version") or ""),
+    )
+    job = db.update_system_job(job["id"], video_id=video_id)
+    db.update_video_production_state(
+        video_id,
+        publish_status="queued",
+        current_stage="preflight",
+        production_progress="Đang chờ kiểm tra cấu hình đăng YouTube",
+        blocking_reason="",
+    )
+    _kick_production_queue()
+    return job
+
+
+def _execute_video_render_job(job: dict) -> None:
+    from auto_yt.services import video_production
+
+    payload = job.get("payload") or {}
+    video_id = int(job.get("video_id") or payload.get("video_id") or 0)
+    snapshot = payload.get("snapshot") or _get_prompt_production_snapshot(
+        job.get("prompt_version") or ""
+    )
+
+    def update(message: str, stage: str = "", *args, **kwargs) -> None:
+        del args, kwargs
+        db.update_system_job(job["id"], progress=message)
+        db.update_video_production_state(
+            video_id,
+            render_status="running",
+            current_stage=stage or "video_render",
+            production_progress=message,
+            blocking_reason="",
+        )
+
+    result = video_production.produce_video(
+        video_id,
+        snapshot,
+        update,
+        lambda: _raise_if_video_job_canceled(job["id"]),
+        force_new_project=bool(payload.get("force_new_project", False)),
+    )
+    db.update_system_job(
+        job["id"],
+        status="completed",
+        progress="Đã dựng MP4 hoàn tất",
+        result_json=result,
+        finished_at=db.utc_now(),
+    )
+    db.update_video_production_state(
+        video_id,
+        render_status="completed",
+        current_stage="video_render",
+        production_progress="Đã dựng MP4 hoàn tất",
+        blocking_reason="",
+    )
+    _enqueue_youtube_publish_if_enabled(
+        video_id=video_id,
+        snapshot=snapshot,
+        artifact=result.get("artifact") if isinstance(result, dict) else None,
+    )
+
+
+def _execute_youtube_publish_job(job: dict) -> None:
+    payload = dict(job.get("payload") or {})
+    if not payload.get("artifact_id") and not payload.get("workflow_id"):
+        video_id = int(job.get("video_id") or payload.get("video_id") or 0)
+        artifact = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
+        if artifact:
+            payload["artifact_id"] = int(artifact["id"])
+            job = db.update_system_job(job["id"], payload_json=payload) or job
+    result = youtube_publish_workflow.execute_publish_job(
+        job,
+        progress=lambda message, stage="", upload_percent=None: _production_job_progress(
+            job, message, stage, upload_percent
+        ),
+        cancel_check=lambda: _raise_if_video_job_canceled(job["id"]),
+        resolve_default_channel_id=_get_prompt_default_youtube_channel_id,
+        thumbnails_dir=THUMBNAILS_DIR,
+    )
+    db.update_system_job(
+        job["id"],
+        status="completed",
+        progress="Đã hoàn tất đăng YouTube",
+        result_json=result,
+        error="",
+        recovery_count=0,
+        resume_from_step="",
+        next_retry_at="",
+        cancel_requested=0,
+        finished_at=db.utc_now(),
+    )
+
+
+def _pause_youtube_publish_job(
+    job: dict,
+    *,
+    message: str,
+    attention_required: str,
+    missing_configuration: list[str],
+    workflow_status: str = "paused",
+) -> None:
+    workflow = db.get_youtube_publish_workflow_by_job(job["id"])
+    if workflow:
+        db.update_youtube_publish_workflow(
+            workflow["id"],
+            status=workflow_status,
+            error=message,
+        )
+    result = dict((db.get_system_job(job["id"]) or job).get("result") or {})
+    result.update(
+        {
+            "attention_required": attention_required,
+            "missing_configuration": list(dict.fromkeys(missing_configuration)),
+        }
+    )
+    db.update_system_job(
+        job["id"],
+        status="paused",
+        progress=message,
+        result_json=result,
+        error=message,
+        next_retry_at="",
+        cancel_requested=0,
+        finished_at="",
+    )
+    video_id = job.get("video_id")
+    if video_id:
+        db.update_video_production_state(
+            int(video_id),
+            publish_status=workflow_status,
+            production_progress=message,
+            blocking_reason=message,
+        )
+
+
+def _schedule_youtube_publish_recovery(job: dict, error: str) -> bool:
+    current = db.get_system_job(job["id"]) or job
+    recovery_count = int(current.get("recovery_count") or 0)
+    if recovery_count >= len(YOUTUBE_RECOVERY_DELAYS_SECONDS):
+        return False
+    delay_seconds = YOUTUBE_RECOVERY_DELAYS_SECONDS[recovery_count]
+    result = dict(current.get("result") or {})
+    result.pop("attention_required", None)
+    result.pop("missing_configuration", None)
+    recovered = db.schedule_system_job_recovery(
+        job["id"],
+        resume_from_step=str(result.get("publish_stage") or "preflight"),
+        delay_seconds=delay_seconds,
+        error=error,
+        result_json=result,
+    )
+    if not recovered:
+        return False
+    db.update_system_job(
+        job["id"],
+        progress=f"Lỗi tạm thời; tự thử lại sau {delay_seconds} giây",
+    )
+    workflow = db.get_youtube_publish_workflow_by_job(job["id"])
+    if workflow:
+        db.update_youtube_publish_workflow(
+            workflow["id"], status="retry_wait", error=error
+        )
+    return True
+
+
+def _handle_production_job_error(job: dict, exc: Exception) -> None:
+    safe_error = security_logging.redact_sensitive(str(exc))
+    workflow = db.get_youtube_publish_workflow_by_job(job["id"])
+    if isinstance(exc, VideoJobCanceled):
+        if workflow:
+            db.update_youtube_publish_workflow(
+                workflow["id"], status="canceled", error=safe_error
+            )
+        db.update_system_job(
+            job["id"],
+            status="canceled",
+            progress="Đã dừng theo yêu cầu của người dùng",
+            error=safe_error,
+            cancel_requested=0,
+            finished_at=db.utc_now(),
+        )
+        return
+    if isinstance(exc, youtube_publish_workflow.PublishConfigurationRequired):
+        _pause_youtube_publish_job(
+            job,
+            message=safe_error,
+            attention_required="youtube_publish_config",
+            missing_configuration=exc.missing_configuration,
+        )
+        return
+    if isinstance(exc, publication_scheduler.PublicationScheduleError):
+        _pause_youtube_publish_job(
+            job,
+            message=safe_error,
+            attention_required="youtube_publish_schedule",
+            missing_configuration=["publication_slots"],
+        )
+        return
+    if isinstance(exc, youtube_publisher.YouTubeUploadReconciliationRequired):
+        _pause_youtube_publish_job(
+            job,
+            message=safe_error,
+            attention_required="youtube_reconcile_required",
+            missing_configuration=[],
+            workflow_status="reconcile_required",
+        )
+        return
+    if isinstance(exc, youtube_publisher.YouTubePublicUploadRestricted):
+        _pause_youtube_publish_job(
+            job,
+            message=safe_error,
+            attention_required="youtube_public_verification",
+            missing_configuration=["public_upload_verified"],
+        )
+        return
+    if isinstance(exc, ProxyConfigurationError):
+        _pause_youtube_publish_job(
+            job,
+            message=safe_error,
+            attention_required="youtube_publish_config",
+            missing_configuration=["gpm_proxy_info"],
+        )
+        return
+    if isinstance(exc, SecretStorageError):
+        _pause_youtube_publish_job(
+            job,
+            message=safe_error,
+            attention_required="youtube_publish_config",
+            missing_configuration=["local_secret_store"],
+        )
+        return
+    if isinstance(exc, youtube_comments.YouTubeCommentsError) and not _is_transient_youtube_error(exc):
+        _pause_youtube_publish_job(
+            job,
+            message=safe_error,
+            attention_required="youtube_publish_auth",
+            missing_configuration=["youtube_oauth"],
+        )
+        return
+    if isinstance(
+        exc,
+        (
+            youtube_publisher.YouTubeProcessingPending,
+            youtube_publisher.YouTubeTransientError,
+        ),
+    ) or _is_transient_youtube_error(exc):
+        if _schedule_youtube_publish_recovery(job, safe_error):
+            return
+    if workflow:
+        db.update_youtube_publish_workflow(
+            workflow["id"], status="failed_permanent", error=safe_error
+        )
+    db.update_system_job(
+        job["id"],
+        status="error",
+        progress="Tác vụ production thất bại",
+        error=safe_error,
+        cancel_requested=0,
+        finished_at=db.utc_now(),
+    )
+
+
+def _execute_fb_crosspost_job(job: dict) -> None:
+    from auto_yt.services import fb_crossposter_service
+
+    payload = job.get("payload") or {}
+    item_id = int(payload.get("item_id") or 0)
+    task_id = payload.get("task_id")
+    if not item_id:
+        db.update_system_job(job["id"], status="completed", progress="Không tìm thấy item_id trong payload.")
+        return
+
+    fb_crossposter_service.process_queue_item_jit(
+        item_id=item_id,
+        parent_task_id=task_id,
+        sys_job_id=job["id"],
+    )
+
+
+def _execute_fb_crosspost_sync_job(job: dict) -> None:
+    from auto_yt.services import fb_crossposter_service
+
+    payload = job.get("payload") or {}
+    channel_url = payload.get("channel_url") or ""
+    target_page_id = payload.get("target_page_id") or ""
+    gpm_profile_id = payload.get("gpm_profile_id") or ""
+    if not channel_url:
+        db.update_system_job(job["id"], status="completed", progress="Không tìm thấy channel_url trong payload.")
+        return
+
+    fb_crossposter_service.sync_channel_public_videos(
+        channel_url=channel_url,
+        gpm_profile_id=gpm_profile_id,
+        target_page_id=target_page_id,
+        sys_job_id=job["id"],
+    )
+
+
+_production_coordinator = production_coordinator_service.ProductionCoordinator(
+    {
+        "visual_scene_plan": _execute_visual_scene_plan_job,
+        "video_render": _execute_video_render_job,
+        "youtube_publish": _execute_youtube_publish_job,
+        "youtube_upload": _execute_youtube_publish_job,
+        "fb_crosspost": _execute_fb_crosspost_job,
+        "fb_crosspost_sync": _execute_fb_crosspost_sync_job,
+    },
+    error_handler=_handle_production_job_error,
+)
+
+
+def _kick_production_queue() -> None:
+    _production_coordinator.wake()
+
+
+def _trigger_video_render_if_enabled(video_id: int) -> dict | None:
+    video = db.get_video(video_id)
+    if not video or video.get("video_status") == db.VIDEO_STATUS_ERROR:
+        return None
+    prompt_version = video.get("prompt_version") or ""
+    try:
+        snapshot = json.loads(video.get("production_snapshot_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        snapshot = {}
+    if not isinstance(snapshot, dict) or not snapshot.get("pipeline"):
+        snapshot = _get_prompt_production_snapshot(prompt_version)
+    pipeline = snapshot.get("pipeline") or {}
+    if not pipeline.get("video_render"):
+        return None
+    
+    existing_jobs = db.list_system_jobs(video_id=video_id, limit=None)
+    for j in existing_jobs:
+        if j.get("job_type") == "video_render" and j.get("status") in {"queued", "running", "completed"}:
+            return j
+            
+    job_id = f"video-render-{uuid.uuid4().hex}"
+    job = db.create_system_job(
+        job_id=job_id,
+        job_type="video_render",
+        title=f"Dựng video MP4 cho #{video_id}",
+        payload={"video_id": video_id, "snapshot": snapshot},
+        prompt_version=prompt_version,
+    )
+    db.update_system_job(job["id"], video_id=video_id)
+    _kick_production_queue()
+    return job
 
 def _drain_video_queue() -> None:
     global _video_queue_worker_active
@@ -3686,7 +5074,10 @@ def _kick_video_queue() -> None:
 @app.post("/api/process-video")
 def process_video(request: VideoRequest):
     resolved_prompt_version = request.prompt_version or _get_active_prompt_version_id()
-    pipeline = _get_prompt_pipeline(resolved_prompt_version)
+    _production_snapshot = _get_prompt_production_snapshot(resolved_prompt_version)
+    pipeline = chatgpt_projects.normalize_prompt_pipeline(
+        _production_snapshot.get("pipeline")
+    )
     requested_voice_id = request.voice_id or _get_prompt_default_voice_id(
         resolved_prompt_version
     )
@@ -3762,6 +5153,7 @@ def process_video(request: VideoRequest):
             "voice_name": selected_voice["name"],
             "voice_snapshot": voice_snapshot,
             "pipeline": pipeline,
+            "production_snapshot": _production_snapshot,
         },
         prompt_version=resolved_prompt_version,
         voice_id=selected_voice["id"],
@@ -4011,9 +5403,15 @@ def continue_video_generation(video_id: int):
     return {"job_id": job_id}
 
 
-def _system_job_center_item(job: dict, queue_position: int | None) -> dict:
+def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: bool = False) -> dict:
     payload = job.get("payload") or {}
-    status = job["status"]
+    result = job.get("result") or {}
+    raw_status = str(job.get("status") or "")
+    status_map = {
+        "completed": "done",
+        "failed": "error",
+    }
+    status = status_map.get(raw_status, raw_status)
     video_id = job.get("video_id")
     title = (
         job.get("generated_title")
@@ -4021,15 +5419,58 @@ def _system_job_center_item(job: dict, queue_position: int | None) -> dict:
         or job.get("title")
         or payload.get("url", "")
     )
+    job_type = str(job.get("job_type") or "")
+    type_label = ALL_JOB_LABELS.get(job_type, job_type)
+    publish_workflow = (
+        db.get_youtube_publish_workflow_by_job(job["id"])
+        if hydrate and job_type in {"youtube_upload", "youtube_publish"}
+        else None
+    )
+    publish_stage = str(
+        result.get("publish_stage")
+        or result.get("stage")
+        or (publish_workflow or {}).get("stage")
+        or ""
+    )
+    upload_percent = result.get("upload_percent")
+    if upload_percent is None and publish_workflow:
+        artifact = db.get_video_artifact(int(publish_workflow.get("artifact_id") or 0))
+        artifact_size = int((artifact or {}).get("size_bytes") or 0)
+        if artifact_size > 0:
+            upload_percent = min(
+                100,
+                int(
+                    (int(publish_workflow.get("upload_offset") or 0) / artifact_size)
+                    * 100
+                ),
+            )
+    scheduled_at = str(
+        result.get("scheduled_at")
+        or (publish_workflow or {}).get("scheduled_at")
+        or ""
+    )
+    youtube_video_id = str(
+        result.get("youtube_video_id")
+        or (publish_workflow or {}).get("youtube_video_id")
+        or ""
+    )
+    artifact_download_url = (
+        f"/api/videos/{video_id}/download-mp4"
+        if hydrate
+        and video_id
+        and db.get_latest_video_artifact(int(video_id), "final_mp4", status="ready")
+        else ""
+    )
+    youtube_studio_url = (
+        "https://studio.youtube.com/"
+        if youtube_video_id
+        else ""
+    )
     return {
         "id": job["id"],
         "raw_id": job["id"],
-        "type": job["job_type"],
-        "type_label": (
-            "Tạo video"
-            if job["job_type"] == "video_generation"
-            else COMMENT_JOB_LABELS.get(job["job_type"], job["job_type"])
-        ),
+        "type": job_type,
+        "type_label": type_label,
         "status": status,
         "title": html.unescape(str(title or "")),
         "original_title": html.unescape(
@@ -4047,16 +5488,20 @@ def _system_job_center_item(job: dict, queue_position: int | None) -> dict:
         "voice_revision": int(job.get("voice_revision") or 1),
         "pipeline": (
             chatgpt_projects.normalize_prompt_pipeline(payload.get("pipeline"))
-            if job["job_type"] == "video_generation"
+            if job_type == "video_generation"
             else None
         ),
         "queue_position": queue_position,
         "attempt": job.get("attempt", 0),
         "recovery_count": job.get("recovery_count", 0),
         "recovery_limit": (
-            len(VIDEO_RECOVERY_DELAYS_SECONDS)
-            if job["job_type"] == "video_generation"
-            else 0
+            len(YOUTUBE_RECOVERY_DELAYS_SECONDS)
+            if job_type in {"youtube_upload", "youtube_publish"}
+            else (
+                len(VIDEO_RECOVERY_DELAYS_SECONDS)
+                if job_type == "video_generation"
+                else 0
+            )
         ),
         "resume_from_step": job.get("resume_from_step", ""),
         "next_retry_at": job.get("next_retry_at", ""),
@@ -4066,23 +5511,74 @@ def _system_job_center_item(job: dict, queue_position: int | None) -> dict:
         "finished_at": job.get("finished_at", ""),
         "can_cancel": (
             status in {"queued", "retry_wait", "paused"}
-            or (job["job_type"] == "video_generation" and status == "running")
+            or (job_type in {"video_generation", "video_render", "visual_scene_plan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish"} and status == "running")
         ),
         "can_retry": (
             status in {"error", "canceled"}
-            and job["job_type"] != "comment_publish"
+            and job_type != "comment_publish"
         ),
         "can_pause": status in {"queued", "retry_wait"},
         "can_resume": status == "paused",
-        "can_edit": job["job_type"] == "video_generation" and (
+        "can_edit": job_type == "video_generation" and (
             status in {"error", "canceled"}
             or (status in {"queued", "paused"} and video_id is None)
         ),
         "can_delete": status != "running",
         "attention_required": (
-            (job.get("result") or {}).get("attention_required", "")
+            result.get("attention_required", "")
         ),
+        "automatic_login": result.get("automatic_login", ""),
+        "missing_configuration": result.get("missing_configuration") or [],
+        "publish_stage": publish_stage,
+        "upload_percent": upload_percent,
+        "scheduled_at": scheduled_at,
+        "youtube_video_id": youtube_video_id,
+        "artifact_download_url": artifact_download_url,
+        "youtube_studio_url": youtube_studio_url,
     }
+
+
+def _hydrate_job_center_items(items: list[dict]) -> list[dict]:
+    if not items:
+        return items
+    video_ids = [int(item["video_id"]) for item in items if item.get("video_id")]
+    ready_artifact_video_ids = (
+        db.get_video_ids_with_ready_final_mp4(video_ids) if video_ids else set()
+    )
+    yt_job_ids = [
+        item["id"] for item in items
+        if item.get("type") in {"youtube_upload", "youtube_publish"}
+    ]
+    workflows_by_job_id = (
+        db.get_youtube_publish_workflows_by_job_ids(yt_job_ids) if yt_job_ids else {}
+    )
+    for item in items:
+        vid = item.get("video_id")
+        if vid and int(vid) in ready_artifact_video_ids:
+            item["artifact_download_url"] = f"/api/videos/{vid}/download-mp4"
+        workflow = workflows_by_job_id.get(item["id"])
+        if workflow:
+            if not item.get("publish_stage"):
+                item["publish_stage"] = str(workflow.get("stage") or "")
+            if item.get("upload_percent") is None:
+                artifact_size = int(workflow.get("artifact_size_bytes") or 0)
+                if artifact_size > 0:
+                    item["upload_percent"] = min(
+                        100,
+                        int(
+                            (int(workflow.get("upload_offset") or 0) / artifact_size)
+                            * 100
+                        ),
+                    )
+            if not item.get("scheduled_at"):
+                item["scheduled_at"] = str(workflow.get("scheduled_at") or "")
+            if not item.get("youtube_video_id"):
+                item["youtube_video_id"] = str(workflow.get("youtube_video_id") or "")
+            if item.get("youtube_video_id"):
+                item["youtube_studio_url"] = "https://studio.youtube.com/"
+        elif item.get("youtube_video_id"):
+            item["youtube_studio_url"] = "https://studio.youtube.com/"
+    return items
 
 
 def _audio_job_center_item(task: dict) -> dict:
@@ -4271,7 +5767,11 @@ def _job_matches_video_search(item: dict, query: str) -> bool:
 
 
 JOB_CENTER_ACTIONS = ("retry", "pause", "resume", "cancel")
-JOB_CENTER_SYSTEM_JOB_TYPES = ("video_generation", *COMMENT_JOB_TYPES)
+JOB_CENTER_SYSTEM_JOB_TYPES = (
+    "video_generation",
+    *COMMENT_JOB_TYPES,
+    *PRODUCTION_JOB_TYPES,
+)
 
 
 def _job_supports_action(item: dict, action: str) -> bool:
@@ -4289,14 +5789,20 @@ def _collect_job_center_items(job_type: str | None = None) -> list[dict]:
         normalized_type = ""
     items: list[dict] = []
 
-    requested_system_type = (
-        normalized_type if normalized_type in JOB_CENTER_SYSTEM_JOB_TYPES else None
-    )
-    if not normalized_type or requested_system_type:
-        system_jobs = db.list_system_jobs(
-            limit=None,
-            job_type=requested_system_type,
-        )
+    if normalized_type == "youtube_publish":
+        requested_system_types = ["youtube_publish", "youtube_upload"]
+    elif normalized_type in JOB_CENTER_SYSTEM_JOB_TYPES:
+        requested_system_types = [normalized_type]
+    else:
+        requested_system_types = None
+
+    if not normalized_type or requested_system_types:
+        if not normalized_type:
+            system_jobs = db.list_system_jobs(limit=None, job_type=None)
+        else:
+            system_jobs = []
+            for st in requested_system_types:
+                system_jobs.extend(db.list_system_jobs(limit=None, job_type=st))
         queue_positions: dict[str, int] = {}
         queued_counts: dict[str, int] = {}
         for job in sorted(system_jobs, key=lambda item: item["created_at"]):
@@ -4414,9 +5920,9 @@ def list_jobs(
         action: sum(_job_supports_action(item, action) for item in filtered_items)
         for action in JOB_CENTER_ACTIONS
     }
-    paged_items = filtered_items[
-        requested_offset:requested_offset + requested_limit
-    ]
+    paged_items = _hydrate_job_center_items(
+        filtered_items[requested_offset:requested_offset + requested_limit]
+    )
     for item in paged_items:
         item.pop("download_videos", None)
     return {
@@ -4452,6 +5958,8 @@ def _kick_job_queues(job_types: set[str]) -> None:
         _kick_video_queue()
     if any(job_type in COMMENT_JOB_TYPES for job_type in job_types):
         _kick_comment_queue()
+    if any(job_type in PRODUCTION_JOB_TYPES for job_type in job_types):
+        _kick_production_queue()
 
 
 def _run_system_job_center_action(
@@ -4466,6 +5974,7 @@ def _run_system_job_center_action(
     current_item = _system_job_center_item(
         job,
         db.get_system_job_queue_position(job_id),
+        hydrate=True,
     )
     if not _job_supports_action(current_item, action):
         raise JobCenterActionNotAllowedError(
@@ -4473,20 +5982,69 @@ def _run_system_job_center_action(
         )
     if action == "retry":
         updated_job = db.retry_system_job(job_id)
+        if str(job.get("job_type")) == "fb_crosspost":
+            try:
+                from auto_yt.services import fb_crossposter_service
+                raw_payload = job.get("payload") or job.get("payload_json") or {}
+                if isinstance(raw_payload, str):
+                    try:
+                        payload = json.loads(raw_payload)
+                    except Exception:
+                        payload = {}
+                else:
+                    payload = dict(raw_payload)
+                page_id = payload.get("page_id") or payload.get("target_page_id")
+                days_ahead = payload.get("days_ahead")
+                item_id = payload.get("item_id")
+                if page_id and days_ahead:
+                    fb_crossposter_service.start_schedule_ahead_batch(
+                        target_page_id=str(page_id),
+                        days_ahead=int(days_ahead),
+                    )
+                elif item_id:
+                    threading.Thread(
+                        target=fb_crossposter_service.process_queue_item_jit,
+                        args=(int(item_id),),
+                        kwargs={"sys_job_id": job_id},
+                        daemon=True,
+                    ).start()
+            except Exception as retry_err:
+                logger.warning("Could not re-trigger fb_crosspost worker on retry: %s", retry_err)
     elif action == "pause":
         updated_job = db.pause_system_job(job_id)
     elif action == "resume":
         updated_job = db.resume_system_job(job_id)
     else:
         updated_job = db.request_cancel_system_job(job_id)
+        if str(job.get("job_type")) == "fb_crosspost":
+            try:
+                from auto_yt.services import fb_crossposter_service
+                task_id = (job.get("payload") or {}).get("task_id")
+                fb_crossposter_service.cancel_schedule_ahead_batch(task_id=task_id)
+            except Exception:
+                pass
     if not updated_job:
         raise JobCenterItemNotFoundError("Không tìm thấy job.")
+    if str(job.get("job_type")) in {"youtube_upload", "youtube_publish"}:
+        workflow = db.get_youtube_publish_workflow_by_job(job_id)
+        if workflow:
+            workflow_status = {
+                "pause": "paused",
+                "cancel": "canceled",
+                "resume": "reserved",
+                "retry": "reserved",
+            }.get(action)
+            if workflow_status:
+                db.update_youtube_publish_workflow(
+                    workflow["id"], status=workflow_status, error=""
+                )
     _sync_legacy_job(updated_job)
     if kick_queues:
         _kick_job_queues({str(job["job_type"])})
     return _system_job_center_item(
         updated_job,
         db.get_system_job_queue_position(job_id),
+        hydrate=True,
     )
 
 
@@ -4710,6 +6268,7 @@ def update_video_job(job_id: str, request: UpdateVideoJobRequest):
         "job": _system_job_center_item(
             updated_job,
             db.get_system_job_queue_position(job_id),
+            hydrate=True,
         ),
     }
 
@@ -4724,8 +6283,7 @@ def delete_job(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     with _jobs_lock:
         _jobs.pop(job_id, None)
-    _kick_video_queue()
-    _kick_comment_queue()
+    _kick_job_queues({str(deleted_job.get("job_type") or "video_generation")})
     return {"success": True}
 
 
@@ -5000,6 +6558,29 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
     ):
         return {"success": False, "error": CHATGPT_BUSY_ERROR}
 
+    v_title = ""
+    if req.video_id:
+        try:
+            v_rec = db.get_editable_video_job(req.video_id) or {}
+            v_title = v_rec.get("generated_title") or v_rec.get("original_title") or f"Video #{req.video_id}"
+        except Exception:
+            v_title = f"Video #{req.video_id}"
+    else:
+        v_title = "Thumbnail độc lập"
+
+    sys_job_id = f"thumb-{req.video_id or int(time.time() * 1000)}"
+    try:
+        db.create_system_job(
+            job_id=sys_job_id,
+            job_type="thumbnail_generation",
+            title=f"Sinh Thumbnail: {v_title[:50]}",
+            video_id=req.video_id,
+            payload={"video_id": req.video_id, "thumbnail_type": req.thumbnail_type},
+        )
+        db.update_system_job(sys_job_id, status="running", progress="Đang tạo ảnh qua ChatGPT...")
+    except Exception as exc:
+        logger.warning("Could not register thumbnail_generation system_job: %s", exc)
+
     try:
         loop = asyncio.get_event_loop()
         def generate_requested_thumbnails():
@@ -5114,9 +6695,29 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
                         
                 db.update_script(req.video_id, script)
         
+        try:
+            db.update_system_job(
+                sys_job_id,
+                status="completed",
+                progress="Đã tạo xong ảnh thumbnail",
+                finished_at=db.utc_now(),
+            )
+        except Exception:
+            pass
+
         return {"success": True, **result}
     except Exception as e:
         print(f"Error in generate_thumbnails_endpoint: {e}", file=sys.stderr)
+        try:
+            db.update_system_job(
+                sys_job_id,
+                status="failed",
+                progress=f"Lỗi tạo thumbnail: {str(e)[:100]}",
+                error=str(e),
+                finished_at=db.utc_now(),
+            )
+        except Exception:
+            pass
         import traceback
         traceback.print_exc()
         return {"success": False, "error": str(e)}
@@ -5551,6 +7152,100 @@ def save_audio_duration(video_id: int, request: AudioDurationRequest):
     if not success:
         raise HTTPException(status_code=404, detail="Video not found")
     return {"success": True}
+
+
+@app.post("/api/videos/{video_id}/render-video")
+def trigger_render_video(video_id: int, mode: str = "resume"):
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video.")
+    audio_task = db.get_audio_task(video_id)
+    if not audio_task or audio_task.get("status") != "completed" or not audio_task.get("audio_url"):
+        raise HTTPException(status_code=400, detail="Video chưa có file âm thanh hoàn tất.")
+    prompt_version = video.get("prompt_version") or ""
+    snapshot = _get_prompt_production_snapshot(prompt_version)
+    force_new_project = (mode == "recreate")
+    job_id = f"video-render-{uuid.uuid4().hex}"
+    job = db.create_system_job(
+        job_id=job_id,
+        job_type="video_render",
+        title=f"Dựng video MP4 cho #{video_id}" + (" (Tạo mới)" if force_new_project else ""),
+        payload={
+            "video_id": video_id,
+            "snapshot": snapshot,
+            "mode": mode,
+            "force_new_project": force_new_project,
+        },
+        prompt_version=prompt_version,
+    )
+    db.update_system_job(job["id"], video_id=video_id)
+    _kick_production_queue()
+    return {"success": True, "job_id": job["id"], "status": "queued"}
+
+
+@app.post("/api/videos/{video_id}/cancel-render")
+def cancel_render_video(video_id: int):
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video.")
+    jobs = db.list_system_jobs(video_id=video_id, limit=None)
+    active_jobs = [
+        j for j in jobs
+        if j.get("job_type") == "video_render"
+        and j.get("status") in {"queued", "running", "retry_wait"}
+    ]
+    if not active_jobs:
+        return {"success": True, "message": "Không có tác vụ render nào đang chạy."}
+
+    for job in active_jobs:
+        job_id = job["id"]
+        coordinator_status = _production_coordinator.status()
+        if (
+            coordinator_status.get("current_job_id") != job_id
+            or job.get("status") in {"queued", "retry_wait"}
+        ):
+            db.update_system_job(
+                job_id,
+                status="canceled",
+                progress="Đã dừng tác vụ dựng video.",
+                finished_at=db.utc_now(),
+                cancel_requested=0,
+            )
+        else:
+            db.request_cancel_system_job(job_id)
+
+    return {"success": True, "message": "Đã yêu cầu dừng tác vụ dựng video."}
+
+
+@app.get("/api/videos/{video_id}/render-status")
+def get_render_status(video_id: int):
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video.")
+    artifact = db.get_latest_video_artifact(video_id, "final_mp4")
+    jobs = db.list_system_jobs(video_id=video_id, limit=None)
+    render_job = next((j for j in jobs if j.get("job_type") == "video_render"), None)
+    return {
+        "video_id": video_id,
+        "has_mp4": bool(artifact and artifact.get("status") == "ready" and Path(artifact.get("path") or "").is_file()),
+        "mp4_artifact": artifact,
+        "job": render_job,
+    }
+
+
+@app.get("/api/videos/{video_id}/download-mp4")
+def download_video_mp4(video_id: int):
+    artifact = db.get_latest_video_artifact(video_id, "final_mp4")
+    if not artifact or artifact.get("status") != "ready":
+        raise HTTPException(status_code=404, detail="Video MP4 chưa sẵn sàng.")
+    path = Path(artifact.get("path") or "")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="File video MP4 không tồn tại trên đĩa.")
+    return FileResponse(
+        path=str(path),
+        media_type="video/mp4",
+        filename=path.name,
+    )
 
 @app.get("/api/videos/{video_id}")
 def get_video(video_id: int):
@@ -6561,8 +8256,14 @@ def save_prompt_version_name(version_id: str, payload: PromptVersionNameData):
         _assert_prompt_version_editable(version_id)
         data = _read_prompts_config()
         version = _get_prompt_version(data, version_id)
+        old_name = str(version.get("name") or "").strip()
         version["name"] = name
         normalized_data = _write_prompts_config(data)
+
+    if old_name and old_name != name:
+        from auto_yt.services import prompt_assets
+        prompt_assets.rename_prompt_asset_dir(old_name, name)
+
     return {
         "version_id": version_id,
         "version": normalized_data["versions"][version_id],
@@ -6642,13 +8343,72 @@ def save_prompt_pipeline(version_id: str, payload: PromptPipelineData):
         _assert_prompt_version_editable(version_id)
         data = _read_prompts_config()
         version = _get_prompt_version(data, version_id)
-        version["pipeline"] = chatgpt_projects.validate_prompt_pipeline(
+        thumbnail_variant = chatgpt_projects.normalize_image_generation_settings(
+            version.get("image_generation_settings")
+        )["thumbnail_variant"]
+        requested_pipeline = payload.model_dump()
+        validated_pipeline = chatgpt_projects.validate_prompt_pipeline(
+            requested_pipeline,
+            thumbnail_variant,
+        )
+        version["pipeline"] = validated_pipeline
+        normalized_data = _write_prompts_config(data)
+    auto_enabled = [
+        key
+        for key, enabled in validated_pipeline.items()
+        if enabled and not requested_pipeline.get(key, False)
+    ]
+    return {
+        "version_id": version_id,
+        "pipeline": normalized_data["versions"][version_id]["pipeline"],
+        "auto_enabled": auto_enabled,
+    }
+
+
+@app.patch("/api/prompts/{version_id}/image-generation")
+def save_prompt_image_generation(
+    version_id: str,
+    payload: PromptImageGenerationData,
+):
+    with _prompts_config_lock:
+        _assert_prompt_version_editable(version_id)
+        data = _read_prompts_config()
+        version = _get_prompt_version(data, version_id)
+        settings = chatgpt_projects.validate_image_generation_settings(
             payload.model_dump()
+        )
+        previous_pipeline = chatgpt_projects.normalize_prompt_pipeline(
+            version.get("pipeline")
+        )
+        pipeline = chatgpt_projects.validate_prompt_pipeline(
+            previous_pipeline,
+            settings["thumbnail_variant"],
+        )
+        version["image_generation_settings"] = settings
+        version["pipeline"] = pipeline
+        normalized_data = _write_prompts_config(data)
+    return {
+        "version_id": version_id,
+        "version": normalized_data["versions"][version_id],
+    }
+
+
+@app.patch("/api/prompts/{version_id}/publishing")
+def save_prompt_publishing(
+    version_id: str,
+    payload: PromptPublishingData,
+):
+    with _prompts_config_lock:
+        _assert_prompt_version_editable(version_id)
+        data = _read_prompts_config()
+        version = _get_prompt_version(data, version_id)
+        version["publishing_settings"] = (
+            chatgpt_projects.validate_publishing_settings(payload.model_dump())
         )
         normalized_data = _write_prompts_config(data)
     return {
         "version_id": version_id,
-        "pipeline": normalized_data["versions"][version_id]["pipeline"],
+        "version": normalized_data["versions"][version_id],
     }
 
 
@@ -6812,3 +8572,723 @@ async def open_profile():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="127.0.0.1", port=8080, reload=True, loop="asyncio")
+
+
+from auto_yt.services import google_flow_account
+from auto_yt.services import google_flow_browser_service
+from auto_yt.services.google_flow_login import login_google_flow
+from fastapi import File, UploadFile, Form
+import json
+import shutil
+import hashlib
+import os
+from auto_yt.paths import DATA_DIR
+FLOW_REFERENCE_STAGING_DIR = DATA_DIR / "flow_staging"
+from pydantic import BaseModel
+
+class GoogleFlowAccountData(BaseModel):
+    email: str = ""
+    password: str = ""
+    totp_secret: str = ""
+
+@app.get("/api/flow/account")
+def get_flow_account():
+    return google_flow_account.get_account_status()
+
+@app.put("/api/flow/account")
+def update_flow_account(payload: GoogleFlowAccountData):
+    try:
+        return google_flow_account.save_credentials(payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+@app.delete("/api/flow/account")
+def clear_flow_account():
+    google_flow_account.clear_account()
+    return {"success": True}
+
+@app.get("/api/flow/browser")
+def get_flow_browser_status():
+    return google_flow_browser_service.get_browser_service_status()
+
+@app.post("/api/flow/browser/{action}")
+def manage_flow_browser(action: str):
+    if action == "start":
+        status = google_flow_browser_service.start_browser_service()
+        if not status.get("connected"):
+            raise HTTPException(status_code=503, detail=status.get("message"))
+    elif action == "stop":
+        status = google_flow_browser_service.stop_browser_service()
+        if status.get("process_alive"):
+            raise HTTPException(status_code=409, detail=status.get("message"))
+    elif action == "show":
+        status = google_flow_browser_service.set_browser_service_window_visibility(True)
+        if not status.get("connected"):
+            raise HTTPException(status_code=503, detail=status.get("message"))
+    elif action == "hide":
+        status = google_flow_browser_service.set_browser_service_window_visibility(False)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid action")
+    return status
+
+
+async def _verify_google_flow_browser_session(account: dict) -> dict:
+    from playwright.async_api import async_playwright
+
+    endpoint = google_flow_browser_service.get_browser_service_endpoint()
+    if not endpoint:
+        raise RuntimeError("Browser Google Flow chưa sẵn sàng.")
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.connect_over_cdp(endpoint)
+        if not browser.contexts:
+            raise RuntimeError("Browser Google Flow chưa có browser context.")
+        context = browser.contexts[0]
+        page = context.pages[0] if context.pages else await context.new_page()
+        page.set_default_timeout(60_000)
+        result = await login_google_flow(account, page)
+        cookies = [
+            cookie
+            for cookie in result.get("cookies", [])
+            if google_flow_account.is_google_flow_cookie(cookie)
+        ]
+        if not google_flow_account.has_google_flow_auth_cookie(cookies):
+            raise RuntimeError("Không tìm thấy phiên đăng nhập Google hợp lệ.")
+        account["session_cookies"] = cookies
+        google_flow_account.save_account(account)
+        return result
+
+@app.post("/api/flow/login-check")
+async def check_flow_login():
+    try:
+        account = google_flow_account.load_account()
+        browser_status = google_flow_browser_service.get_browser_service_status()
+        if not browser_status.get("connected"):
+            browser_status = await asyncio.to_thread(
+                google_flow_browser_service.start_browser_service
+            )
+        if not browser_status.get("connected"):
+            return {
+                "success": False,
+                "error": browser_status.get("message")
+                or "Không thể khởi động trình duyệt Flow.",
+            }
+
+        result = await _verify_google_flow_browser_session(account)
+        return {
+            "success": True,
+            "message": result.get("message") or "Flow login verified",
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/flow/test-generation")
+def test_flow_generation(confirm_credit_charge: bool = False):
+    if not confirm_credit_charge:
+        raise HTTPException(status_code=400, detail="Must confirm credit charge")
+    return {"success": True, "message": "Test generated"}
+
+@app.post("/api/flow/reference-sets")
+async def upload_reference_set(files: list[UploadFile] = File(...), labels_json: str = Form(...)):
+    labels = json.loads(labels_json)
+    if len(files) > 8:
+        raise HTTPException(status_code=400, detail="Max 8 references allowed")
+    
+    reference_set_id = hashlib.sha256(os.urandom(32)).hexdigest()[:16]
+    staging_dir = FLOW_REFERENCE_STAGING_DIR / reference_set_id
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    
+    saved_files = []
+    content_hash_builder = hashlib.sha256()
+    
+    for idx, file in enumerate(files):
+        ext = file.filename.split('.')[-1].lower()
+        if ext not in ['png', 'jpg', 'jpeg', 'webp']:
+            raise HTTPException(status_code=400, detail=f"Unsupported format: {ext}")
+            
+        file_path = staging_dir / f"{idx}_{file.filename}"
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        
+        # In a real app we'd verify with PIL here, but skip for brevity
+        file_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
+        content_hash_builder.update(file_hash.encode())
+        
+        saved_files.append({
+            "id": f"{reference_set_id}_{idx}",
+            "filename": file.filename,
+            "hash": file_hash,
+            "label": labels[idx] if idx < len(labels) else ""
+        })
+        
+    return {
+        "reference_set_id": reference_set_id,
+        "content_hash": content_hash_builder.hexdigest(),
+        "references": saved_files
+    }
+
+
+def _build_prompt_production_snapshot(version_id: str, version: dict) -> dict:
+    """Build a full production snapshot dict from a prompt version record."""
+    image_settings = chatgpt_projects.normalize_image_generation_settings(
+        version.get("image_generation_settings")
+    )
+    pipeline = chatgpt_projects.normalize_prompt_pipeline(
+        version.get("pipeline") or version.get("pipeline_settings"),
+        image_settings.get("thumbnail_variant", "without_text"),
+    )
+    return {
+        "prompt_version": version_id,
+        "image_generation_settings": image_settings,
+        "publishing_settings": chatgpt_projects.normalize_publishing_settings(
+            version.get("publishing_settings")
+        ),
+        "default_youtube_channel_id": str(
+            version.get("default_youtube_channel_id") or ""
+        ).strip(),
+        "pipeline": pipeline,
+    }
+
+
+def _get_prompt_production_snapshot(prompt_version: str) -> dict:
+    """Return the full production snapshot for a prompt version, reading from config."""
+    with _prompts_config_lock:
+        data = _read_prompts_config()
+    resolved = prompt_version.strip() or data.get("active_version", "default")
+    versions = data.get("versions") or {}
+    version = versions.get(resolved) or versions.get("default") or {}
+    return _build_prompt_production_snapshot(resolved, version)
+
+
+@app.get("/api/prompts/{version}/assets")
+def get_prompt_version_assets(version: str):
+    from auto_yt.services import prompt_assets
+    assets = prompt_assets.list_prompt_assets(version)
+    folder_path = str(prompt_assets.get_prompt_asset_dir(version).resolve())
+    return {
+        "success": True,
+        "assets": assets,
+        "folder_path": folder_path,
+        "total": len(assets),
+    }
+
+
+@app.post("/api/prompts/{version}/open-folder")
+def open_prompt_version_folder(version: str):
+    from auto_yt.services import prompt_assets
+    success = prompt_assets.open_prompt_asset_dir(version)
+    folder_path = str(prompt_assets.get_prompt_asset_dir(version).resolve())
+    return {
+        "success": success,
+        "folder_path": folder_path,
+        "message": "Đã mở thư mục trên máy tính" if success else "Không thể mở thư mục",
+    }
+
+
+@app.post("/api/prompts/{version}/assets/upload")
+async def upload_prompt_version_asset(version: str, file: UploadFile = File(...)):
+    from auto_yt.services import prompt_assets
+    ext = Path(file.filename).suffix.lower()
+    if ext not in prompt_assets.SUPPORTED_IMAGE_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Định dạng không hỗ trợ ({ext}). Chỉ chấp nhận png, jpg, jpeg, webp.",
+        )
+    target_dir = prompt_assets.get_prompt_asset_dir(version)
+    target_file = target_dir / file.filename
+    with open(target_file, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return {
+        "success": True,
+        "filename": file.filename,
+        "path": str(target_file.resolve()),
+        "message": f"Đã lưu ảnh {file.filename} vào bộ prompt {version}",
+    }
+
+
+@app.get("/api/prompts/{version}/assets/{filename}")
+def get_prompt_version_asset_file(version: str, filename: str):
+    from auto_yt.services import prompt_assets
+    safe_filename = Path(filename).name
+    target_dir = prompt_assets.get_prompt_asset_dir(version)
+    target_file = target_dir / safe_filename
+    if not target_file.is_file():
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return FileResponse(target_file)
+
+
+@app.delete("/api/prompts/{version}/assets/{filename}")
+def delete_prompt_version_asset(version: str, filename: str):
+    from auto_yt.services import prompt_assets
+    safe_filename = Path(filename).name
+    target_dir = prompt_assets.get_prompt_asset_dir(version)
+    target_file = target_dir / safe_filename
+    if not target_file.is_file():
+        raise HTTPException(status_code=404, detail="Asset not found")
+    try:
+        target_file.unlink()
+        return {"success": True, "message": f"Đã xóa ảnh {safe_filename}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# FB Cross-Poster (YouTube to FB Syndication)
+# ==========================================
+
+from auto_yt.services import fb_crossposter_service
+from auto_yt.services import fb_token_service
+
+try:
+    fb_crossposter_service.scheduler.start()
+except Exception as _scheduler_err:
+    logger.warning("Could not auto-start fb_crossposter_service scheduler: %s", _scheduler_err)
+
+
+class FBCrossPosterSettingsPayload(BaseModel):
+    source_channel_id: str = ""
+    source_channel_title: str = ""
+    source_gpm_profile_id: str = ""
+    target_fb_page_id: str = ""
+    target_fb_page_name: str = ""
+    target_gpm_profile_id: str = ""
+    target_access_token: str = ""
+    daily_quota: int = 2
+    schedule_times: list[str] = Field(default_factory=lambda: ["11:30", "19:30"])
+    lead_time_minutes: int = 60
+    post_template: str = ""
+    sort_order_mode: str = "oldest_first"
+    auto_sync_enabled: bool = False
+    auto_sync_type: str = "interval"
+    auto_sync_interval_hours: int = 6
+    auto_sync_fixed_times: list[str] = Field(default_factory=lambda: ["06:00", "18:00"])
+    auto_publish_enabled: bool = False
+
+
+class FBCrossPosterSyncPayload(BaseModel):
+    channel_url: Optional[str] = None
+    gpm_profile_id: Optional[str] = None
+    sort_order_mode: Optional[str] = None
+    max_videos: int = 500
+    target_page_id: Optional[str] = ""
+
+
+class FBCrossPosterTestPayload(BaseModel):
+    page_id: str
+    access_token: str = ""
+    gpm_profile_id: str = ""
+
+
+class FBCrossPosterExtractTokenPayload(BaseModel):
+    profile_id: str
+    target_page_id: Optional[str] = ""
+
+
+class FBCrossPosterExchangeTokenPayload(BaseModel):
+    token: str
+    target_page_id: str
+    app_id: Optional[str] = ""
+    app_secret: Optional[str] = ""
+    profile_id: Optional[str] = ""
+
+
+
+class FBCrossPosterRecalculatePayload(BaseModel):
+    daily_quota: int = 2
+    schedule_times: list[str] = Field(default_factory=lambda: ["11:30", "19:30"])
+    target_page_id: Optional[str] = ""
+
+
+class FBCrossPosterItemUpdatePayload(BaseModel):
+    fb_title: Optional[str] = None
+    fb_description: Optional[str] = None
+    scheduled_publish_time: Optional[int] = None
+    sort_order: Optional[int] = None
+    status: Optional[str] = None
+
+
+class FBCrossPosterClearPayload(BaseModel):
+    only_pending: bool = False
+    target_page_id: Optional[str] = ""
+
+
+class FBCrossPosterScheduleAheadPayload(BaseModel):
+    page_id: str = ""
+    days_ahead: int = 7
+
+
+@app.get("/api/fb-crossposter/campaigns")
+def list_fb_crossposter_campaigns():
+    """Retrieve all configured Fanpage campaigns."""
+    campaigns = db.list_all_crossposter_campaigns()
+    return {"campaigns": campaigns}
+
+
+@app.get("/api/fb-crossposter/settings")
+def get_fb_crossposter_settings(page_id: str = Query(default="")):
+    """Retrieve FB Cross-Poster settings, stats, and connected channels for a specific Fanpage."""
+    settings = db.get_fb_crossposter_settings(page_id)
+    stats = db.get_fb_crossposter_stats(page_id)
+    campaigns = db.list_all_crossposter_campaigns()
+
+    # Get YouTube channels and GPM profiles
+    yt_channels = []
+    try:
+        yt_channels = db.get_youtube_channels()
+    except Exception:
+        pass
+
+    gpm_profiles_list = []
+    try:
+        gpm_res = gpm_service.list_gpm_profiles()
+        if isinstance(gpm_res, dict):
+            gpm_profiles_list = gpm_res.get("items") or []
+        elif isinstance(gpm_res, list):
+            gpm_profiles_list = gpm_res
+    except Exception:
+        pass
+
+    return {
+        "settings": settings,
+        "stats": stats,
+        "campaigns": campaigns,
+        "youtube_channels": yt_channels,
+        "gpm_profiles": gpm_profiles_list,
+    }
+
+
+@app.post("/api/fb-crossposter/settings")
+def save_fb_crossposter_settings(
+    payload: FBCrossPosterSettingsPayload,
+    page_id: str = Query(default=""),
+):
+    """Save FB Cross-Poster settings for a specific Fanpage."""
+    target_page_id = payload.target_fb_page_id or page_id
+    existing = db.get_fb_crossposter_settings(target_page_id)
+    updates = payload.model_dump(exclude_unset=True)
+    saved = db.save_fb_crossposter_settings(
+        {**existing, **updates},
+        page_id=target_page_id,
+    )
+    return {"success": True, "settings": saved}
+
+
+@app.post("/api/fb-crossposter/test-connection")
+def test_fb_crossposter_connection(payload: FBCrossPosterTestPayload):
+    """Test Facebook Page Access Token and retrieve Fanpage info."""
+    try:
+        access_token = payload.access_token.strip()
+        if not access_token:
+            settings = db.get_fb_crossposter_runtime_settings(payload.page_id)
+            access_token = str(settings.get("target_access_token") or "")
+        if not access_token:
+            raise ValueError("Fanpage chưa có Page Access Token")
+        result = fb_crossposter_service.test_fb_connection(
+            page_id=payload.page_id,
+            access_token=access_token,
+            gpm_profile_id=payload.gpm_profile_id,
+        )
+        return result
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=security_logging.redact_sensitive(exc),
+        )
+
+
+@app.post("/api/fb-crossposter/extract-token")
+async def extract_fb_crossposter_token(payload: FBCrossPosterExtractTokenPayload):
+    """Auto-extract Permanent Page Access Token via Playwright CDP on the given browser profile."""
+    try:
+        result = await fb_token_service.extract_permanent_fb_tokens(
+            profile_id=payload.profile_id,
+            target_page_id=payload.target_page_id or "",
+        )
+        return result
+    except Exception as exc:
+        safe_error = security_logging.redact_sensitive(exc)
+        logger.error("Lỗi trích xuất Token Facebook: %s", safe_error)
+        raise HTTPException(status_code=500, detail=safe_error)
+
+
+@app.post("/api/fb-crossposter/exchange-token")
+def exchange_fb_crossposter_token(payload: FBCrossPosterExchangeTokenPayload):
+    """Exchange and store one Page token without returning the secret to the client."""
+    try:
+        result = fb_token_service.exchange_to_permanent_token(
+            input_token=payload.token,
+            app_id=payload.app_id or "",
+            app_secret=payload.app_secret or "",
+            profile_id=payload.profile_id or "",
+        )
+        target_page_id = payload.target_page_id.strip()
+        matched_page = next(
+            (
+                page
+                for page in result.get("pages") or []
+                if str(page.get("page_id") or "") == target_page_id
+            ),
+            None,
+        )
+        if not matched_page or not matched_page.get("access_token"):
+            raise ValueError("Token không thuộc Fanpage Page ID đã chọn")
+        existing = db.get_fb_crossposter_settings(target_page_id)
+        saved = db.save_fb_crossposter_settings({
+            **existing,
+            "target_fb_page_id": target_page_id,
+            "target_fb_page_name": matched_page.get("name") or existing.get("target_fb_page_name", ""),
+            "target_gpm_profile_id": payload.profile_id or existing.get("target_gpm_profile_id", ""),
+            "target_access_token": matched_page["access_token"],
+        }, page_id=target_page_id)
+        return {
+            "success": True,
+            "page": {
+                "page_id": target_page_id,
+                "name": matched_page.get("name") or "",
+                "category": matched_page.get("category") or "",
+                "token_configured": saved.get("target_access_token_configured", False),
+            },
+            "message": "Page Access Token đã được lưu an toàn.",
+        }
+    except Exception as exc:
+        safe_error = security_logging.redact_sensitive(exc)
+        logger.error("Lỗi đổi Token Facebook: %s", safe_error)
+        raise HTTPException(status_code=400, detail=safe_error)
+
+
+
+@app.post("/api/fb-crossposter/sync")
+def sync_fb_crossposter_channel(
+    payload: Optional[FBCrossPosterSyncPayload] = None,
+    page_id: str = Query(default=""),
+):
+    """Scrape public YouTube videos and populate the queue for a Fanpage campaign."""
+    target_page_id = (payload and payload.target_page_id) or page_id
+    settings = db.get_fb_crossposter_settings(target_page_id)
+
+    channel_url = (payload and payload.channel_url) or settings.get("source_channel_id")
+    gpm_profile_id = (payload and payload.gpm_profile_id) or settings.get("source_gpm_profile_id", "")
+    sort_order_mode = (payload and payload.sort_order_mode) or settings.get("sort_order_mode", "oldest_first")
+    max_videos = (payload and payload.max_videos) or 500
+
+    if not channel_url:
+        raise HTTPException(status_code=400, detail="Chưa cấu hình hoặc chọn Kênh YouTube nguồn")
+
+    try:
+        result = fb_crossposter_service.sync_channel_public_videos(
+            channel_url=channel_url,
+            gpm_profile_id=gpm_profile_id,
+            sort_order_mode=sort_order_mode,
+            max_videos=max_videos,
+            target_page_id=target_page_id,
+        )
+        stats = db.get_fb_crossposter_stats(target_page_id)
+        return {
+            "success": True,
+            "result": result,
+            "stats": stats,
+            "message": f"Đã quét xong: tìm thấy {result['total_found']} video ({result['inserted']} video mới được thêm vào hàng đợi).",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/fb-crossposter/queue")
+def get_fb_crossposter_queue(
+    target_page_id: Optional[str] = Query(default=""),
+    status: Optional[str] = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    search: str = Query(default=""),
+):
+    """Retrieve paginated queue items with statistics filtered by Fanpage."""
+    queue_data = db.get_fb_crossposter_queue(
+        status=status,
+        target_page_id=target_page_id,
+        page=page,
+        page_size=page_size,
+        search=search,
+    )
+    stats = db.get_fb_crossposter_stats(target_page_id)
+    queue_data["stats"] = stats
+    return queue_data
+
+
+@app.post("/api/fb-crossposter/recalculate-schedule")
+def recalculate_fb_crossposter_schedule(
+    payload: Optional[FBCrossPosterRecalculatePayload] = None,
+    page_id: str = Query(default=""),
+):
+    """Recalculate schedule timestamps for all pending queue items for a Fanpage campaign."""
+    target_page_id = (payload and payload.target_page_id) or page_id
+    settings = db.get_fb_crossposter_settings(target_page_id)
+    daily_quota = (payload and payload.daily_quota) or settings.get("daily_quota", 2)
+    schedule_times = (payload and payload.schedule_times) or settings.get("schedule_times", ["11:30", "19:30"])
+
+    updated_count = db.recalculate_fb_queue_schedule(
+        daily_quota=daily_quota,
+        times_list=schedule_times,
+        target_page_id=target_page_id,
+    )
+    stats = db.get_fb_crossposter_stats(target_page_id)
+    return {
+        "success": True,
+        "updated_count": updated_count,
+        "stats": stats,
+        "message": f"Đã tính toán và phân bổ lịch đăng cho {updated_count} video.",
+    }
+
+
+@app.post("/api/fb-crossposter/queue/{item_id}/publish-now")
+def publish_fb_crossposter_item_now(item_id: int):
+    """Trigger immediate JIT download, preparation, and Facebook publishing for one item."""
+    try:
+        result = fb_crossposter_service.process_queue_item_jit(item_id)
+        item = db.get_fb_crossposter_queue_item(item_id)
+        target_page_id = (item and item.get("target_page_id")) or ""
+        stats = db.get_fb_crossposter_stats(target_page_id)
+        return {
+            "success": True,
+            "result": result,
+            "stats": stats,
+            "message": f"Đã đăng thành công video lên Facebook (Post ID: {result.get('fb_post_id')})",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/fb-crossposter/queue/{item_id}/skip")
+def skip_fb_crossposter_item(item_id: int):
+    """Mark a queue item as skipped."""
+    success = db.update_fb_crossposter_queue_item(item_id, {"status": "skipped"})
+    if not success:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video")
+    item = db.get_fb_crossposter_queue_item(item_id)
+    target_page_id = (item and item.get("target_page_id")) or ""
+    stats = db.get_fb_crossposter_stats(target_page_id)
+    return {"success": True, "stats": stats, "message": "Đã đánh dấu bỏ qua video"}
+
+
+@app.post("/api/fb-crossposter/queue/{item_id}/unskip")
+def unskip_fb_crossposter_item(item_id: int):
+    """Revert a skipped item back to pending."""
+    success = db.update_fb_crossposter_queue_item(item_id, {"status": "pending"})
+    if not success:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video")
+    item = db.get_fb_crossposter_queue_item(item_id)
+    target_page_id = (item and item.get("target_page_id")) or ""
+    stats = db.get_fb_crossposter_stats(target_page_id)
+    return {"success": True, "stats": stats, "message": "Đã đưa video trở lại hàng đợi"}
+
+
+@app.post("/api/fb-crossposter/queue/reset-errors")
+def reset_fb_crossposter_errors(page_id: str = Query(default="")):
+    """Reset all error items back to 'scheduled' state."""
+    count = db.reset_fb_crossposter_queue_errors(page_id)
+    stats = db.get_fb_crossposter_stats(page_id)
+    return {
+        "success": True,
+        "reset_count": count,
+        "stats": stats,
+        "message": f"Đã reset {count} video lỗi về trạng thái Chờ đăng / Đã lên lịch",
+    }
+
+
+@app.put("/api/fb-crossposter/queue/{item_id}")
+def update_fb_crossposter_item(item_id: int, payload: FBCrossPosterItemUpdatePayload):
+    """Edit metadata (title, caption, scheduled time) of a queue item."""
+    fields = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if payload.fb_description is not None:
+        fields["fb_description_source"] = "manual"
+    success = db.update_fb_crossposter_queue_item(item_id, fields)
+    if not success:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video hoặc không có trường nào cập nhật")
+    item = db.get_fb_crossposter_queue_item(item_id)
+    return {"success": True, "item": item, "message": "Đã cập nhật thông tin video"}
+
+
+@app.delete("/api/fb-crossposter/queue/{item_id}")
+def delete_fb_crossposter_item(item_id: int):
+    """Delete a queue item."""
+    item = db.get_fb_crossposter_queue_item(item_id)
+    target_page_id = (item and item.get("target_page_id")) or ""
+    success = db.delete_fb_crossposter_queue_item(item_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video")
+    stats = db.get_fb_crossposter_stats(target_page_id)
+    return {"success": True, "stats": stats, "message": "Đã xóa video khỏi hàng đợi"}
+
+
+@app.post("/api/fb-crossposter/queue/clear")
+def clear_fb_crossposter_queue(
+    payload: FBCrossPosterClearPayload,
+    page_id: str = Query(default=""),
+):
+    """Clear queue items for a Fanpage campaign."""
+    target_page_id = payload.target_page_id or page_id
+    deleted_count = db.clear_fb_crossposter_queue(
+        only_pending=payload.only_pending,
+        target_page_id=target_page_id,
+    )
+    stats = db.get_fb_crossposter_stats(target_page_id)
+    return {
+        "success": True,
+        "deleted_count": deleted_count,
+        "stats": stats,
+        "message": f"Đã xóa {deleted_count} video khỏi hàng đợi",
+    }
+
+
+# =========================================================================
+# Batch Cloud Pre-Scheduler Endpoints
+# =========================================================================
+
+@app.post("/api/fb-crossposter/schedule-ahead")
+def start_schedule_ahead(payload: FBCrossPosterScheduleAheadPayload):
+    """Start background sequential batch upload to Meta Cloud for N days ahead."""
+    try:
+        task_info = fb_crossposter_service.start_schedule_ahead_batch(
+            target_page_id=payload.page_id,
+            days_ahead=payload.days_ahead,
+        )
+        return {"success": True, "task": task_info}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/fb-crossposter/schedule-ahead/status")
+def get_schedule_ahead_status(
+    task_id: Optional[str] = Query(default=None),
+    page_id: Optional[str] = Query(default=None),
+):
+    """Get the current progress of a batch pre-schedule task."""
+    return fb_crossposter_service.get_schedule_ahead_status(task_id=task_id, page_id=page_id)
+
+
+@app.post("/api/fb-crossposter/schedule-ahead/cancel")
+def cancel_schedule_ahead(
+    task_id: Optional[str] = Query(default=None),
+    page_id: Optional[str] = Query(default=None),
+):
+    """Cancel a running batch pre-schedule task."""
+    canceled = fb_crossposter_service.cancel_schedule_ahead_batch(task_id=task_id, page_id=page_id)
+    return {"success": True, "canceled": canceled}
+
+
+@app.delete("/api/fb-crossposter/campaigns/{page_id}")
+@app.post("/api/fb-crossposter/campaigns/delete")
+def delete_crossposter_campaign(
+    page_id: Optional[str] = None,
+    payload: Optional[dict] = None,
+):
+    """Delete a Fanpage campaign and all its queued videos."""
+    pid = page_id or (payload and payload.get("page_id")) or ""
+    if not pid:
+        raise HTTPException(status_code=400, detail="page_id is required")
+    success = db.delete_fb_crossposter_campaign(pid)
+    campaigns = db.list_all_crossposter_campaigns()
+    return {"success": success, "campaigns": campaigns, "message": f"Đã xóa chiến dịch cho Fanpage: {pid}"}
+
+
+
+

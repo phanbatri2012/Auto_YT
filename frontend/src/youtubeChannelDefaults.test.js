@@ -75,6 +75,16 @@ test('channel settings expose safe automatic reply scheduling controls', () => {
   assert.match(channelSettingsSource, /reply_paused/)
 })
 
+test('channel settings expose timezone-aware video publication slots', () => {
+  assert.match(channelSettingsSource, /publication_timezone/)
+  assert.match(channelSettingsSource, /publication_slots/)
+  assert.match(channelSettingsSource, /publication_daily_limit/)
+  assert.match(channelSettingsSource, /publication_lead_minutes/)
+  assert.match(channelSettingsSource, /publication_paused/)
+  assert.match(channelSettingsSource, /public_upload_verified/)
+  assert.match(channelSettingsSource, /Thêm khung giờ đăng/)
+})
+
 test('legacy video import supports channel-wide selection with exact dedupe states', () => {
   assert.match(commentsSource, /api\/youtube-comments\/import-preview/)
   assert.match(commentsSource, /api\/youtube-comments\/import/)
@@ -103,14 +113,12 @@ test('channel settings show only the channel assigned to the selected prompt', (
   assert.match(channelSettingsSource, /Chọn bộ prompt để cài đặt kênh/)
   assert.match(channelSettingsSource, /selectedPrompt\?\.default_youtube_channel_id/)
   assert.match(channelSettingsSource, /selectedChannel && \[selectedChannel\]\.map/)
-  assert.match(settingsSource, /promptVersions=\{promptsData\.versions\}/)
-  assert.match(settingsSource, /activePromptVersion=\{activeVersion\}/)
 })
 
 test('channel reconnect is locked to its channel and named OAuth client', () => {
   assert.match(channelSettingsSource, /client_name/)
   assert.match(channelSettingsSource, /expected_channel_id/)
-  assert.match(channelSettingsSource, /oauth_client_choice: channel\.oauth_client_id \|\| ''/)
+  assert.match(channelSettingsSource, /oauth_client_choice: channel\.oauth_client_id/)
   assert.match(channelSettingsSource, /Kết nối lại đúng kênh này/)
   assert.match(channelSettingsSource, /Tên hiện trên màn hình Google là tên ứng dụng OAuth/)
 })

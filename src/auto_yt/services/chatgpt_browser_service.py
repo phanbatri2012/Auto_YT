@@ -57,7 +57,7 @@ COMMON_BROWSER_ARGS = (
     "--no-default-browser-check",
 )
 
-_manager_lock = threading.Lock()
+_manager_lock = threading.RLock()
 
 
 def _utc_now() -> str:
@@ -238,36 +238,23 @@ def _service_environment() -> dict[str, str]:
 
 
 def _spawn_service_process() -> None:
+    from auto_yt.services.win32_window import spawn_service_on_interactive_desktop
+
     SERVICE_LOG_DIR.mkdir(parents=True, exist_ok=True)
     stdout_path = SERVICE_LOG_DIR / "chatgpt-browser-service.stdout.log"
     stderr_path = SERVICE_LOG_DIR / "chatgpt-browser-service.stderr.log"
-    creation_flags = 0
-    startup_info = None
-    if sys.platform == "win32":
-        creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        startup_info = subprocess.STARTUPINFO()
-        startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startup_info.wShowWindow = subprocess.SW_HIDE
-    with (
-        stdout_path.open("a", encoding="utf-8") as stdout_handle,
-        stderr_path.open("a", encoding="utf-8") as stderr_handle,
-    ):
-        subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "auto_yt.services.chatgpt_browser_service",
-                "--serve",
-            ],
-            cwd=str(PROJECT_ROOT),
-            env=_service_environment(),
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            creationflags=creation_flags,
-            startupinfo=startup_info,
-            close_fds=True,
-        )
+    spawn_service_on_interactive_desktop(
+        [
+            sys.executable,
+            "-m",
+            "auto_yt.services.chatgpt_browser_service",
+            "--serve",
+        ],
+        cwd=PROJECT_ROOT,
+        env=_service_environment(),
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+    )
 
 
 def start_browser_service(
@@ -345,13 +332,26 @@ def _visible_window_bounds() -> dict[str, int]:
 def _set_cdp_window_visibility(endpoint: str, visible: bool) -> None:
     """Move the existing Chromium window; never launch or replace a browser."""
     from playwright.sync_api import sync_playwright
+    from auto_yt.services.win32_window import set_desktop_window_visibility
 
+    browser_pids: set[int] = set()
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(endpoint)
         if not browser.contexts:
             raise RuntimeError("Browser Service chưa có browser context.")
         context = browser.contexts[0]
         page = context.pages[0] if context.pages else context.new_page()
+
+        try:
+            browser_cdp = browser.new_browser_cdp_session()
+            sys_info = browser_cdp.send("SystemInfo.getProcessInfo")
+            for proc in sys_info.get("processInfo", []):
+                proc_id = proc.get("id")
+                if isinstance(proc_id, int) and proc_id > 0:
+                    browser_pids.add(proc_id)
+        except Exception:
+            pass
+
         session = context.new_cdp_session(page)
         window_id = session.send("Browser.getWindowForTarget")["windowId"]
         session.send(
@@ -363,6 +363,10 @@ def _set_cdp_window_visibility(endpoint: str, visible: bool) -> None:
                 "Browser.setWindowBounds",
                 {"windowId": window_id, "bounds": _visible_window_bounds()},
             )
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
         else:
             session.send(
                 "Browser.setWindowBounds",
@@ -381,9 +385,19 @@ def _set_cdp_window_visibility(endpoint: str, visible: bool) -> None:
                 {"windowId": window_id, "bounds": {"windowState": "minimized"}},
             )
 
+    if sys.platform == "win32" and browser_pids:
+        set_desktop_window_visibility(browser_pids, visible)
+
 
 def set_browser_service_window_visibility(visible: bool) -> dict:
     """Show or hide the one shared browser without touching the active page/job."""
+    if visible:
+        status = get_browser_service_status()
+        if not status.get("connected"):
+            status = start_browser_service()
+            if not status.get("connected"):
+                return status
+
     with _manager_lock:
         status = get_browser_service_status()
         if not status.get("connected"):

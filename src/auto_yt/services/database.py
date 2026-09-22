@@ -3,6 +3,7 @@ import datetime
 import json
 import re
 import unicodedata
+import uuid
 from pathlib import Path
 
 # Fix the path to point correctly from where the app runs
@@ -167,6 +168,32 @@ def build_video_search_text(
         )
     )
 
+
+
+VIDEO_PRODUCTION_BACKUP_SUFFIX = ".pre_video_production_v1.bak"
+
+def _backup_database_before_video_production() -> None:
+    """Create one consistent backup before adding production workflow tables."""
+    if not DB_PATH.exists():
+        return
+    backup_path = DB_PATH.with_name(DB_PATH.name + VIDEO_PRODUCTION_BACKUP_SUFFIX)
+    if backup_path.exists():
+        return
+    source = sqlite3.connect(str(DB_PATH))
+    try:
+        existing = source.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'video_artifacts'"
+        ).fetchone()
+        if existing:
+            return
+        destination = sqlite3.connect(str(backup_path))
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
 
 def _remove_orphan_video_dependencies(connection: sqlite3.Connection) -> dict:
     removed = {}
@@ -757,9 +784,312 @@ def init_db():
         "UPDATE videos SET search_text = ? WHERE id = ?",
         search_text_updates,
     )
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS fb_crossposter_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_channel_id TEXT DEFAULT '',
+            source_channel_title TEXT DEFAULT '',
+            source_gpm_profile_id TEXT DEFAULT '',
+            target_fb_page_id TEXT DEFAULT '',
+            target_fb_page_name TEXT DEFAULT '',
+            target_gpm_profile_id TEXT DEFAULT '',
+            target_access_token TEXT DEFAULT '',
+            target_access_token_encrypted TEXT DEFAULT '',
+            daily_quota INTEGER DEFAULT 2,
+            schedule_times_json TEXT DEFAULT '["11:30", "19:30"]',
+            lead_time_minutes INTEGER DEFAULT 60,
+            post_template TEXT DEFAULT '',
+            sort_order_mode TEXT DEFAULT 'oldest_first',
+            auto_sync_enabled INTEGER DEFAULT 0,
+            auto_sync_type TEXT DEFAULT 'interval',
+            auto_sync_interval_hours INTEGER DEFAULT 6,
+            auto_sync_fixed_times_json TEXT DEFAULT '["06:00", "18:00"]',
+            last_synced_at TEXT DEFAULT '',
+            auto_publish_enabled INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT ''
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS fb_crossposter_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_page_id TEXT DEFAULT '',
+            youtube_id TEXT NOT NULL,
+            youtube_url TEXT NOT NULL,
+            original_title TEXT NOT NULL,
+            original_description TEXT DEFAULT '',
+            original_tags_json TEXT DEFAULT '[]',
+            thumbnail_url TEXT DEFAULT '',
+            youtube_upload_date TEXT DEFAULT '',
+            fb_title TEXT DEFAULT '',
+            fb_description TEXT DEFAULT '',
+            fb_description_source TEXT DEFAULT '',
+            status TEXT DEFAULT 'pending',
+            scheduled_publish_time INTEGER DEFAULT 0,
+            fb_post_id TEXT DEFAULT '',
+            error_message TEXT DEFAULT '',
+            sort_order INTEGER DEFAULT 0,
+            file_size_bytes INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT '',
+            updated_at TEXT DEFAULT '',
+            UNIQUE(youtube_id, target_page_id)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_fb_crossposter_queue_status ON fb_crossposter_queue(status)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_fb_crossposter_queue_sort ON fb_crossposter_queue(sort_order)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_fb_queue_page_status ON fb_crossposter_queue(target_page_id, status, scheduled_publish_time)")
+
+    try:
+        c.execute(
+            "ALTER TABLE fb_crossposter_settings "
+            "ADD COLUMN target_access_token_encrypted TEXT DEFAULT ''"
+        )
+    except sqlite3.OperationalError:
+        pass
+    _migrate_fb_crossposter_token_storage(conn)
+
+    _backup_database_before_video_production()
+
+    # Video Production columns
+    for column_definition in (
+        "production_snapshot_json TEXT NOT NULL DEFAULT '{}'",
+        "render_status TEXT NOT NULL DEFAULT ''",
+        "publish_status TEXT NOT NULL DEFAULT ''",
+        "current_stage TEXT NOT NULL DEFAULT ''",
+        "production_progress TEXT NOT NULL DEFAULT ''",
+        "blocking_reason TEXT NOT NULL DEFAULT ''",
+        "flow_project_url TEXT DEFAULT ''",
+        "flow_scene_count INTEGER DEFAULT 0",
+        "flow_completed_scenes INTEGER DEFAULT 0",
+    ):
+        try:
+            c.execute(f"ALTER TABLE videos ADD COLUMN {column_definition}")
+        except sqlite3.OperationalError:
+            pass
+
+    # YouTube Channel publication columns
+    for column_definition in (
+        "publication_timezone TEXT DEFAULT 'Asia/Ho_Chi_Minh'",
+        "publication_slots_json TEXT DEFAULT '[]'",
+        "publication_daily_limit INTEGER DEFAULT 1",
+        "publication_lead_minutes INTEGER DEFAULT 120",
+        "publication_paused INTEGER DEFAULT 0",
+        "public_upload_verified INTEGER DEFAULT 0",
+        "gpm_profile_id TEXT DEFAULT ''",
+        "gpm_profile_name TEXT DEFAULT ''",
+        "gpm_proxy_info TEXT DEFAULT ''",
+        "interaction_mode TEXT DEFAULT 'gpm_browser'",
+        "auto_heart INTEGER DEFAULT 1",
+    ):
+        try:
+            c.execute(f"ALTER TABLE youtube_channels ADD COLUMN {column_definition}")
+        except sqlite3.OperationalError:
+            pass
+
+    # Video publication columns
+    for column_definition in (
+        "privacy_status TEXT NOT NULL DEFAULT 'public'",
+        "processing_status TEXT NOT NULL DEFAULT 'succeeded'",
+        "scheduled_at TEXT DEFAULT ''",
+        "artifact_hash TEXT DEFAULT ''",
+    ):
+        try:
+            c.execute(f"ALTER TABLE video_publications ADD COLUMN {column_definition}")
+        except sqlite3.OperationalError:
+            pass
+
+    # New tables
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS video_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id INTEGER NOT NULL,
+            artifact_type TEXT NOT NULL,
+            path TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            mime_type TEXT DEFAULT '',
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            duration_seconds REAL,
+            width INTEGER,
+            height INTEGER,
+            codecs_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE,
+            UNIQUE(video_id, artifact_type, content_hash)
+        )
+    """)
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_video_artifacts_video_type '
+        'ON video_artifacts(video_id, artifact_type, status)'
+    )
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS flow_projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id INTEGER NOT NULL UNIQUE,
+            project_id TEXT NOT NULL,
+            project_url TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (video_id) REFERENCES videos (id) ON DELETE CASCADE
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS youtube_publish_workflows (
+            id TEXT PRIMARY KEY,
+            video_id INTEGER NOT NULL,
+            youtube_channel_id INTEGER NOT NULL,
+            artifact_id INTEGER NOT NULL,
+            system_job_id TEXT DEFAULT '',
+            status TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL DEFAULT '{}',
+            upload_session_encrypted TEXT DEFAULT '',
+            upload_offset INTEGER NOT NULL DEFAULT 0,
+            youtube_video_id TEXT DEFAULT '',
+            publication_id INTEGER,
+            caption_id TEXT DEFAULT '',
+            scheduled_at TEXT DEFAULT '',
+            error TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE,
+            FOREIGN KEY(youtube_channel_id) REFERENCES youtube_channels(id) ON DELETE RESTRICT,
+            FOREIGN KEY(artifact_id) REFERENCES video_artifacts(id) ON DELETE RESTRICT,
+            FOREIGN KEY(publication_id) REFERENCES video_publications(id) ON DELETE SET NULL
+        )
+    """)
+    try:
+        c.execute("ALTER TABLE youtube_publish_workflows ADD COLUMN caption_id TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_publish_workflows_video_channel '
+        'ON youtube_publish_workflows(video_id, youtube_channel_id, status)'
+    )
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+    """)
+    c.execute(
+        "INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+        (PUBLISH_PIPELINE_V1_MIGRATION, utc_now()),
+    )
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS channel_schedule_reservations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            youtube_channel_id INTEGER NOT NULL,
+            workflow_id TEXT NOT NULL UNIQUE,
+            scheduled_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'reserved',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(youtube_channel_id) REFERENCES youtube_channels(id) ON DELETE CASCADE,
+            FOREIGN KEY(workflow_id) REFERENCES youtube_publish_workflows(id) ON DELETE CASCADE,
+            UNIQUE(youtube_channel_id, scheduled_at)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS comfyui_workflow_profiles (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            base_url TEXT NOT NULL,
+            workflow_json TEXT NOT NULL,
+            node_mappings_json TEXT NOT NULL DEFAULT '{}',
+            max_concurrency INTEGER NOT NULL DEFAULT 1,
+            min_width INTEGER NOT NULL DEFAULT 1024,
+            min_height INTEGER NOT NULL DEFAULT 576,
+            timeout_seconds INTEGER NOT NULL DEFAULT 900,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    _migrate_fb_crossposter_queue_composite_unique(conn)
     _remove_orphan_video_dependencies(conn)
     conn.commit()
     conn.close()
+
+def _migrate_fb_crossposter_queue_composite_unique(conn: sqlite3.Connection) -> None:
+    c = conn.cursor()
+    c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='fb_crossposter_queue'")
+    row = c.fetchone()
+    if row and row[0] and "youtube_id TEXT UNIQUE" in row[0]:
+        c.execute("""
+            CREATE TABLE fb_crossposter_queue_migrated (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_page_id TEXT DEFAULT '',
+                youtube_id TEXT NOT NULL,
+                youtube_url TEXT NOT NULL,
+                original_title TEXT NOT NULL,
+                original_description TEXT DEFAULT '',
+                original_tags_json TEXT DEFAULT '[]',
+                thumbnail_url TEXT DEFAULT '',
+                youtube_upload_date TEXT DEFAULT '',
+                fb_title TEXT DEFAULT '',
+                fb_description TEXT DEFAULT '',
+                fb_description_source TEXT DEFAULT '',
+                status TEXT DEFAULT 'pending',
+                scheduled_publish_time INTEGER DEFAULT 0,
+                fb_post_id TEXT DEFAULT '',
+                error_message TEXT DEFAULT '',
+                sort_order INTEGER DEFAULT 0,
+                file_size_bytes INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT '',
+                updated_at TEXT DEFAULT '',
+                UNIQUE(youtube_id, target_page_id)
+            )
+        """)
+        c.execute("""
+            INSERT OR IGNORE INTO fb_crossposter_queue_migrated (
+                id, target_page_id, youtube_id, youtube_url, original_title, original_description,
+                original_tags_json, thumbnail_url, youtube_upload_date, fb_title, fb_description,
+                fb_description_source, status, scheduled_publish_time, fb_post_id, error_message,
+                sort_order, file_size_bytes,
+                created_at, updated_at
+            )
+            SELECT 
+                id, target_page_id, youtube_id, youtube_url, original_title, original_description,
+                original_tags_json, thumbnail_url, youtube_upload_date, fb_title, fb_description,
+                fb_description_source, status, scheduled_publish_time, fb_post_id, error_message,
+                sort_order, file_size_bytes,
+                created_at, updated_at
+            FROM fb_crossposter_queue
+        """)
+        c.execute("DROP TABLE fb_crossposter_queue")
+        c.execute("ALTER TABLE fb_crossposter_queue_migrated RENAME TO fb_crossposter_queue")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_fb_crossposter_queue_status ON fb_crossposter_queue(status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_fb_crossposter_queue_sort ON fb_crossposter_queue(sort_order)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_fb_queue_page_status ON fb_crossposter_queue(target_page_id, status, scheduled_publish_time)")
+
+
+def _migrate_fb_crossposter_token_storage(conn: sqlite3.Connection) -> None:
+    """Move legacy plaintext Page tokens into the user-bound DPAPI column."""
+    from auto_yt.services.secret_store import encrypt_secret
+
+    rows = conn.execute(
+        "SELECT id, target_access_token, target_access_token_encrypted "
+        "FROM fb_crossposter_settings"
+    ).fetchall()
+    for row_id, plaintext_token, encrypted_token in rows:
+        plaintext = str(plaintext_token or "").strip()
+        encrypted = str(encrypted_token or "").strip()
+        if plaintext and not encrypted:
+            encrypted = encrypt_secret(plaintext)
+        if plaintext or encrypted != str(encrypted_token or ""):
+            conn.execute(
+                "UPDATE fb_crossposter_settings "
+                "SET target_access_token = '', target_access_token_encrypted = ? "
+                "WHERE id = ?",
+                (encrypted, row_id),
+            )
+
 
 def save_video(
     url: str,
@@ -1355,6 +1685,12 @@ def save_youtube_channel(
     token_expiry: str = "",
     scope: str = "",
     oauth_client_id: str = "",
+    gpm_profile_id: str = "",
+    gpm_profile_name: str = "",
+    gpm_proxy_info: str = "",
+    interaction_mode: str = "gpm_browser",
+    auto_heart: int = 1,
+    **extra_fields,
 ) -> dict:
     now = utc_now()
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
@@ -1364,8 +1700,9 @@ def save_youtube_channel(
         INSERT INTO youtube_channels (
             channel_id, title, thumbnail_url, access_token_encrypted,
             refresh_token_encrypted, token_expiry, scope, oauth_client_id, status,
+            gpm_profile_id, gpm_profile_name, gpm_proxy_info, interaction_mode, auto_heart,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(channel_id) DO UPDATE SET
             title = excluded.title,
             thumbnail_url = excluded.thumbnail_url,
@@ -1383,6 +1720,18 @@ def save_youtube_channel(
                 THEN youtube_channels.oauth_client_id
                 ELSE excluded.oauth_client_id
             END,
+            gpm_profile_id = CASE
+                WHEN excluded.gpm_profile_id != '' THEN excluded.gpm_profile_id
+                ELSE youtube_channels.gpm_profile_id
+            END,
+            gpm_profile_name = CASE
+                WHEN excluded.gpm_profile_name != '' THEN excluded.gpm_profile_name
+                ELSE youtube_channels.gpm_profile_name
+            END,
+            gpm_proxy_info = CASE
+                WHEN excluded.gpm_proxy_info != '' THEN excluded.gpm_proxy_info
+                ELSE youtube_channels.gpm_proxy_info
+            END,
             status = 'connected',
             updated_at = excluded.updated_at
         ''',
@@ -1395,6 +1744,11 @@ def save_youtube_channel(
             token_expiry,
             scope,
             str(oauth_client_id or "").strip(),
+            gpm_profile_id,
+            gpm_profile_name,
+            gpm_proxy_info,
+            interaction_mode,
+            auto_heart,
             now,
             now,
         ),
@@ -1407,13 +1761,22 @@ def save_youtube_channel(
     return _public_youtube_channel(row)
 
 
-def _public_youtube_channel(row: sqlite3.Row | dict | None) -> dict | None:
+PUBLISH_PIPELINE_V1_MIGRATION = "publish_pipeline_v1"
+
+
+def _public_youtube_channel(row: sqlite3.Row | dict | None, *, include_tokens: bool = False) -> dict | None:
     if row is None:
         return None
     channel = dict(row)
     channel["has_refresh_token"] = bool(channel.get("refresh_token_encrypted"))
-    channel.pop("access_token_encrypted", None)
-    channel.pop("refresh_token_encrypted", None)
+    try:
+        slots = json.loads(channel.get("publication_slots_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        slots = []
+    channel["publication_slots"] = slots if isinstance(slots, list) else []
+    if not include_tokens:
+        channel.pop("access_token_encrypted", None)
+        channel.pop("refresh_token_encrypted", None)
     return channel
 
 
@@ -1424,7 +1787,7 @@ def get_youtube_channel(channel_db_id: int, *, include_tokens: bool = False) -> 
         "SELECT * FROM youtube_channels WHERE id = ?", (channel_db_id,)
     ).fetchone()
     conn.close()
-    return dict(row) if include_tokens and row else _public_youtube_channel(row)
+    return _public_youtube_channel(row, include_tokens=include_tokens)
 
 
 def get_youtube_channel_by_channel_id(
@@ -1443,7 +1806,7 @@ def get_youtube_channel_by_channel_id(
         (normalized_channel_id,),
     ).fetchone()
     conn.close()
-    return dict(row) if include_tokens and row else _public_youtube_channel(row)
+    return _public_youtube_channel(row, include_tokens=include_tokens)
 
 
 def list_youtube_channels() -> list[dict]:
@@ -1480,6 +1843,17 @@ def update_youtube_channel(channel_db_id: int, **changes) -> dict | None:
         "auto_sync",
         "sync_interval_minutes",
         "last_sync_at",
+        "gpm_profile_id",
+        "gpm_profile_name",
+        "gpm_proxy_info",
+        "interaction_mode",
+        "auto_heart",
+        "publication_timezone",
+        "publication_slots_json",
+        "publication_daily_limit",
+        "publication_lead_minutes",
+        "publication_paused",
+        "public_upload_verified",
     }
     invalid = set(changes) - allowed
     if invalid:
@@ -2637,6 +3011,7 @@ def get_system_job(job_id: str) -> dict | None:
 def list_system_jobs(
     limit: int | None = 100,
     job_type: str | None = None,
+    video_id: int | None = None,
 ) -> list[dict]:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -2648,6 +3023,9 @@ def list_system_jobs(
     if job_type:
         filters.append("system_jobs.job_type = ?")
         params.append(job_type)
+    if video_id is not None:
+        filters.append("system_jobs.video_id = ?")
+        params.append(video_id)
     where_clause = f" WHERE {' AND '.join(filters)}"
     limit_clause = " LIMIT ?" if limit is not None else ""
     if limit is not None:
@@ -2693,18 +3071,28 @@ def list_active_system_jobs(job_type: str | None = None) -> list[dict]:
 
 
 def pause_queued_attention_jobs() -> int:
-    """Keep legacy verification jobs paused until the user explicitly resumes.
-
-    Older resume actions left the ``attention_required`` marker attached while
-    changing the status back to queued. On restart that could immediately hit
-    ChatGPT again. New resume actions clear the marker atomically below.
-    """
+    """Keep verification jobs paused and normalize interrupted auto-login state."""
     candidates = list_active_system_jobs()
     paused = 0
     for job in candidates:
-        if job.get("status") not in {"queued", "retry_wait"}:
+        result = dict(job.get("result") or {})
+        if (
+            job.get("status") == "paused"
+            and result.get("automatic_login") == "pending"
+        ):
+            result["automatic_login"] = "interrupted"
+            update_system_job(
+                job["id"],
+                progress=(
+                    "Auto Login tự động bị gián đoạn khi hệ thống khởi động lại; "
+                    "cần xác minh thủ công"
+                ),
+                result_json=result,
+            )
             continue
-        if not (job.get("result") or {}).get("attention_required"):
+        if not result.get("attention_required"):
+            continue
+        if job.get("status") not in {"queued", "retry_wait"}:
             continue
         update_system_job(
             job["id"],
@@ -2715,6 +3103,28 @@ def pause_queued_attention_jobs() -> int:
         )
         paused += 1
     return paused
+
+
+def fail_interrupted_system_jobs(job_type: str, message: str) -> int:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    now = utc_now()
+    try:
+        rows = conn.execute(
+            "SELECT id, cancel_requested FROM system_jobs WHERE job_type = ? AND status IN ('running', 'queued', 'processing')",
+            (job_type,),
+        ).fetchall()
+        count = len(rows)
+        for row in rows:
+            new_status = "canceled" if row["cancel_requested"] else "failed"
+            conn.execute(
+                "UPDATE system_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?",
+                (new_status, message, now, row["id"]),
+            )
+        conn.commit()
+        return count
+    finally:
+        conn.close()
 
 
 def has_active_system_job_for_video(job_type: str, video_id: int) -> bool:
@@ -3185,3 +3595,1615 @@ def get_system_job_queue_position(job_id: str) -> int | None:
 
 # Initialize tables when module is imported
 init_db()
+
+
+# =========================================================================
+# Facebook Cross-Poster Database Methods
+# =========================================================================
+
+def _load_fb_crossposter_settings(page_id: str | None = None) -> dict:
+    """Load one settings row, including encrypted fields for trusted backend callers."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = None
+        if page_id and page_id.strip():
+            row = conn.execute(
+                "SELECT * FROM fb_crossposter_settings WHERE target_fb_page_id = ? LIMIT 1",
+                (page_id.strip(),)
+            ).fetchone()
+        
+        if not row and not (page_id and page_id.strip()):
+            row = conn.execute(
+                "SELECT * FROM fb_crossposter_settings ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+
+        if not row and not (page_id and page_id.strip()):
+            conn.execute("INSERT OR IGNORE INTO fb_crossposter_settings (id, lead_time_minutes) VALUES (1, 60)")
+            conn.commit()
+            row = conn.execute("SELECT * FROM fb_crossposter_settings WHERE id = 1").fetchone()
+        
+        data = dict(row) if row else {
+            "target_fb_page_id": str(page_id or "").strip(),
+            "target_access_token": "",
+            "target_access_token_encrypted": "",
+        }
+        if isinstance(data.get("schedule_times_json"), str):
+            try:
+                data["schedule_times"] = json.loads(data["schedule_times_json"])
+            except Exception:
+                data["schedule_times"] = ["11:30", "19:30"]
+        else:
+            data["schedule_times"] = ["11:30", "19:30"]
+
+        if isinstance(data.get("auto_sync_fixed_times_json"), str):
+            try:
+                data["auto_sync_fixed_times"] = json.loads(data["auto_sync_fixed_times_json"])
+            except Exception:
+                data["auto_sync_fixed_times"] = ["06:00", "18:00"]
+        else:
+            data["auto_sync_fixed_times"] = ["06:00", "18:00"]
+
+        data["lead_time_minutes"] = int(data.get("lead_time_minutes") or 60)
+        return data
+    finally:
+        conn.close()
+
+
+def _safe_fb_crossposter_settings(data: dict) -> dict:
+    safe = dict(data or {})
+    encrypted = str(safe.pop("target_access_token_encrypted", "") or "")
+    legacy = str(safe.pop("target_access_token", "") or "")
+    safe["target_access_token_configured"] = bool(encrypted or legacy)
+    return safe
+
+
+def get_fb_crossposter_settings(page_id: str | None = None) -> dict:
+    """Return Cross-Poster settings without exposing the Page Access Token."""
+    return _safe_fb_crossposter_settings(_load_fb_crossposter_settings(page_id))
+
+
+def get_fb_crossposter_runtime_settings(page_id: str | None = None) -> dict:
+    """Return settings with a decrypted token for backend-only Facebook operations."""
+    from auto_yt.services.secret_store import decrypt_secret
+
+    data = _load_fb_crossposter_settings(page_id)
+    encrypted = str(data.pop("target_access_token_encrypted", "") or "")
+    legacy = str(data.pop("target_access_token", "") or "")
+    data["target_access_token"] = decrypt_secret(encrypted or legacy)
+    data["target_access_token_configured"] = bool(encrypted or legacy)
+    return data
+
+
+def list_all_crossposter_campaigns() -> list[dict]:
+    """List all configured Fanpage campaigns with their queue counts."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("SELECT * FROM fb_crossposter_settings ORDER BY id ASC").fetchall()
+        campaigns = []
+        for r in rows:
+            d = _safe_fb_crossposter_settings(dict(r))
+            pid = d.get("target_fb_page_id", "")
+            d["page_id"] = pid
+            d["page_name"] = d.get("target_fb_page_name") or pid or "Default Fanpage"
+            stats = get_fb_crossposter_stats(target_page_id=pid)
+            d["stats"] = stats
+            try:
+                d["schedule_times"] = json.loads(d.get("schedule_times_json") or "[]")
+            except Exception:
+                d["schedule_times"] = ["11:30", "19:30"]
+            campaigns.append(d)
+        return campaigns
+    finally:
+        conn.close()
+
+
+def save_fb_crossposter_settings(settings: dict, page_id: str | None = None) -> dict:
+    """Save or update FB Cross-Poster settings for a specific Fanpage."""
+    from auto_yt.services.secret_store import encrypt_secret
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    now_iso = datetime.datetime.now().isoformat()
+    target_page_id = (page_id or settings.get("target_fb_page_id") or "").strip()
+    try:
+        schedule_times = settings.get("schedule_times", ["11:30", "19:30"])
+        schedule_times_json = json.dumps(schedule_times) if not isinstance(schedule_times, str) else schedule_times
+
+        fixed_times = settings.get("auto_sync_fixed_times", ["06:00", "18:00"])
+        fixed_times_json = json.dumps(fixed_times) if not isinstance(fixed_times, str) else fixed_times
+
+        lead_time = int(settings.get("lead_time_minutes") or 60)
+
+        existing = None
+        if target_page_id:
+            existing = conn.execute(
+                "SELECT id, target_fb_page_id, last_synced_at, "
+                "target_access_token_encrypted "
+                "FROM fb_crossposter_settings WHERE target_fb_page_id = ?",
+                (target_page_id,)
+            ).fetchone()
+
+        if not existing:
+            first_row = conn.execute(
+                "SELECT id, target_fb_page_id, last_synced_at, "
+                "target_access_token_encrypted "
+                "FROM fb_crossposter_settings ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+            if first_row and (not target_page_id or not first_row["target_fb_page_id"]):
+                existing = first_row
+
+        last_synced_at_val = settings.get("last_synced_at")
+        if last_synced_at_val is None and existing:
+            last_synced_at_val = existing["last_synced_at"] if existing["last_synced_at"] is not None else ""
+        elif last_synced_at_val is None:
+            last_synced_at_val = ""
+
+        supplied_token = str(settings.get("target_access_token") or "").strip()
+        encrypted_token = (
+            encrypt_secret(supplied_token)
+            if supplied_token
+            else str(existing["target_access_token_encrypted"] or "") if existing else ""
+        )
+
+        values = (
+            settings.get("source_channel_id", ""),
+            settings.get("source_channel_title", ""),
+            settings.get("source_gpm_profile_id", ""),
+            target_page_id,
+            settings.get("target_fb_page_name", ""),
+            settings.get("target_gpm_profile_id", ""),
+            encrypted_token,
+            int(settings.get("daily_quota", 2)),
+            schedule_times_json,
+            lead_time,
+            settings.get("post_template", ""),
+            settings.get("sort_order_mode", "oldest_first"),
+            1 if settings.get("auto_sync_enabled") else 0,
+            settings.get("auto_sync_type", "interval"),
+            int(settings.get("auto_sync_interval_hours", 6)),
+            fixed_times_json,
+            last_synced_at_val,
+            1 if settings.get("auto_publish_enabled") else 0,
+            now_iso,
+        )
+
+        if existing:
+            conn.execute("""
+                UPDATE fb_crossposter_settings SET
+                    source_channel_id = ?,
+                    source_channel_title = ?,
+                    source_gpm_profile_id = ?,
+                    target_fb_page_id = ?,
+                    target_fb_page_name = ?,
+                    target_gpm_profile_id = ?,
+                    target_access_token = '',
+                    target_access_token_encrypted = ?,
+                    daily_quota = ?,
+                    schedule_times_json = ?,
+                    lead_time_minutes = ?,
+                    post_template = ?,
+                    sort_order_mode = ?,
+                    auto_sync_enabled = ?,
+                    auto_sync_type = ?,
+                    auto_sync_interval_hours = ?,
+                    auto_sync_fixed_times_json = ?,
+                    last_synced_at = ?,
+                    auto_publish_enabled = ?,
+                    updated_at = ?
+                WHERE id = ?
+            """, (*values, existing["id"]))
+        else:
+            conn.execute("""
+                INSERT INTO fb_crossposter_settings (
+                    source_channel_id, source_channel_title, source_gpm_profile_id,
+                    target_fb_page_id, target_fb_page_name, target_gpm_profile_id,
+                    target_access_token, target_access_token_encrypted,
+                    daily_quota, schedule_times_json, lead_time_minutes, post_template,
+                    sort_order_mode, auto_sync_enabled, auto_sync_type,
+                    auto_sync_interval_hours, auto_sync_fixed_times_json,
+                    last_synced_at, auto_publish_enabled, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, values)
+        conn.commit()
+    finally:
+        conn.close()
+    return get_fb_crossposter_settings(page_id=target_page_id)
+
+
+def upsert_fb_crossposter_queue_items(items: list[dict], target_page_id: str = "") -> dict:
+    """Upsert YouTube videos into fb_crossposter_queue isolated by target_page_id.
+    Preserves status for existing records. Returns count of inserted vs existing.
+    """
+    if not items:
+        return {"inserted": 0, "existing": 0}
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    now_iso = datetime.datetime.now().isoformat()
+    inserted_count = 0
+    existing_count = 0
+    target_pid = (target_page_id or "").strip()
+    seen_in_batch: set[str] = set()
+
+    try:
+        for idx, item in enumerate(items):
+            yt_id = item.get("youtube_id")
+            if not yt_id:
+                continue
+            if yt_id in seen_in_batch:
+                continue
+            seen_in_batch.add(yt_id)
+            tags = item.get("original_tags", [])
+            tags_json = json.dumps(tags, ensure_ascii=False) if isinstance(tags, list) else str(tags)
+            original_description = str(item.get("original_description") or "")
+
+            existing = conn.execute(
+                "SELECT id FROM fb_crossposter_queue WHERE youtube_id = ? AND target_page_id = ?",
+                (yt_id, target_pid)
+            ).fetchone()
+
+            if existing:
+                existing_count += 1
+                conn.execute("""
+                    UPDATE fb_crossposter_queue SET
+                        original_title = ?,
+                        original_description = CASE WHEN ? != '' THEN ? ELSE original_description END,
+                        original_tags_json = CASE WHEN ? != '[]' THEN ? ELSE original_tags_json END,
+                        fb_title = CASE 
+                            WHEN fb_title = original_title OR fb_title = '' OR fb_title IS NULL OR status = 'scheduled' 
+                            THEN ? 
+                            ELSE fb_title 
+                        END,
+                        fb_description = CASE 
+                            WHEN COALESCE(fb_description_source, '') != 'manual'
+                            THEN ?
+                            ELSE fb_description
+                        END,
+                        fb_description_source = CASE
+                            WHEN COALESCE(fb_description_source, '') = 'manual' THEN 'manual'
+                            ELSE 'auto'
+                        END,
+                        thumbnail_url = CASE WHEN ? != '' THEN ? ELSE thumbnail_url END,
+                        youtube_upload_date = ?,
+                        sort_order = ?,
+                        updated_at = ?
+                    WHERE id = ? AND status IN ('pending', 'scheduled')
+                """, (
+                    item.get("original_title", ""),
+                    original_description,
+                    original_description,
+                    tags_json,
+                    tags_json,
+                    item.get("fb_title") or item.get("original_title", ""),
+                    item.get("fb_description", ""),
+                    item.get("thumbnail_url", ""),
+                    item.get("thumbnail_url", ""),
+                    item.get("youtube_upload_date", ""),
+                    item.get("sort_order", idx + 1),
+                    now_iso,
+                    existing[0]
+                ))
+            else:
+                try:
+                    conn.execute("""
+                        INSERT INTO fb_crossposter_queue (
+                            target_page_id, youtube_id, youtube_url, original_title, original_description,
+                            original_tags_json, thumbnail_url, youtube_upload_date,
+                            fb_title, fb_description, fb_description_source, status, sort_order,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    """, (
+                        target_pid,
+                        yt_id,
+                        item.get("youtube_url", f"https://www.youtube.com/watch?v={yt_id}"),
+                        item.get("original_title", ""),
+                        item.get("original_description", ""),
+                        tags_json,
+                        item.get("thumbnail_url", ""),
+                        item.get("youtube_upload_date", ""),
+                        item.get("fb_title", item.get("original_title", "")),
+                        item.get("fb_description", ""),
+                        item.get("fb_description_source", "auto"),
+                        item.get("sort_order", idx + 1),
+                        now_iso,
+                        now_iso
+                    ))
+                    inserted_count += 1
+                except sqlite3.IntegrityError:
+                    existing_count += 1
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"inserted": inserted_count, "existing": existing_count}
+
+
+def get_fb_crossposter_queue(
+    target_page_id: str = "",
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    search: str = ""
+) -> dict:
+    """List queue items with pagination, filtering by target_page_id, and search."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        where_clauses = []
+        params = []
+
+        if target_page_id and target_page_id.strip():
+            where_clauses.append("target_page_id = ?")
+            params.append(target_page_id.strip())
+
+        if status and status != "all":
+            where_clauses.append("status = ?")
+            params.append(status)
+
+        if search.strip():
+            where_clauses.append("(original_title LIKE ? OR fb_title LIKE ? OR youtube_id LIKE ?)")
+            term = f"%{search.strip()}%"
+            params.extend([term, term, term])
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        total_row = conn.execute(
+            f"SELECT COUNT(*) as total FROM fb_crossposter_queue {where_sql}",
+            params
+        ).fetchone()
+        total_items = total_row["total"] if total_row else 0
+
+        offset = max(0, (page - 1) * page_size)
+        query_params = list(params) + [page_size, offset]
+
+        rows = conn.execute(f"""
+            SELECT * FROM fb_crossposter_queue
+            {where_sql}
+            ORDER BY sort_order ASC, id ASC
+            LIMIT ? OFFSET ?
+        """, query_params).fetchall()
+
+        items = []
+        for row in rows:
+            d = dict(row)
+            try:
+                d["original_tags"] = json.loads(d.get("original_tags_json") or "[]")
+            except Exception:
+                d["original_tags"] = []
+            items.append(d)
+
+        return {
+            "items": items,
+            "total": total_items,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": max(1, (total_items + page_size - 1) // page_size)
+        }
+    finally:
+        conn.close()
+
+
+def get_fb_crossposter_queue_item(item_id: int) -> dict | None:
+    """Get a single queue item by ID."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM fb_crossposter_queue WHERE id = ?", (item_id,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["original_tags"] = json.loads(d.get("original_tags_json") or "[]")
+        except Exception:
+            d["original_tags"] = []
+        return d
+    finally:
+        conn.close()
+
+
+def update_fb_crossposter_queue_item(item_id: int, fields: dict) -> bool:
+    """Update specific fields of a queue item."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        allowed = {
+            "fb_title", "fb_description", "status", "scheduled_publish_time",
+            "fb_post_id", "error_message", "sort_order", "file_size_bytes", "target_page_id",
+            "original_title", "original_description", "original_tags_json", "thumbnail_url",
+            "fb_description_source",
+        }
+        updates = []
+        values = []
+        for k, v in fields.items():
+            if k in allowed:
+                updates.append(f"{k} = ?")
+                values.append(v)
+        
+        if not updates:
+            return False
+
+        updates.append("updated_at = ?")
+        values.append(datetime.datetime.now().isoformat())
+        values.append(item_id)
+
+        sql = f"UPDATE fb_crossposter_queue SET {', '.join(updates)} WHERE id = ?"
+        cur = conn.execute(sql, values)
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def delete_fb_crossposter_queue_item(item_id: int) -> bool:
+    """Delete a queue item by ID."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        cur = conn.execute("DELETE FROM fb_crossposter_queue WHERE id = ?", (item_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def clear_fb_crossposter_queue(target_page_id: str = "", only_pending: bool = False) -> int:
+    """Clear queue items for a target_page_id."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        where_clauses = []
+        params = []
+        if target_page_id and target_page_id.strip():
+            where_clauses.append("target_page_id = ?")
+            params.append(target_page_id.strip())
+        if only_pending:
+            where_clauses.append("status IN ('pending', 'error')")
+        
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        cur = conn.execute(f"DELETE FROM fb_crossposter_queue {where_sql}", params)
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def recalculate_fb_queue_schedule(
+    daily_quota: int,
+    times_list: list[str],
+    target_page_id: str = "",
+    start_date: datetime.date | None = None
+) -> int:
+    """Recalculate scheduled_publish_time for pending/scheduled items of a specific Fanpage."""
+    if daily_quota <= 0 or not times_list:
+        return 0
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        where_sql = "WHERE status IN ('pending', 'scheduled') AND (fb_post_id IS NULL OR fb_post_id = '')"
+        params = []
+        if target_page_id and target_page_id.strip():
+            where_sql += " AND target_page_id = ?"
+            params.append(target_page_id.strip())
+        else:
+            where_sql += " AND (target_page_id = '' OR target_page_id IS NULL)"
+
+        rows = conn.execute(f"""
+            SELECT id FROM fb_crossposter_queue
+            {where_sql}
+            ORDER BY sort_order ASC, id ASC
+        """, params).fetchall()
+
+        if not rows:
+            return 0
+
+        now = datetime.datetime.now()
+        current_date = start_date or now.date()
+        time_slots = sorted(times_list)
+        slot_count = len(time_slots)
+
+        slot_index = 0
+        date_offset = 0
+        updated_count = 0
+
+        # If current date is today, find next available time slot (>10 mins in future)
+        if current_date == now.date():
+            found_future_slot = False
+            for s_idx, t_str in enumerate(time_slots):
+                try:
+                    hour, minute = map(int, t_str.split(":"))
+                    slot_dt = datetime.datetime.combine(current_date, datetime.time(hour, minute))
+                    if slot_dt > now + datetime.timedelta(minutes=10):
+                        slot_index = s_idx
+                        found_future_slot = True
+                        break
+                except Exception:
+                    continue
+            if not found_future_slot:
+                date_offset = 1
+                slot_index = 0
+
+        for row in rows:
+            item_id = row[0]
+            target_date = current_date + datetime.timedelta(days=date_offset)
+            t_str = time_slots[slot_index % slot_count]
+            try:
+                hour, minute = map(int, t_str.split(":"))
+                scheduled_dt = datetime.datetime.combine(target_date, datetime.time(hour, minute))
+                scheduled_ts = int(scheduled_dt.timestamp())
+            except Exception:
+                scheduled_ts = int((now + datetime.timedelta(hours=2)).timestamp())
+
+            conn.execute("""
+                UPDATE fb_crossposter_queue
+                SET scheduled_publish_time = ?, status = 'scheduled', updated_at = ?
+                WHERE id = ?
+            """, (scheduled_ts, datetime.datetime.now().isoformat(), item_id))
+            updated_count += 1
+
+            slot_index += 1
+            if slot_index % min(daily_quota, slot_count) == 0:
+                date_offset += 1
+                slot_index = 0
+
+        conn.commit()
+        return updated_count
+    finally:
+        conn.close()
+
+
+def get_fb_crossposter_stats(target_page_id: str = "") -> dict:
+    """Get summary counts of queue statuses filtered by target_page_id."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        where_sql = ""
+        params = []
+        if target_page_id and target_page_id.strip():
+            where_sql = "WHERE target_page_id = ?"
+            params.append(target_page_id.strip())
+
+        rows = conn.execute(f"""
+            SELECT status, COUNT(*) as count
+            FROM fb_crossposter_queue
+            {where_sql}
+            GROUP BY status
+        """, params).fetchall()
+
+        counts = {
+            "total": 0,
+            "pending": 0,
+            "scheduled": 0,
+            "downloading": 0,
+            "uploading": 0,
+            "published": 0,
+            "skipped": 0,
+            "error": 0
+        }
+        for row in rows:
+            st = row["status"]
+            cnt = row["count"]
+            if st in counts:
+                counts[st] = cnt
+            counts["total"] += cnt
+
+        # Next upcoming scheduled item
+        next_where = "status = 'scheduled' AND scheduled_publish_time > ?"
+        next_params = [int(datetime.datetime.now().timestamp())]
+        if target_page_id and target_page_id.strip():
+            next_where += " AND target_page_id = ?"
+            next_params.append(target_page_id.strip())
+
+        next_item = conn.execute(f"""
+            SELECT id, fb_title, original_title, scheduled_publish_time, target_page_id
+            FROM fb_crossposter_queue
+            WHERE {next_where}
+            ORDER BY scheduled_publish_time ASC
+            LIMIT 1
+        """, next_params).fetchone()
+
+        counts["next_scheduled"] = dict(next_item) if next_item else None
+        return counts
+    finally:
+        conn.close()
+
+
+def get_next_queue_items_for_pre_schedule(target_page_id: str, count: int) -> list[dict]:
+    """Retrieve the next K items from the queue for pre-scheduling (including previously failed items)."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        where_sql = "WHERE status IN ('pending', 'scheduled', 'error') AND (fb_post_id IS NULL OR fb_post_id = '')"
+        params = []
+        if target_page_id and target_page_id.strip():
+            where_sql += " AND target_page_id = ?"
+            params.append(target_page_id.strip())
+        params.append(max(1, count))
+
+        rows = conn.execute(f"""
+            SELECT * FROM fb_crossposter_queue
+            {where_sql}
+            ORDER BY sort_order ASC, id ASC
+            LIMIT ?
+        """, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_fb_queue_items_for_schedule_ahead(days_ahead: int, target_page_id: str = "") -> list[dict]:
+    """Retrieve queue items for pre-scheduling based on days_ahead and daily quota."""
+    settings = get_fb_crossposter_settings(target_page_id)
+    daily_quota = settings.get("daily_quota", 2)
+    count = max(1, int(days_ahead) * int(daily_quota))
+    return get_next_queue_items_for_pre_schedule(target_page_id, count)
+
+
+def reset_fb_crossposter_queue_errors(target_page_id: str = "") -> int:
+    """Reset all error items back to 'scheduled' state and clear error messages."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        where_sql = "WHERE status = 'error'"
+        params = []
+        if target_page_id and target_page_id.strip():
+            where_sql += " AND target_page_id = ?"
+            params.append(target_page_id.strip())
+        
+        cursor = conn.execute(f"UPDATE fb_crossposter_queue SET status = 'scheduled', error_message = '' {where_sql}", params)
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        conn.close()
+
+
+def delete_fb_crossposter_campaign(page_id: str) -> bool:
+    """Delete a Fanpage campaign from settings and delete all its queue items."""
+    if not page_id:
+        return False
+    target_pid = page_id.strip()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        conn.execute("DELETE FROM fb_crossposter_settings WHERE target_fb_page_id = ?", (target_pid,))
+        conn.execute("DELETE FROM fb_crossposter_queue WHERE target_page_id = ?", (target_pid,))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+# ==============================================================================
+# Helper & Slugs
+# ==============================================================================
+
+def _slugify(text: str) -> str:
+    normalized = unicodedata.normalize("NFD", text.replace("Đ", "D").replace("đ", "d"))
+    without_accents = "".join(
+        c for c in normalized if unicodedata.category(c) != "Mn"
+    )
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", without_accents.lower()).strip("-")
+    return re.sub(r"-+", "-", cleaned)
+
+
+def extract_generated_video_slug(text: str) -> str:
+    if not text:
+        return ""
+    metadata_match = METADATA_SECTION_PATTERN.search(text)
+    section = metadata_match.group(1) if metadata_match else text
+    lines = section.splitlines()
+    for raw_line in lines:
+        line = raw_line.strip().strip("#*` ")
+        label, separator, inline_value = line.partition(":")
+        norm_label = _normalize_metadata_label(label)
+        if norm_label in {"SLUG", "URL SLUG"}:
+            val = inline_value.strip().strip('"“”\'` ')
+            while ":" in val:
+                val = val.partition(":")[2].strip().strip('"“”\'` ')
+            slug = _slugify(val)
+            if slug:
+                return slug
+    title = extract_generated_video_title(text)
+    if not title:
+        title = text.strip()
+    return _slugify(title)
+
+
+def resolve_render_filename(
+    video_id: int,
+    base_slug: str,
+    output_dir: Path | str | None = None,
+) -> str:
+    target_dir = Path(output_dir) if output_dir else Path("renders")
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        own_artifact = conn.execute(
+            "SELECT path FROM video_artifacts WHERE video_id = ? AND artifact_type = 'final_mp4' ORDER BY id DESC LIMIT 1",
+            (video_id,),
+        ).fetchone()
+        if own_artifact:
+            own_stem = Path(own_artifact["path"]).stem
+            if own_stem == base_slug or own_stem.startswith(f"{base_slug}-"):
+                return own_stem
+
+        other_artifacts = conn.execute(
+            "SELECT video_id, path FROM video_artifacts WHERE video_id != ? AND artifact_type = 'final_mp4'",
+            (video_id,),
+        ).fetchall()
+        used_stems = {Path(row["path"]).stem for row in other_artifacts}
+
+        candidate = base_slug
+        candidate_file = target_dir / f"{candidate}.mp4"
+        if candidate not in used_stems and not candidate_file.exists():
+            return candidate
+
+        index = 1
+        while True:
+            candidate = f"{base_slug}-{index}"
+            candidate_file = target_dir / f"{candidate}.mp4"
+            if candidate not in used_stems and not candidate_file.exists():
+                return candidate
+            index += 1
+    finally:
+        conn.close()
+
+
+def _decode_json_field(value: str, fallback):
+    try:
+        decoded = json.loads(value or "")
+    except (TypeError, json.JSONDecodeError):
+        return fallback
+    return decoded if isinstance(decoded, type(fallback)) else fallback
+
+
+# ==============================================================================
+# Video Artifacts
+# ==============================================================================
+
+def _decode_video_artifact(row: sqlite3.Row | dict | None) -> dict | None:
+    if row is None:
+        return None
+    artifact = dict(row)
+    artifact["codecs"] = _decode_json_field(artifact.pop("codecs_json", "{}"), {})
+    artifact["metadata"] = _decode_json_field(
+        artifact.pop("metadata_json", "{}"), {}
+    )
+    return artifact
+
+
+def upsert_video_artifact(
+    *,
+    video_id: int,
+    artifact_type: str,
+    path: str,
+    content_hash: str,
+    status: str,
+    mime_type: str = "",
+    size_bytes: int = 0,
+    duration_seconds: float | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    codecs: dict | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        INSERT INTO video_artifacts (
+            video_id, artifact_type, path, content_hash, mime_type, size_bytes,
+            duration_seconds, width, height, codecs_json, status, metadata_json,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(video_id, artifact_type, content_hash) DO UPDATE SET
+            path = excluded.path,
+            mime_type = excluded.mime_type,
+            size_bytes = excluded.size_bytes,
+            duration_seconds = excluded.duration_seconds,
+            width = excluded.width,
+            height = excluded.height,
+            codecs_json = excluded.codecs_json,
+            status = excluded.status,
+            metadata_json = excluded.metadata_json,
+            updated_at = excluded.updated_at
+        """,
+        (
+            video_id,
+            artifact_type,
+            path,
+            content_hash,
+            mime_type,
+            max(0, int(size_bytes or 0)),
+            duration_seconds,
+            width,
+            height,
+            json.dumps(codecs or {}, ensure_ascii=False),
+            status,
+            json.dumps(metadata or {}, ensure_ascii=False),
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        """
+        SELECT * FROM video_artifacts
+        WHERE video_id = ? AND artifact_type = ? AND content_hash = ?
+        """,
+        (video_id, artifact_type, content_hash),
+    ).fetchone()
+    conn.close()
+    return _decode_video_artifact(row)
+
+
+def get_video_artifact(artifact_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM video_artifacts WHERE id = ?", (artifact_id,)
+    ).fetchone()
+    conn.close()
+    return _decode_video_artifact(row)
+
+
+def get_latest_video_artifact(
+    video_id: int,
+    artifact_type: str,
+    status: str | None = None,
+) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    filters = ["video_id = ?", "artifact_type = ?"]
+    params: list = [video_id, artifact_type]
+    if status:
+        filters.append("status = ?")
+        params.append(status)
+    row = conn.execute(
+        f"SELECT * FROM video_artifacts WHERE {' AND '.join(filters)} "
+        "ORDER BY updated_at DESC, id DESC LIMIT 1",
+        params,
+    ).fetchone()
+    conn.close()
+    return _decode_video_artifact(row)
+
+
+def list_video_artifacts(
+    video_id: int,
+    artifact_type: str | None = None,
+) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    if artifact_type:
+        if artifact_type.endswith("%") or artifact_type.endswith(":"):
+            prefix = artifact_type.rstrip("%")
+            if not prefix.endswith("%"):
+                prefix = f"{prefix}%"
+            rows = conn.execute(
+                "SELECT * FROM video_artifacts WHERE video_id = ? AND artifact_type LIKE ? ORDER BY id",
+                (video_id, prefix),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM video_artifacts WHERE video_id = ? AND artifact_type = ? ORDER BY id",
+                (video_id, artifact_type),
+            ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM video_artifacts WHERE video_id = ? ORDER BY id",
+            (video_id,),
+        ).fetchall()
+    conn.close()
+    return [_decode_video_artifact(row) for row in rows]
+
+
+def delete_video_artifact(artifact_id: int) -> bool:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    cursor = conn.execute("DELETE FROM video_artifacts WHERE id = ?", (artifact_id,))
+    conn.commit()
+    conn.close()
+    return cursor.rowcount > 0
+
+
+def get_video_ids_with_ready_final_mp4(video_ids: list[int] | set[int]) -> set[int]:
+    if not video_ids:
+        return set()
+    conn = sqlite3.connect(str(DB_PATH))
+    placeholders = ",".join("?" for _ in video_ids)
+    rows = conn.execute(
+        f"SELECT DISTINCT video_id FROM video_artifacts WHERE video_id IN ({placeholders}) AND artifact_type = 'final_mp4' AND status = 'ready'",
+        tuple(video_ids),
+    ).fetchall()
+    conn.close()
+    return {int(row[0]) for row in rows}
+
+
+# ==============================================================================
+# YouTube Publish Workflows & Scheduling
+# ==============================================================================
+
+PUBLISH_WORKFLOW_MUTABLE_FIELDS = {
+    "system_job_id",
+    "status",
+    "stage",
+    "snapshot_json",
+    "upload_session_encrypted",
+    "upload_offset",
+    "youtube_video_id",
+    "publication_id",
+    "caption_id",
+    "scheduled_at",
+    "error",
+}
+PUBLISH_WORKFLOW_REUSABLE_STATUSES = {
+    "queued",
+    "running",
+    "retry_wait",
+    "waiting",
+    "processing",
+    "ready_to_schedule",
+    "uploaded_private",
+    "scheduled",
+    "done",
+    "published",
+    "error",
+    "canceled",
+}
+
+
+def _decode_publish_workflow(row: sqlite3.Row | dict | None) -> dict | None:
+    if row is None:
+        return None
+    workflow = dict(row)
+    workflow["snapshot"] = _decode_json_field(
+        workflow.pop("snapshot_json", "{}"), {}
+    )
+    return workflow
+
+
+def reserve_youtube_publish_workflow(
+    *,
+    video_id: int,
+    youtube_channel_id: int,
+    artifact_id: int,
+    snapshot: dict,
+    workflow_id: str | None = None,
+    system_job_id: str = "",
+) -> tuple[dict, bool]:
+    now = utc_now()
+    if not workflow_id:
+        workflow_id = f"yt-pub-{video_id}-{uuid.uuid4().hex[:8]}"
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        placeholders = ",".join("?" for _ in PUBLISH_WORKFLOW_REUSABLE_STATUSES)
+        existing = conn.execute(
+            f"""
+            SELECT * FROM youtube_publish_workflows
+            WHERE video_id = ? AND youtube_channel_id = ?
+              AND status IN ({placeholders})
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (
+                video_id,
+                youtube_channel_id,
+                *sorted(PUBLISH_WORKFLOW_REUSABLE_STATUSES),
+            ),
+        ).fetchone()
+        if existing is not None:
+            conn.execute("COMMIT")
+            return _decode_publish_workflow(existing), False
+        conn.execute(
+            """
+            INSERT INTO youtube_publish_workflows (
+                id, video_id, youtube_channel_id, artifact_id, system_job_id, status, stage,
+                snapshot_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'queued', 'upload', ?, ?, ?)
+            """,
+            (
+                workflow_id,
+                video_id,
+                youtube_channel_id,
+                artifact_id,
+                system_job_id,
+                json.dumps(snapshot, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM youtube_publish_workflows WHERE id = ?",
+            (workflow_id,),
+        ).fetchone()
+        conn.execute("COMMIT")
+        return _decode_publish_workflow(row), True
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def get_youtube_publish_workflow(workflow_id: str) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM youtube_publish_workflows WHERE id = ?", (workflow_id,)
+    ).fetchone()
+    conn.close()
+    return _decode_publish_workflow(row)
+
+
+def get_latest_youtube_publish_workflow(video_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        SELECT * FROM youtube_publish_workflows
+        WHERE video_id = ? ORDER BY created_at DESC LIMIT 1
+        """,
+        (video_id,),
+    ).fetchone()
+    conn.close()
+    return _decode_publish_workflow(row)
+
+
+def get_youtube_publish_workflow_by_job(system_job_id: str) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM youtube_publish_workflows WHERE system_job_id = ? ORDER BY created_at DESC LIMIT 1",
+        (system_job_id,),
+    ).fetchone()
+    conn.close()
+    return _decode_publish_workflow(row)
+
+
+def get_youtube_publish_workflow_for_video(video_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM youtube_publish_workflows WHERE video_id = ? ORDER BY created_at DESC LIMIT 1",
+        (video_id,),
+    ).fetchone()
+    conn.close()
+    return _decode_publish_workflow(row)
+
+
+def get_youtube_publish_workflows_by_job_ids(job_ids: list[str]) -> dict[str, dict]:
+    if not job_ids:
+        return {}
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    placeholders = ",".join("?" for _ in job_ids)
+    rows = conn.execute(
+        f"SELECT * FROM youtube_publish_workflows WHERE system_job_id IN ({placeholders})",
+        tuple(job_ids),
+    ).fetchall()
+    conn.close()
+    return {
+        row["system_job_id"]: _decode_publish_workflow(row)
+        for row in rows
+        if row["system_job_id"]
+    }
+
+
+def update_youtube_publish_workflow(workflow_id: str, **changes) -> dict | None:
+    invalid = set(changes) - PUBLISH_WORKFLOW_MUTABLE_FIELDS
+    if invalid:
+        raise ValueError(f"Unsupported publish workflow fields: {sorted(invalid)}")
+    if not changes:
+        return get_youtube_publish_workflow(workflow_id)
+    encoded = dict(changes)
+    if "snapshot_json" in encoded and not isinstance(encoded["snapshot_json"], str):
+        encoded["snapshot_json"] = json.dumps(
+            encoded["snapshot_json"], ensure_ascii=False
+        )
+    encoded["updated_at"] = utc_now()
+    assignments = ", ".join(f"{field} = ?" for field in encoded)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.execute(
+        f"UPDATE youtube_publish_workflows SET {assignments} WHERE id = ?",
+        (*encoded.values(), workflow_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_youtube_publish_workflow(workflow_id)
+
+
+def reserve_channel_schedule(
+    *,
+    youtube_channel_id: int,
+    workflow_id: str,
+    scheduled_at: str,
+) -> dict | None:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT * FROM channel_schedule_reservations WHERE workflow_id = ?",
+            (workflow_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["status"] == "canceled":
+                try:
+                    conn.execute(
+                        """
+                        UPDATE channel_schedule_reservations
+                        SET scheduled_at = ?, status = 'reserved', updated_at = ?
+                        WHERE workflow_id = ?
+                        """,
+                        (scheduled_at, now, workflow_id),
+                    )
+                except sqlite3.IntegrityError:
+                    conn.execute("ROLLBACK")
+                    return None
+                existing = conn.execute(
+                    "SELECT * FROM channel_schedule_reservations WHERE workflow_id = ?",
+                    (workflow_id,),
+                ).fetchone()
+            conn.execute("COMMIT")
+            return dict(existing)
+        try:
+            conn.execute(
+                """
+                INSERT INTO channel_schedule_reservations (
+                    youtube_channel_id, workflow_id, scheduled_at, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, 'reserved', ?, ?)
+                """,
+                (youtube_channel_id, workflow_id, scheduled_at, now, now),
+            )
+        except sqlite3.IntegrityError:
+            conn.execute("ROLLBACK")
+            return None
+        row = conn.execute(
+            "SELECT * FROM channel_schedule_reservations WHERE workflow_id = ?",
+            (workflow_id,),
+        ).fetchone()
+        conn.execute("COMMIT")
+        return dict(row)
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def list_channel_schedule_reservations(
+    youtube_channel_id: int,
+    *,
+    statuses: tuple[str, ...] = ("reserved", "scheduled"),
+) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    placeholders = ",".join("?" for _ in statuses)
+    rows = conn.execute(
+        f"""
+        SELECT * FROM channel_schedule_reservations
+        WHERE youtube_channel_id = ? AND status IN ({placeholders})
+        ORDER BY scheduled_at
+        """,
+        (youtube_channel_id, *statuses),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_channel_schedule_reservation(workflow_id: str) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM channel_schedule_reservations WHERE workflow_id = ?",
+        (workflow_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_channel_schedule_reservation(
+    workflow_id: str,
+    status: str,
+) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        UPDATE channel_schedule_reservations
+        SET status = ?, updated_at = ? WHERE workflow_id = ?
+        """,
+        (status, utc_now(), workflow_id),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM channel_schedule_reservations WHERE workflow_id = ?",
+        (workflow_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def has_active_youtube_publish_workflow(channel_db_id: int) -> bool:
+    conn = sqlite3.connect(str(DB_PATH))
+    row = conn.execute(
+        """
+        SELECT 1 FROM youtube_publish_workflows
+        WHERE youtube_channel_id = ?
+          AND status IN ('queued', 'running', 'retry_wait', 'waiting',
+                         'processing', 'ready_to_schedule')
+        LIMIT 1
+        """,
+        (channel_db_id,),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def reserve_youtube_publication_slot(
+    workflow_id: str,
+    now_utc: datetime.datetime | None = None,
+) -> str:
+    from auto_yt.services.publication_scheduler import find_next_publication_slot
+    workflow = get_youtube_publish_workflow(workflow_id)
+    if not workflow:
+        raise ValueError(f"Workflow not found: {workflow_id}")
+    channel = get_youtube_channel(int(workflow["youtube_channel_id"]))
+    if not channel:
+        raise ValueError(f"Channel not found: {workflow['youtube_channel_id']}")
+
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        res_rows = conn.execute(
+            "SELECT scheduled_at FROM channel_schedule_reservations WHERE youtube_channel_id = ? AND workflow_id != ? AND status IN ('reserved', 'scheduled')",
+            (channel["id"], workflow_id),
+        ).fetchall()
+        pub_rows = conn.execute(
+            "SELECT published_at FROM video_publications WHERE youtube_channel_id = ? AND published_at != ''",
+            (channel["id"],),
+        ).fetchall()
+
+        occupied = sorted(
+            set(str(r[0]) for r in res_rows if r[0])
+            | set(str(r[0]) for r in pub_rows if r[0])
+        )
+
+        timezone_name = channel.get("publication_timezone") or "Asia/Ho_Chi_Minh"
+        slots = channel.get("publication_slots") or []
+        daily_limit = int(channel.get("publication_daily_limit") or 1)
+        lead_minutes = int(channel.get("publication_lead_minutes") or 120)
+
+        slot = find_next_publication_slot(
+            timezone_name=timezone_name,
+            slots=slots,
+            daily_limit=daily_limit,
+            lead_minutes=lead_minutes,
+            occupied_utc=occupied,
+            now_utc=now_utc,
+        )
+
+        reserve_channel_schedule(
+            youtube_channel_id=channel["id"],
+            workflow_id=workflow_id,
+            scheduled_at=slot,
+        )
+        update_youtube_publish_workflow(workflow_id, scheduled_at=slot)
+        return slot
+    finally:
+        conn.close()
+
+
+# ==============================================================================
+# Video Production State
+# ==============================================================================
+
+VIDEO_PRODUCTION_MUTABLE_FIELDS = {
+    "production_snapshot_json",
+    "render_status",
+    "publish_status",
+    "current_stage",
+    "production_progress",
+    "blocking_reason",
+    "flow_project_url",
+    "flow_scene_count",
+    "flow_completed_scenes",
+}
+
+
+def update_video_production(video_id: int, **changes) -> dict | None:
+    invalid = set(changes) - VIDEO_PRODUCTION_MUTABLE_FIELDS
+    if invalid:
+        raise ValueError(f"Unsupported video production fields: {sorted(invalid)}")
+    if not changes:
+        return get_video(video_id)
+    assignments = ", ".join(f"{field} = ?" for field in changes)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        f"UPDATE videos SET {assignments} WHERE id = ?",
+        (*changes.values(), video_id),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM videos WHERE id = ?", (video_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+update_video_production_state = update_video_production
+
+
+def list_completed_audio_video_ids_with_production_snapshot() -> list[int]:
+    conn = sqlite3.connect(str(DB_PATH))
+    rows = conn.execute(
+        """
+        SELECT videos.id
+        FROM videos
+        JOIN audio_tasks ON audio_tasks.video_id = videos.id
+        WHERE videos.video_status = ?
+          AND audio_tasks.status = 'completed'
+          AND TRIM(COALESCE(videos.production_snapshot_json, '')) NOT IN ('', '{}')
+        ORDER BY videos.id
+        """,
+        (VIDEO_STATUS_ACTIVE,),
+    ).fetchall()
+    conn.close()
+    return [int(row[0]) for row in rows]
+
+
+# ==============================================================================
+# Video Publications & Channels Helpers
+# ==============================================================================
+
+def get_video_publication(publication_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM video_publications WHERE id = ?", (publication_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_channel_pending_publications(channel_db_id: int) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT publications.*
+        FROM video_publications AS publications
+        JOIN videos ON videos.id = publications.video_id
+        WHERE publications.youtube_channel_id = ?
+          AND publications.privacy_status != 'public'
+          AND videos.video_status = ?
+        ORDER BY publications.id
+        """,
+        (channel_db_id, VIDEO_STATUS_ACTIVE),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def update_video_publication(publication_id: int, **changes) -> dict | None:
+    allowed = {
+        "published_url",
+        "published_title",
+        "published_at",
+        "privacy_status",
+        "processing_status",
+        "scheduled_at",
+        "artifact_hash",
+    }
+    invalid = set(changes) - allowed
+    if invalid:
+        raise ValueError(f"Unsupported publication fields: {sorted(invalid)}")
+    if not changes:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM video_publications WHERE id = ?", (publication_id,)
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
+    changes["updated_at"] = utc_now()
+    assignments = ", ".join(f"{field} = ?" for field in changes)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        f"UPDATE video_publications SET {assignments} WHERE id = ?",
+        (*changes.values(), publication_id),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM video_publications WHERE id = ?", (publication_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+get_youtube_channels = list_youtube_channels
+
+
+def get_editable_video_job(identifier: int | str) -> dict | None:
+    if isinstance(identifier, int) or (isinstance(identifier, str) and identifier.isdigit()):
+        vid = get_video(int(identifier))
+        if vid:
+            return vid
+    job = get_system_job(str(identifier))
+    if job:
+        return job
+    return None
+
+
+def upsert_youtube_channel(
+    channel_id: str,
+    title: str,
+    thumbnail_url: str = "",
+    gpm_profile_id: str = "",
+    gpm_profile_name: str = "",
+    gpm_proxy_info: str = "",
+    interaction_mode: str = "gpm_browser",
+    auto_heart: int = 1,
+    **extra_fields,
+) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    existing = conn.execute(
+        "SELECT id FROM youtube_channels WHERE channel_id = ?", (channel_id,)
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """
+            UPDATE youtube_channels SET
+                title = ?,
+                thumbnail_url = ?,
+                gpm_profile_id = ?,
+                gpm_profile_name = ?,
+                gpm_proxy_info = ?,
+                interaction_mode = ?,
+                auto_heart = ?,
+                updated_at = ?
+            WHERE channel_id = ?
+            """,
+            (
+                title,
+                thumbnail_url,
+                gpm_profile_id,
+                gpm_profile_name,
+                gpm_proxy_info,
+                interaction_mode,
+                auto_heart,
+                now,
+                channel_id,
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO youtube_channels (
+                channel_id, title, thumbnail_url, access_token_encrypted,
+                refresh_token_encrypted, token_expiry, scope, status,
+                gpm_profile_id, gpm_profile_name, gpm_proxy_info,
+                interaction_mode, auto_heart, created_at, updated_at
+            ) VALUES (?, ?, ?, '', '', '', '', 'connected', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                channel_id,
+                title,
+                thumbnail_url,
+                gpm_profile_id,
+                gpm_profile_name,
+                gpm_proxy_info,
+                interaction_mode,
+                auto_heart,
+                now,
+                now,
+            ),
+        )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM youtube_channels WHERE channel_id = ?", (channel_id,)
+    ).fetchone()
+    conn.close()
+    return _public_youtube_channel(row)
+
+
+# ==============================================================================
+# ComfyUI Profiles
+# ==============================================================================
+
+def _decode_comfyui_profile(row: sqlite3.Row | dict | None) -> dict | None:
+    if row is None:
+        return None
+    profile = dict(row)
+    profile["workflow"] = _decode_json_field(profile.pop("workflow_json", "{}"), {})
+    profile["node_mappings"] = _decode_json_field(
+        profile.pop("node_mappings_json", "{}"), {}
+    )
+    return profile
+
+
+def save_comfyui_workflow_profile(
+    *,
+    profile_id: str,
+    name: str,
+    base_url: str,
+    workflow: dict,
+    node_mappings: dict,
+    max_concurrency: int = 1,
+    min_width: int = 1024,
+    min_height: int = 576,
+    timeout_seconds: int = 900,
+) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        INSERT INTO comfyui_workflow_profiles (
+            id, name, base_url, workflow_json, node_mappings_json,
+            max_concurrency, min_width, min_height, timeout_seconds,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            base_url = excluded.base_url,
+            workflow_json = excluded.workflow_json,
+            node_mappings_json = excluded.node_mappings_json,
+            max_concurrency = excluded.max_concurrency,
+            min_width = excluded.min_width,
+            min_height = excluded.min_height,
+            timeout_seconds = excluded.timeout_seconds,
+            updated_at = excluded.updated_at
+        """,
+        (
+            profile_id,
+            name,
+            base_url,
+            json.dumps(workflow, ensure_ascii=False),
+            json.dumps(node_mappings, ensure_ascii=False),
+            max(1, int(max_concurrency)),
+            max(256, int(min_width)),
+            max(144, int(min_height)),
+            max(30, int(timeout_seconds)),
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM comfyui_workflow_profiles WHERE id = ?", (profile_id,)
+    ).fetchone()
+    conn.close()
+    return _decode_comfyui_profile(row)
+
+
+def get_comfyui_workflow_profile(profile_id: str) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM comfyui_workflow_profiles WHERE id = ?", (profile_id,)
+    ).fetchone()
+    conn.close()
+    return _decode_comfyui_profile(row)
+
+
+def list_comfyui_workflow_profiles() -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM comfyui_workflow_profiles ORDER BY name COLLATE NOCASE"
+    ).fetchall()
+    conn.close()
+    return [_decode_comfyui_profile(row) for row in rows]
+
+
+def delete_comfyui_workflow_profile(profile_id: str) -> bool:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    cursor = conn.execute(
+        "DELETE FROM comfyui_workflow_profiles WHERE id = ?", (profile_id,)
+    )
+    conn.commit()
+    conn.close()
+    return cursor.rowcount > 0

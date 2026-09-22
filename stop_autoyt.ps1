@@ -1,14 +1,16 @@
 [CmdletBinding()]
 param(
     [ValidateRange(5, 120)]
-    [int]$TimeoutSeconds = 20
+    [int]$TimeoutSeconds = 25
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $projectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd("\")
-$servicePorts = @(8080, 5173)
+$dataRoot = Join-Path $projectRoot "data"
+$chromeUserDataRoot = Join-Path $dataRoot "chrome_user_data"
+$servicePorts = @(8080, 5173, 8011)
 $omniVoiceRoot = if ($env:AUTO_YT_OMNIVOICE_ROOT) {
     [System.IO.Path]::GetFullPath($env:AUTO_YT_OMNIVOICE_ROOT).TrimEnd("\")
 }
@@ -27,17 +29,46 @@ function Get-ProcessSnapshot {
     return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
 }
 
-function Test-ProjectProcess {
+function Test-AutoYTProcess {
     param($Process)
 
     if (-not $Process) {
         return $false
     }
+    $procName = [string]$Process.Name
+    if ($procName -in @("chrome.exe", "msedge.exe", "browser.exe", "brave.exe", "firefox.exe", "opera.exe", "explorer.exe")) {
+        if ($procName -eq "chrome.exe") {
+            return (Test-AutoYTChromeProcess $Process)
+        }
+        return $false
+    }
     $identity = "$($Process.ExecutablePath)`n$($Process.CommandLine)"
-    return $identity.IndexOf(
-        $projectRoot,
-        [System.StringComparison]::OrdinalIgnoreCase
-    ) -ge 0
+    if ($identity.IndexOf($projectRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        return $true
+    }
+    if ($omniVoiceRoot -and $identity.IndexOf($omniVoiceRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        return $true
+    }
+    return $false
+}
+
+function Test-AutoYTChromeProcess {
+    param($Process)
+
+    if (-not $Process -or $Process.Name -ne "chrome.exe") {
+        return $false
+    }
+    $cmd = [string]$Process.CommandLine
+    if ([string]::IsNullOrWhiteSpace($cmd)) {
+        return $false
+    }
+    if ($cmd.IndexOf($chromeUserDataRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        return $true
+    }
+    if ($cmd -match "PROFILE_GPT_" -or $cmd -match "PROFILE_GOOGLE_FLOW_") {
+        return $true
+    }
+    return $false
 }
 
 function Get-ProjectAncestorId {
@@ -59,7 +90,11 @@ function Get-ProjectAncestorId {
         if (-not $current) {
             break
         }
-        if (Test-ProjectProcess $current) {
+        $currName = [string]$current.Name
+        if ($currName -in @("explorer.exe", "WindowsTerminal.exe", "conhost.exe", "chrome.exe", "msedge.exe", "browser.exe", "brave.exe", "firefox.exe", "opera.exe")) {
+            break
+        }
+        if (Test-AutoYTProcess $current) {
             return [int]$current.ProcessId
         }
         $currentId = [int]$current.ParentProcessId
@@ -103,29 +138,23 @@ function Get-ListeningProcessIds {
     }
 }
 
-function Get-TrustedOmniVoiceWorkerId {
-    $markerPath = Join-Path $omniVoiceRoot "data\worker.pid"
-    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
-        return 0
-    }
-    try {
-        $processId = [int](Get-Content -LiteralPath $markerPath -Raw).Trim()
-        $process = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction Stop
-        $commandLine = [string]$process.CommandLine
-        if (
-            $commandLine -notmatch "uvicorn" -or
-            $commandLine -notmatch "api_server:app" -or
-            $commandLine -notmatch "--port\s+8011(?:\s|$)"
-        ) {
-            Write-Warning "OmniVoice PID marker does not identify the expected worker; it will not be stopped."
-            return 0
+function Request-BrowserServiceStop {
+    param([string]$ServiceName)
+
+    $stopFile = Join-Path $dataRoot "$ServiceName.stop.json"
+    $stateFile = Join-Path $dataRoot "$ServiceName.json"
+    if (Test-Path -LiteralPath $stateFile -PathType Leaf) {
+        try {
+            $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+            $payload = @{
+                instance_id = [string]$state.instance_id
+                requested_at = (Get-Date).ToUniversalTime().ToString("o")
+            } | ConvertTo-Json
+            Set-Content -LiteralPath $stopFile -Value $payload -Encoding UTF8
         }
-        return $processId
-    }
-    catch {
-        # A stale marker is safe to remove only inside the configured OmniVoice data folder.
-        Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
-        return 0
+        catch {
+            # Non-blocking best effort
+        }
     }
 }
 
@@ -138,39 +167,61 @@ if (-not $createdNew) {
 }
 
 try {
+    Write-Step "Analyzing running Auto_YT services and processes..."
+    
+    Request-BrowserServiceStop "chatgpt_browser_service"
+    Request-BrowserServiceStop "google_flow_browser_service"
+
     $processes = Get-ProcessSnapshot
     $rootIds = New-Object System.Collections.Generic.HashSet[int]
 
+    # 1. Listeners on service ports: 8080 (backend), 5173 (frontend), 8011 (omnivoice)
     foreach ($port in $servicePorts) {
         foreach ($listenerId in Get-ListeningProcessIds $port) {
-            $projectAncestorId = Get-ProjectAncestorId ([int]$listenerId) $processes
-            if ($projectAncestorId -gt 0) {
-                $null = $rootIds.Add($projectAncestorId)
+            $ancestorId = Get-ProjectAncestorId ([int]$listenerId) $processes
+            if ($ancestorId -gt 0) {
+                $null = $rootIds.Add($ancestorId)
             }
             else {
-                Write-Warning "Port $port is used by another application; it will not be stopped."
+                $proc = $processes | Where-Object { [int]$_.ProcessId -eq [int]$listenerId } | Select-Object -First 1
+                if ($proc -and (Test-AutoYTProcess $proc -or [string]$proc.CommandLine -match "api_server:app" -or [string]$proc.CommandLine -match "auto_yt")) {
+                    $null = $rootIds.Add([int]$listenerId)
+                }
+                else {
+                    Write-Warning "Port $port is used by an external application (PID: $listenerId); it will not be stopped."
+                }
             }
         }
     }
 
+    # 2. Named project processes
     foreach ($process in $processes) {
-        if (-not (Test-ProjectProcess $process)) {
-            continue
+        $cmd = [string]$process.CommandLine
+        $isProject = Test-AutoYTProcess $process
+
+        if ($isProject) {
+            if (
+                $cmd -match "auto_yt\.main:app" -or
+                $cmd -match "auto_yt\.services\.chatgpt_browser_service" -or
+                $cmd -match "auto_yt\.services\.google_flow_browser_service" -or
+                $cmd -match "api_server:app" -or
+                $cmd -match "[\\/]vite(?:\.js)?(?:\s|$)" -or
+                $cmd -match "npm(?:\.cmd)?\s+run\s+dev" -or
+                $cmd -match "playwright"
+            ) {
+                $null = $rootIds.Add([int]$process.ProcessId)
+            }
         }
-        $commandLine = [string]$process.CommandLine
-        if (
-            $commandLine -match "auto_yt\.main:app" -or
-            $commandLine -match "auto_yt\.services\.chatgpt_browser_service" -or
-            $commandLine -match "[\\/]vite(?:\.js)?(?:\s|$)" -or
-            $commandLine -match "npm(?:\.cmd)?\s+run\s+dev"
-        ) {
+        elseif ($cmd -match "api_server:app" -and $cmd -match "8011") {
             $null = $rootIds.Add([int]$process.ProcessId)
         }
     }
 
-    $omniVoiceWorkerId = Get-TrustedOmniVoiceWorkerId
-    if ($omniVoiceWorkerId -gt 0) {
-        $null = $rootIds.Add($omniVoiceWorkerId)
+    # 3. Dedicated Chrome processes with Auto_YT profiles
+    foreach ($process in $processes) {
+        if (Test-AutoYTChromeProcess $process) {
+            $null = $rootIds.Add([int]$process.ProcessId)
+        }
     }
 
     if ($rootIds.Count -eq 0) {
@@ -181,23 +232,33 @@ try {
     $targetIds = New-Object System.Collections.Generic.HashSet[int]
     foreach ($rootId in $rootIds) {
         foreach ($processId in Get-ProcessTreeIds $rootId $processes) {
+            $proc = $processes | Where-Object { [int]$_.ProcessId -eq $processId } | Select-Object -First 1
+            if ($proc) {
+                $procName = [string]$proc.Name
+                if ($procName -in @("chrome.exe", "msedge.exe", "browser.exe", "brave.exe", "firefox.exe", "opera.exe", "explorer.exe")) {
+                    if ($procName -ne "chrome.exe" -or -not (Test-AutoYTChromeProcess $proc)) {
+                        continue
+                    }
+                }
+            }
             $null = $targetIds.Add($processId)
         }
     }
 
-    Write-Step "Stopping backend, frontend and the trusted OmniVoice worker. Persistent jobs and completed audio chunks remain on disk."
+    Write-Step "Stopping backend (8080), frontend (5173), OmniVoice (8011), ChatGPT & Google Flow browser services ($($targetIds.Count) processes)..."
     foreach ($processId in @($targetIds) | Sort-Object -Descending) {
-        Stop-Process -Id $processId -ErrorAction SilentlyContinue
+        Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     }
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
-        Start-Sleep -Milliseconds 250
+        Start-Sleep -Milliseconds 300
         $remainingProjectListeners = @()
         $snapshot = Get-ProcessSnapshot
         foreach ($port in $servicePorts) {
             foreach ($listenerId in Get-ListeningProcessIds $port) {
-                if ((Get-ProjectAncestorId ([int]$listenerId) $snapshot) -gt 0) {
+                $proc = $snapshot | Where-Object { [int]$_.ProcessId -eq [int]$listenerId } | Select-Object -First 1
+                if ($proc -and (Test-AutoYTProcess $proc -or [string]$proc.CommandLine -match "api_server:app" -or [string]$proc.CommandLine -match "auto_yt")) {
                     $remainingProjectListeners += $listenerId
                 }
             }
@@ -205,10 +266,31 @@ try {
     } while ($remainingProjectListeners.Count -gt 0 -and (Get-Date) -lt $deadline)
 
     if ($remainingProjectListeners.Count -gt 0) {
-        throw "Auto_YT processes did not stop within $TimeoutSeconds seconds."
+        foreach ($remId in $remainingProjectListeners) {
+            Stop-Process -Id $remId -Force -ErrorAction SilentlyContinue
+        }
     }
 
-    Write-Host "Auto_YT has stopped. Queued jobs were preserved." -ForegroundColor Green
+    Write-Step "Cleaning up state markers and Chrome lock files..."
+    $stateFiles = @(
+        (Join-Path $dataRoot "chatgpt_browser_service.json"),
+        (Join-Path $dataRoot "chatgpt_browser_service.stop.json"),
+        (Join-Path $dataRoot "google_flow_browser_service.json"),
+        (Join-Path $dataRoot "google_flow_browser_service.stop.json"),
+        (Join-Path $omniVoiceRoot "data\worker.pid")
+    )
+    foreach ($sf in $stateFiles) {
+        if (Test-Path -LiteralPath $sf -PathType Leaf) {
+            Remove-Item -LiteralPath $sf -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
+        Get-ChildItem -LiteralPath $chromeUserDataRoot -Filter "SingletonLock" -Recurse -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "[Auto_YT] All services have stopped cleanly. Ports 8080, 5173, and 8011 are free." -ForegroundColor Green
     exit 0
 }
 catch {

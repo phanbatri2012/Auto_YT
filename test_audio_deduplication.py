@@ -1,5 +1,9 @@
+import sys
+from pathlib import Path
 import unittest
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from auto_yt import main
 

@@ -18,6 +18,15 @@ $venvPython = Join-Path $venvRoot "Scripts\python.exe"
 $backendUrl = "http://127.0.0.1:8080/health"
 $legacyBackendUrl = "http://127.0.0.1:8080/api/chatgpt-status"
 $frontendUrl = "http://127.0.0.1:5173/"
+$omniVoiceUrl = "http://127.0.0.1:8011/health"
+$omniVoiceRoot = if ($env:AUTO_YT_OMNIVOICE_ROOT) {
+    [System.IO.Path]::GetFullPath($env:AUTO_YT_OMNIVOICE_ROOT).TrimEnd("\")
+}
+else {
+    [System.IO.Path]::GetFullPath(
+        (Join-Path (Split-Path (Split-Path $projectRoot -Parent) -Parent) "omnivoice")
+    ).TrimEnd("\")
+}
 
 function Write-Step {
     param([string]$Message)
@@ -228,8 +237,12 @@ function Get-CombinedFingerprint {
 
 function Test-BackendReady {
     try {
-        $null = Invoke-RestMethod -Uri $backendUrl -TimeoutSec 2
-        return $true
+        $health = Invoke-RestMethod -Uri $backendUrl -TimeoutSec 2
+        return (
+            $health.status -eq "ok" -and
+            $null -ne $health.production_coordinator -and
+            [bool]$health.production_coordinator.ready
+        )
     }
     catch {
         try {
@@ -252,10 +265,87 @@ function Test-BackendReady {
 function Test-FrontendReady {
     try {
         $response = Invoke-WebRequest -Uri $frontendUrl -UseBasicParsing -TimeoutSec 2
-        return $response.StatusCode -eq 200 -and $response.Content -match "<title>Auto_YT</title>"
+        return $response.StatusCode -eq 200 -and (
+            $response.Content -match 'id=["'']root["'']' -or
+            $response.Content -match 'src=["''].*?main\.(jsx|tsx|js|ts)["'']' -or
+            $response.Content -match '(?i)<title>.*?(Auto_YT|Nexus).*?</title>'
+        )
     }
     catch {
         return $false
+    }
+}
+
+function Test-OmniVoiceReady {
+    try {
+        $response = Invoke-WebRequest -Uri $omniVoiceUrl -UseBasicParsing -TimeoutSec 2
+        return $response.StatusCode -eq 200
+    }
+    catch {
+        $responseProperty = $_.Exception.PSObject.Properties["Response"]
+        if ($responseProperty -and $null -ne $responseProperty.Value) {
+            $statusCodeProperty = $responseProperty.Value.PSObject.Properties["StatusCode"]
+            if ($statusCodeProperty -and [int]$statusCodeProperty.Value -eq 401) {
+                return $true
+            }
+        }
+        return $false
+    }
+}
+
+function Start-OmniVoiceWorker {
+    if (Test-OmniVoiceReady) {
+        Write-Step "OmniVoice worker is already running."
+        return
+    }
+
+    $apiServerPath = Join-Path $omniVoiceRoot "api_server.py"
+    if (-not (Test-Path -LiteralPath $apiServerPath -PathType Leaf)) {
+        Write-Warning "OmniVoice not found at $omniVoiceRoot; local audio generation will be unavailable."
+        return
+    }
+
+    Write-Step "Starting OmniVoice TTS worker on port 8011..."
+    try {
+        $srcPath = Join-Path $projectRoot "src"
+        $previousPythonPath = $env:PYTHONPATH
+        $env:PYTHONPATH = $srcPath
+        try {
+            & $venvPython -c "from auto_yt.services.omnivoice_client import ensure_worker_running; ensure_worker_running()" *> $null
+        }
+        finally {
+            $env:PYTHONPATH = $previousPythonPath
+        }
+    }
+    catch {
+        Write-Warning "Direct OmniVoice startup returned: $($_.Exception.Message)"
+    }
+}
+
+function Test-BrowserServicesReady {
+    $chatgptStateFile = Join-Path $dataRoot "chatgpt_browser_service.json"
+    $flowStateFile = Join-Path $dataRoot "google_flow_browser_service.json"
+    
+    $chatgptReady = $false
+    $flowReady = $false
+    
+    if (Test-Path -LiteralPath $chatgptStateFile -PathType Leaf) {
+        try {
+            $data = Get-Content -LiteralPath $chatgptStateFile -Raw | ConvertFrom-Json
+            $chatgptReady = [bool]$data.ready
+        } catch {}
+    }
+    
+    if (Test-Path -LiteralPath $flowStateFile -PathType Leaf) {
+        try {
+            $data = Get-Content -LiteralPath $flowStateFile -Raw | ConvertFrom-Json
+            $flowReady = [bool]$data.ready
+        } catch {}
+    }
+    
+    return @{
+        ChatGPT = $chatgptReady
+        GoogleFlow = $flowReady
     }
 }
 
@@ -475,23 +565,55 @@ function Ensure-FrontendEnvironment {
     return $npmCommand.Source
 }
 
+function Start-DetachedProcess {
+    param(
+        [string]$CommandLine,
+        [string]$WorkingDirectory
+    )
+
+    $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{
+        ShowWindow = [uint16]0
+    }
+    $res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine = $CommandLine
+        CurrentDirectory = $WorkingDirectory
+        ProcessStartupInformation = $startup
+    }
+    if ($res.ReturnValue -ne 0) {
+        throw "Failed to create detached process (ReturnValue: $($res.ReturnValue)): $CommandLine"
+    }
+
+    $pidVal = [int]$res.ProcessId
+    return [PSCustomObject]@{
+        Id = $pidVal
+        ProcessId = $pidVal
+        HasExited = $false
+        Refresh = {
+            $p = Get-Process -Id $this.Id -ErrorAction SilentlyContinue
+            $this.HasExited = ($null -eq $p)
+        }
+    }
+}
+
 function Start-Backend {
     New-Item -ItemType Directory -Path $logsRoot -Force | Out-Null
-    $env:PYTHONPATH = Join-Path $projectRoot "src"
+    $srcPath = Join-Path $projectRoot "src"
+    $stdoutLog = Join-Path $logsRoot "backend.stdout.log"
+    $stderrLog = Join-Path $logsRoot "backend.stderr.log"
     Write-Step "Starting backend on port 8080."
-    return Start-Process -FilePath $venvPython -ArgumentList @(
-        "-m", "uvicorn", "auto_yt.main:app", "--host", "127.0.0.1", "--port", "8080"
-    ) -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logsRoot "backend.stdout.log") -RedirectStandardError (Join-Path $logsRoot "backend.stderr.log") -PassThru
+    $cmdLine = "cmd.exe /c `"set PYTHONPATH=$srcPath&& `"$venvPython`" -m uvicorn auto_yt.main:app --host 127.0.0.1 --port 8080 >> `"$stdoutLog`" 2>> `"$stderrLog`"`""
+    return Start-DetachedProcess -CommandLine $cmdLine -WorkingDirectory $projectRoot
 }
 
 function Start-Frontend {
     param([string]$NpmPath)
 
     New-Item -ItemType Directory -Path $logsRoot -Force | Out-Null
+    $stdoutLog = Join-Path $logsRoot "frontend.stdout.log"
+    $stderrLog = Join-Path $logsRoot "frontend.stderr.log"
     Write-Step "Starting frontend on port 5173."
-    return Start-Process -FilePath $NpmPath -ArgumentList @(
-        "run", "dev", "--", "--host", "127.0.0.1"
-    ) -WorkingDirectory $frontendRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logsRoot "frontend.stdout.log") -RedirectStandardError (Join-Path $logsRoot "frontend.stderr.log") -PassThru
+    $cmdLine = "cmd.exe /c `"call `"$NpmPath`" run dev -- --host 127.0.0.1 >> `"$stdoutLog`" 2>> `"$stderrLog`"`""
+    return Start-DetachedProcess -CommandLine $cmdLine -WorkingDirectory $frontendRoot
 }
 
 $createdNew = $false
@@ -513,22 +635,24 @@ try {
 
     $backendReady = Test-BackendReady
     $frontendReady = Test-FrontendReady
+    $omniVoiceReady = Test-OmniVoiceReady
 
-    if ($backendReady -and $frontendReady) {
-        Write-Step "The full system is already running."
+    if ($backendReady -and $frontendReady -and $omniVoiceReady) {
+        Write-Step "All core services are already running."
     }
     else {
+        # 1. Start Backend (which also triggers ChatGPT & Google Flow browser services)
         if (-not $backendReady) {
             Protect-DataDirectory
             if (Test-PortInUse 8080) {
-                Wait-ForService "Backend" ${function:Test-BackendReady} 10
+                Wait-ForService "Backend (8080)" ${function:Test-BackendReady} 10
                 $backendReady = $true
             }
             else {
                 Ensure-PythonEnvironment
                 $backendProcess = Start-Backend
                 try {
-                    Wait-ForService "Backend" ${function:Test-BackendReady} $ReadyTimeoutSeconds
+                    Wait-ForService "Backend (8080)" ${function:Test-BackendReady} $ReadyTimeoutSeconds
                     $backendReady = $true
                 }
                 catch {
@@ -541,37 +665,108 @@ try {
             }
         }
 
+        # 2. Ensure OmniVoice Worker is running on port 8011
+        if (-not $omniVoiceReady) {
+            Ensure-PythonEnvironment
+            Start-OmniVoiceWorker
+            try {
+                Wait-ForService "OmniVoice TTS Worker (8011)" ${function:Test-OmniVoiceReady} 45
+                $omniVoiceReady = $true
+            }
+            catch {
+                Write-Warning "OmniVoice worker did not respond within timeout. Audio generation will fallback to remote/Genmax if configured."
+                $omniVoiceReady = $false
+            }
+        }
+
+        # 3. Start Frontend UI on port 5173
         if (-not $frontendReady) {
             if (Test-PortInUse 5173) {
-                Wait-ForService "Frontend" ${function:Test-FrontendReady} 10
+                Wait-ForService "Frontend (5173)" ${function:Test-FrontendReady} 10
                 $frontendReady = $true
             }
             else {
                 $npmPath = Ensure-FrontendEnvironment
                 $frontendProcess = Start-Frontend $npmPath
                 try {
-                    Wait-ForService "Frontend" ${function:Test-FrontendReady} $ReadyTimeoutSeconds
+                    Wait-ForService "Frontend (5173)" ${function:Test-FrontendReady} $ReadyTimeoutSeconds
                     $frontendReady = $true
                 }
                 catch {
                     $frontendProcess.Refresh()
                     if ($frontendProcess.HasExited) {
-                        throw "Frontend exited during startup. See data/logs/frontend.stderr.log."
+                        $frontendErrLog = Join-Path $logsRoot "frontend.stderr.log"
+                        $errText = if (Test-Path -LiteralPath $frontendErrLog -PathType Leaf) { Get-Content -LiteralPath $frontendErrLog -Raw -ErrorAction SilentlyContinue } else { "" }
+                        if ($errText -match "EPERM" -and ($errText -match "\.vite" -or $errText -match "unlink")) {
+                            Write-Step "Detected locked or restricted Vite cache. Self-healing by resetting .vite cache..."
+                            $viteDir = Join-Path $frontendRoot "node_modules\.vite"
+                            if (Test-Path -LiteralPath $viteDir) {
+                                $backupViteName = ".vite_stale_" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
+                                try { Rename-Item -LiteralPath $viteDir -NewName $backupViteName -Force -ErrorAction SilentlyContinue } catch {}
+                            }
+                            Write-Step "Retrying frontend startup with clean cache..."
+                            $frontendProcess = Start-Frontend $npmPath
+                            Wait-ForService "Frontend (5173)" ${function:Test-FrontendReady} $ReadyTimeoutSeconds
+                            $frontendReady = $true
+                        }
+                        else {
+                            throw "Frontend exited during startup. See data/logs/frontend.stderr.log."
+                        }
                     }
-                    throw
+                    else {
+                        throw
+                    }
                 }
             }
         }
     }
 
     if (-not $backendReady -or -not $frontendReady) {
-        throw "The full Auto_YT system is not ready."
+        throw "The core Auto_YT system is not ready."
     }
+
+    # 4. Check Browser Services readiness (ChatGPT & Google Flow)
+    Write-Step "Checking browser automation services (ChatGPT & Google Flow)..."
+    $browserDeadline = (Get-Date).AddSeconds(20)
+    do {
+        $bs = Test-BrowserServicesReady
+        if ($bs.ChatGPT -and $bs.GoogleFlow) {
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $browserDeadline)
+
+    $finalBrowserState = Test-BrowserServicesReady
+
+    Write-Host ""
+    Write-Host "=================================================================" -ForegroundColor Green
+    Write-Host "               AUTO_YT SYSTEM IS READY TO PRODUCE VIDEOS          " -ForegroundColor Green
+    Write-Host "=================================================================" -ForegroundColor Green
+    Write-Host " [OK] Backend API Server:     $backendUrl" -ForegroundColor Green
+    Write-Host " [OK] Production Coordinator: Ready (render + YouTube publish)" -ForegroundColor Green
+    Write-Host " [OK] Frontend Web UI:        $frontendUrl" -ForegroundColor Green
+    if ($omniVoiceReady) {
+        Write-Host " [OK] OmniVoice TTS Server:   $omniVoiceUrl" -ForegroundColor Green
+    } else {
+        Write-Host " [!]  OmniVoice TTS Server:   Offline (remote voice fallback)" -ForegroundColor Yellow
+    }
+    if ($finalBrowserState.ChatGPT) {
+        Write-Host " [OK] ChatGPT Automation:     Ready (Chromium CDP connected)" -ForegroundColor Green
+    } else {
+        Write-Host " [!]  ChatGPT Automation:     Connecting in background" -ForegroundColor Yellow
+    }
+    if ($finalBrowserState.GoogleFlow) {
+        Write-Host " [OK] Google Flow Automation: Ready (Chromium CDP connected)" -ForegroundColor Green
+    } else {
+        Write-Host " [!]  Google Flow Automation: Connecting in background" -ForegroundColor Yellow
+    }
+    Write-Host "=================================================================" -ForegroundColor Green
+    Write-Host ""
 
     if (-not $NoBrowser) {
         Start-Process $frontendUrl
     }
-    Write-Host "Auto_YT is ready: $frontendUrl" -ForegroundColor Green
+    Write-Host "Auto_YT interface is open at: $frontendUrl" -ForegroundColor Green
     exit 0
 }
 catch {

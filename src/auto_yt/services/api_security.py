@@ -35,12 +35,24 @@ def _secure_response(response):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Cache-Control", "no-store")
     return response
 
 
 def _has_allowed_origin(request: Request) -> bool:
     origin = request.headers.get("origin", "")
-    return not origin or origin in ALLOWED_FRONTEND_ORIGINS
+    if origin:
+        return origin in ALLOWED_FRONTEND_ORIGINS
+    referer = request.headers.get("referer", "")
+    if referer:
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(referer)
+            ref_origin = f"{p.scheme}://{p.netloc}"
+            return ref_origin in ALLOWED_FRONTEND_ORIGINS
+        except Exception:
+            return False
+    return True
 
 
 def _is_cross_site(request: Request) -> bool:
@@ -68,17 +80,16 @@ async def protect_loopback_api(request: Request, call_next):
     if path == SESSION_PATH:
         if request.method != "GET":
             return _error(405, "Method not allowed")
-        origin = request.headers.get("origin", "")
-        if origin not in ALLOWED_FRONTEND_ORIGINS or _is_cross_site(request):
+        if not _has_allowed_origin(request) or _is_cross_site(request):
             return _error(403, "Untrusted frontend origin")
         response = JSONResponse({"csrf_token": _CSRF_TOKEN})
         response.set_cookie(
             SESSION_COOKIE_NAME,
             _SESSION_SECRET,
             httponly=True,
-            samesite="strict",
+            samesite="lax",
             secure=False,
-            path="/api",
+            path="/",
         )
         response.headers["Cache-Control"] = "no-store"
         return _secure_response(response)
@@ -90,12 +101,16 @@ async def protect_loopback_api(request: Request, call_next):
         return _error(403, "Cross-site API request blocked")
 
     session_secret = request.cookies.get(SESSION_COOKIE_NAME, "")
-    if not secrets.compare_digest(session_secret, _SESSION_SECRET):
+    csrf_header = request.headers.get(CSRF_HEADER_NAME, "")
+    has_valid_cookie = bool(session_secret and secrets.compare_digest(session_secret, _SESSION_SECRET))
+    has_valid_token = bool(csrf_header and secrets.compare_digest(csrf_header, _CSRF_TOKEN))
+
+    if not has_valid_cookie and not has_valid_token:
         return _error(401, "Local API session required")
 
     if request.method in UNSAFE_METHODS:
         csrf_token = request.headers.get(CSRF_HEADER_NAME, "")
-        if not secrets.compare_digest(csrf_token, _CSRF_TOKEN):
+        if not csrf_token or not secrets.compare_digest(csrf_token, _CSRF_TOKEN):
             return _error(403, "Invalid API request token")
 
     return _secure_response(await call_next(request))

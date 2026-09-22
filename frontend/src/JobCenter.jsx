@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { openVideoStudioInGpm } from './gpmOpener.js'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const BULK_ACTIONS = ['retry', 'pause', 'resume', 'cancel']
@@ -32,7 +33,40 @@ const PIPELINE_LABELS = {
   chapters: 'Chapter',
   thumbnail_with_text: 'Ảnh có chữ',
   thumbnail_without_text: 'Ảnh không chữ',
-  audio: 'Audio'
+  audio: 'Audio',
+  video_render: 'Dựng MP4',
+  youtube_upload: 'Upload Private',
+  youtube_schedule: 'Đặt lịch'
+}
+
+const PUBLISH_STAGE_LABELS = {
+  preflight: 'Kiểm tra cấu hình',
+  slot_reserved: 'Đã giữ lịch',
+  session_created: 'Đã tạo phiên upload',
+  uploading: 'Đang upload',
+  uploaded: 'Đã upload Private',
+  thumbnail_done: 'Đã gắn thumbnail',
+  caption_done: 'Đã gắn phụ đề',
+  processing: 'YouTube đang xử lý',
+  scheduled: 'Đã đặt lịch',
+  completed: 'Hoàn tất'
+}
+
+const CONFIGURATION_LABELS = {
+  default_youtube_channel_id: 'kênh YouTube mặc định',
+  youtube_oauth: 'OAuth YouTube',
+  gpm_profile_id: 'GPM Profile',
+  gpm_proxy_info: 'proxy riêng của GPM Profile',
+  publication_timezone: 'múi giờ đăng',
+  publication_slots: 'khung giờ đăng',
+  publication_paused: 'bỏ tạm dừng lịch đăng',
+  public_upload_verified: 'xác minh quyền đặt lịch public',
+  made_for_kids: 'lựa chọn dành cho trẻ em',
+  metadata: 'metadata YouTube',
+  final_mp4: 'file MP4',
+  captions_srt: 'phụ đề SRT',
+  thumbnail: 'thumbnail local',
+  local_secret_store: 'kho bí mật DPAPI trên máy'
 }
 
 function formatPipeline(pipeline) {
@@ -58,6 +92,8 @@ function isWithinSnapshot(job, snapshotAt) {
 
 function JobCenter({ onOpenVideo, refreshKey }) {
   const [jobs, setJobs] = useState([])
+  const [page, setPage] = useState(1)
+  const pageSize = 50
   const [counts, setCounts] = useState({ total: 0, active: 0, error: 0 })
   const [filteredTotal, setFilteredTotal] = useState(0)
   const [selectableTotal, setSelectableTotal] = useState(0)
@@ -89,6 +125,16 @@ function JobCenter({ onOpenVideo, refreshKey }) {
     setSelectionSummary(null)
   }, [])
 
+  const handleOpenStudio = async (job) => {
+    if (!job?.video_id) return
+    try {
+      const data = await openVideoStudioInGpm(job.video_id)
+      setMessage(data.message || '🚀 Đã mở YouTube Studio trong GPM Profile!')
+    } catch (err) {
+      setMessage(`⚠️ Không thể mở Studio trong GPM: ${err.message}`)
+    }
+  }
+
   useEffect(() => {
     const timeoutId = setTimeout(
       () => setDebouncedSearchQuery(searchQuery.trim()),
@@ -101,8 +147,10 @@ function JobCenter({ onOpenVideo, refreshKey }) {
     const requestId = requestIdRef.current + 1
     requestIdRef.current = requestId
     try {
+      const offset = (page - 1) * pageSize
       const params = new URLSearchParams({
-        limit: debouncedSearchQuery ? '500' : '200'
+        limit: String(pageSize),
+        offset: String(offset)
       })
       if (debouncedSearchQuery) params.set('search', debouncedSearchQuery)
       if (filter !== 'all') params.set('status', filter)
@@ -146,7 +194,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
     } finally {
       if (requestId === requestIdRef.current) setLoading(false)
     }
-  }, [debouncedSearchQuery, filter, typeFilter])
+  }, [debouncedSearchQuery, filter, page, pageSize, typeFilter])
 
   useEffect(() => {
     setLoading(true)
@@ -165,6 +213,66 @@ function JobCenter({ onOpenVideo, refreshKey }) {
   }, [hasPollableJobs, loadJobs])
 
   const filteredJobs = jobs
+  const totalPages = Math.max(1, Math.ceil((filteredTotal || 0) / pageSize))
+  const startItem = filteredTotal === 0 ? 0 : (page - 1) * pageSize + 1
+  const endItem = Math.min(page * pageSize, filteredTotal)
+
+  const renderPagination = () => (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '12px', padding: '12px 16px', background: '#161616', borderRadius: '8px', border: '1px solid #333' }}>
+      <div style={{ color: '#aaa', fontSize: '0.86em' }}>
+        {filteredTotal > 0 ? (
+          <>Hiển thị <strong style={{ color: '#fff' }}>{startItem} - {endItem}</strong> trong tổng số <strong style={{ color: '#a970ff' }}>{filteredTotal}</strong> job</>
+        ) : (
+          'Không có job nào'
+        )}
+      </div>
+      {totalPages > 1 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={page <= 1 || Boolean(actionId)}
+            onClick={() => setPage(1)}
+            style={{ padding: '6px 12px', fontSize: '0.85em', width: 'auto' }}
+            title="Trang đầu"
+          >
+            «
+          </button>
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={page <= 1 || Boolean(actionId)}
+            onClick={() => setPage(p => Math.max(1, p - 1))}
+            style={{ padding: '6px 14px', fontSize: '0.85em', width: 'auto' }}
+          >
+            ‹ Trước
+          </button>
+          <span style={{ color: '#eee', fontWeight: '600', fontSize: '0.85em', padding: '0 8px' }}>
+            Trang {page} / {totalPages}
+          </span>
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={page >= totalPages || Boolean(actionId)}
+            onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+            style={{ padding: '6px 14px', fontSize: '0.85em', width: 'auto' }}
+          >
+            Sau ›
+          </button>
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={page >= totalPages || Boolean(actionId)}
+            onClick={() => setPage(totalPages)}
+            style={{ padding: '6px 12px', fontSize: '0.85em', width: 'auto' }}
+            title="Trang cuối"
+          >
+            »
+          </button>
+        </div>
+      )}
+    </div>
+  )
 
   const selectedJobItems = useMemo(
     () => Object.values(selectedJobs),
@@ -356,6 +464,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
             onChange={event => {
               clearSelection()
               setSearchQuery(event.target.value)
+              setPage(1)
             }}
             placeholder="Tìm theo tiêu đề, link YouTube, mã video hoặc mã job..."
             style={{
@@ -372,6 +481,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
               onClick={() => {
                 clearSelection()
                 setSearchQuery('')
+                setPage(1)
               }}
               style={{ width: 'auto', padding: '5px 10px' }}
             >
@@ -400,6 +510,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
             onClick={() => {
               clearSelection()
               setFilter(value)
+              setPage(1)
             }}
             style={{ padding: '9px 16px', width: 'auto' }}
           >
@@ -413,6 +524,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           onChange={event => {
             clearSelection()
             setTypeFilter(event.target.value)
+            setPage(1)
           }}
           style={{
             padding: '9px 14px', borderRadius: '7px', border: '1px solid #555',
@@ -423,13 +535,20 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           <option value="video_generation">Tạo video</option>
           <option value="audio_review">Kiểm duyệt audio</option>
           <option value="audio">Tạo audio</option>
+          <option value="visual_scene_plan">Lập kế hoạch cảnh</option>
+          <option value="video_render">Dựng video MP4</option>
+          <option value="youtube_publish">Upload / đặt lịch YouTube</option>
           <option value="youtube_download">Tải YouTube</option>
           <option value="chatgpt">Tác vụ ChatGPT</option>
           <option value="comment_sync">Đồng bộ bình luận</option>
           <option value="comment_draft">Soạn trả lời bình luận</option>
-           <option value="comment_publish">Đăng trả lời bình luận</option>
-           <option value="comment_video_import">Khởi tạo Chat cho video cũ</option>
-         </select>
+          <option value="comment_publish">Đăng trả lời bình luận</option>
+          <option value="comment_video_import">Khởi tạo Chat cho video cũ</option>
+          <option value="fb_crosspost">Đăng chéo Facebook</option>
+          <option value="fb_crosspost_sync">Đồng bộ video Facebook</option>
+          <option value="thumbnail_generation">Sinh ảnh Thumbnail</option>
+          <option value="tiktok_publish">Đăng video TikTok</option>
+        </select>
         <button
           className="btn-secondary"
           disabled={Boolean(actionId)}
@@ -502,11 +621,17 @@ function JobCenter({ onOpenVideo, refreshKey }) {
       ) : filteredJobs.length === 0 ? (
         <div className="result-panel" style={{ color: '#888' }}>Không có job phù hợp.</div>
       ) : (
-        <div style={{ display: 'grid', gap: '12px' }}>
+        <>
+          {renderPagination()}
+          <div style={{ display: 'grid', gap: '12px', marginTop: '12px', marginBottom: '12px' }}>
           {filteredJobs.map(job => {
             const status = (
               job.status === 'paused' && job.attention_required === 'chatgpt_verification'
-                ? { label: 'Cần xác minh ChatGPT', color: '#f1c40f' }
+                ? job.automatic_login === 'pending'
+                  ? { label: 'Đang Auto Login', color: '#4dd0e1' }
+                  : { label: 'Cần xác minh ChatGPT', color: '#f1c40f' }
+                : job.status === 'paused' && job.attention_required?.startsWith('youtube_')
+                  ? { label: 'Cần cấu hình', color: '#f1c40f' }
                 : job.type === 'comment_publish' && job.status === 'retry_wait'
                 ? { label: 'Đã hẹn đăng', color: '#4dd0e1' }
                 : STATUS_META[job.status] || STATUS_META.error
@@ -545,6 +670,12 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                     <div style={{ color: '#999', marginTop: '7px', fontSize: '0.86em' }}>
                       {job.progress || 'Chưa có cập nhật'}
                     </div>
+                    {job.publish_stage && (
+                      <div style={{ color: '#76d7c4', marginTop: '6px', fontSize: '0.8em' }}>
+                        Bước YouTube: {PUBLISH_STAGE_LABELS[job.publish_stage] || job.publish_stage}
+                        {Number.isFinite(job.upload_percent) ? ` · ${job.upload_percent}%` : ''}
+                      </div>
+                    )}
                     {job.type === 'video_generation' && job.pipeline && (
                       <div style={{ color: '#b794f6', marginTop: '6px', fontSize: '0.8em' }}>
                         Pipeline: Kịch bản lõi → {formatPipeline(job.pipeline)}
@@ -570,6 +701,11 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                         {job.type === 'comment_publish' ? 'Dự kiến đăng lúc' : 'Tự chạy lại lúc'} {formatDate(job.next_retry_at)}
                       </div>
                     )}
+                    {job.scheduled_at && (
+                      <div style={{ color: '#4dd0e1', marginTop: '4px', fontSize: '0.78em' }}>
+                        Lịch YouTube: {formatDate(job.scheduled_at)}
+                      </div>
+                    )}
                     {job.error && (
                       <details style={{ marginTop: '9px', color: '#ff6b6b', fontSize: '0.84em' }}>
                         <summary>Xem lỗi</summary>
@@ -578,14 +714,49 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                     )}
                     {job.attention_required === 'chatgpt_verification' && (
                       <div style={{ color: '#f1c40f', marginTop: '9px', fontSize: '0.84em' }}>
-                        Phiên đã lưu sẽ được worker tự khôi phục. Nếu tài khoản thật sự hết
-                        phiên, mở Auto Login hoặc Open Profile, đăng nhập xong rồi mới bấm
-                        “Tiếp tục”; hệ thống dùng checkpoint hiện có và không gửi trùng prompt.
+                        {job.automatic_login === 'pending'
+                          ? 'Phiên đã hết hạn. Hệ thống đang tự đăng nhập và sẽ tự tiếp tục đúng job này khi thành công.'
+                          : ['failed', 'cooldown', 'interrupted'].includes(job.automatic_login)
+                            ? 'Auto Login tự động không hoàn tất. Hãy kiểm tra tài khoản hoặc mở Open Profile để xác minh, sau đó bấm “Tiếp tục”.'
+                            : 'ChatGPT đang yêu cầu CAPTCHA/Cloudflare hoặc xác minh thủ công. Mở Auto Login hoặc Open Profile, xác minh xong rồi bấm “Tiếp tục”.'}
+                      </div>
+                    )}
+                    {job.status === 'paused' && job.attention_required?.startsWith('youtube_') && (
+                      <div style={{ color: '#f1c40f', marginTop: '9px', fontSize: '0.84em' }}>
+                        Hãy sửa trong Channel Hub rồi bấm “Tiếp tục”.
+                        {job.missing_configuration?.length > 0 && (
+                          <div style={{ marginTop: '4px' }}>
+                            Còn thiếu: {job.missing_configuration
+                              .map(item => CONFIGURATION_LABELS[item] || item)
+                              .join(', ')}.
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
 
                   <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    {job.artifact_download_url && (
+                      <a
+                        className="btn-secondary"
+                        style={{ padding: '8px 12px', textDecoration: 'none' }}
+                        href={`${API_BASE}${job.artifact_download_url}`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Mở / tải MP4
+                      </a>
+                    )}
+                    {job.youtube_studio_url && (
+                      <button
+                        className="btn-secondary"
+                        style={{ padding: '8px 12px' }}
+                        onClick={() => handleOpenStudio(job)}
+                        title="Mở YouTube Studio trong GPM Profile của kênh"
+                      >
+                        📺 YouTube Studio
+                      </button>
+                    )}
                     {job.video_id && (
                       <button className="btn-secondary" style={{ padding: '8px 12px' }} onClick={() => onOpenVideo(job.video_id)}>
                         Xem video
@@ -616,7 +787,9 @@ function JobCenter({ onOpenVideo, refreshKey }) {
               </div>
             )
           })}
-        </div>
+          </div>
+          {renderPagination()}
+        </>
       )}
     </>
   )

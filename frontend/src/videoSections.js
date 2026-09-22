@@ -39,8 +39,14 @@ function getMetadataLabel(line) {
   if (['tieu de', 'tieu de video', 'video title', 'title'].includes(label)) {
     return { type: 'title', value }
   }
-  if (['slug', 'url slug'].includes(label)) {
-    return { type: 'slug', value }
+  if (['slug', 'url slug', 'slug url'].includes(label)) {
+    let cleanValue = value
+    for (const prefix of ['url slug:', 'slug url:', 'slug:']) {
+      if (cleanValue.toLowerCase().startsWith(prefix)) {
+        cleanValue = cleanValue.slice(prefix.length).trim()
+      }
+    }
+    return { type: 'slug', value: cleanValue }
   }
   if (['mo ta', 'mo ta video', 'description'].includes(label)) {
     return { type: 'description', value }
@@ -51,7 +57,11 @@ function getMetadataLabel(line) {
   if (['binh luan ghim', 'pinned comment'].includes(label)) {
     return { type: 'pinnedComment', value }
   }
-  if (['quiz', 'quiz tuong tac', 'cau hoi', 'cau hoi quiz'].includes(label)) {
+  if ([
+    'quiz', 'quiz tuong tac', 'cau hoi', 'cau hoi quiz',
+    'cau hoi khan gia', 'trac nghiem', 'cau hoi trac nghiem',
+    'cau hoi va dap an', 'quiz khan gia'
+  ].includes(label)) {
     return { type: 'quiz', value }
   }
 
@@ -63,14 +73,21 @@ function moveQuestionToQuiz(source, quiz) {
   for (let index = source.length - 1; index >= 0; index -= 1) {
     const line = source[index].trim()
     if (!line) continue
-    if (line.endsWith('?')) {
+    const clean = normalizeLabel(line)
+    if (
+      line.endsWith('?') ||
+      clean.startsWith('theo quy vi') ||
+      clean.startsWith('theo cac ban') ||
+      clean.startsWith('cau hoi')
+    ) {
       questionIndex = index
+      break
     }
-    break
   }
 
-  if (questionIndex < 0) return
-  quiz.push(...trimEmptyLines(source.splice(questionIndex)))
+  if (questionIndex >= 0) {
+    quiz.push(...trimEmptyLines(source.splice(questionIndex)))
+  }
 }
 
 function parseMetadataContent(content) {
@@ -95,6 +112,17 @@ function parseMetadataContent(content) {
     }
 
     const trimmed = line.trim()
+    const cleanLower = normalizeLabel(trimmed)
+
+    if (
+      (cleanLower.startsWith('theo quy vi') || cleanLower.startsWith('theo cac ban') || cleanLower.startsWith('cau hoi')) &&
+      currentField === 'pinnedComment'
+    ) {
+      currentField = 'quiz'
+      fields.quiz.push(line)
+      return
+    }
+
     if (/^(?:A|B|C|D)[.)]\s+/i.test(trimmed) && currentField !== 'quiz') {
       const questionSource = fields.pinnedComment.length
         ? fields.pinnedComment
@@ -118,15 +146,21 @@ function parseMetadataContent(content) {
   })
 
   return Object.fromEntries(
-    Object.entries(fields).map(([key, lines]) => [key, trimEmptyLines(lines).join('\n').trim()])
+    Object.entries(fields).map(([key, lines]) => {
+      let text = trimEmptyLines(lines).join('\n').trim()
+      if (key === 'slug') {
+        text = text.replace(/^(?:url\s+)?slug:\s*/i, '').trim()
+      }
+      return [key, text]
+    })
   )
 }
 
 function buildDescriptionSection(metadata, chaptersContent) {
   const parts = []
   if (metadata.description) parts.push(metadata.description)
-  if (metadata.tags) parts.push(metadata.tags)
   if (chaptersContent) parts.push(chaptersContent)
+  if (metadata.tags) parts.push(metadata.tags)
 
   if (!parts.length) return null
   return {

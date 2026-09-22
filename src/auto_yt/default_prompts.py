@@ -13,6 +13,23 @@ DEFAULT_PROMPTS_DATA = {
                 "thumbnail_with_text": True,
                 "thumbnail_without_text": True,
                 "audio": True,
+                "video_render": False,
+                "youtube_upload": False,
+                "youtube_schedule": False,
+            },
+            "image_generation_settings": {
+                "workflow_profile_id": "",
+                "style_prompt": "",
+                "negative_prompt": "",
+                "seed_mode": "random",
+                "thumbnail_variant": "without_text",
+            },
+            "publishing_settings": {
+                "category_id": "",
+                "language": "vi",
+                "made_for_kids": None,
+                "notify_subscribers": True,
+                "contains_synthetic_media": True,
             },
             "prompts": {
                 "outline": "Bạn là biên tập viên nội dung cho kênh YouTube Đinh Đoàn Phân Tích. Dưới đây là một kịch bản dài đã có sẵn. Dưới góc nhìn của tiến sĩ, Chuyên gia tâm lý Đinh Đoàn Đinh Đoàn phân tích Hãy chia nội dung này thành các phần lớn hợp lý theo dòng chảy tự nhiên của câu chuyện để dễ viết lại thành lời dẫn video. Không cần đặt tiêu đề cho từng phần. Hãy gộp thành các phần lớn, KHÔNG tách nhỏ quá nhiều. Mỗi phần lớn chỉ cần trình bày dưới dạng gạch đầu dòng các ý chính cơ bản, nhưng phải bao quát đủ thông tin quan trọng như bản gốc, không cắt gọn mất ý chính, không viết tắt. Kiểm tra các Tên riêng, mốc thời gian, địa điểm, số liệu để sửa lại cho đúng.\n\nLưu ý CỰC KỲ QUAN TRỌNG: Khi lập dàn ý, CHỈ LẤY phần nội dung câu chuyện bám sát theo đúng TIÊU ĐỀ KỊCH BẢN. Tuyệt đối bỏ qua tất cả các nội dung khác (ví dụ như đoạn quảng cáo, giới thiệu đầu video, hoặc các câu chuyện phụ không liên quan đến tiêu đề).\n\nQuan trọng: Định dạng mỗi phần bằng chuỗi [PHAN] ở đầu, ví dụ:\n[PHAN]\nNội dung phần 1...\n[PHAN]\nNội dung phần 2...\n\nDưới đây là kịch bản (Bao gồm Tiêu đề và Nội dung):\n{transcript}",
@@ -23,7 +40,7 @@ DEFAULT_PROMPTS_DATA = {
                 
                 "outro": "viết outro cho video (viết lại nội dung đầy đủ chi tiết, nội dung viết liền không cần xuống dòng) :\n- kết luận.\n- Lời cảm ơn đến người xem.\n- Kêu gọi like, chia sẻ và đăng ký kênh.\n- Nhắc nhở về việc bình luận và chia sẻ ý kiến về câu chuyện\n- Hứa hẹn cập nhật những câu chuyện hấp dẫn nhất trong các video tiếp theo.\n- Kêu gọi nhấn nút \"Tham gia\" để đăng ký thành viên hoặc gửi \"Cảm ơn\"",
                 
-                "metadata": "Dựa vào toàn bộ nội dung vừa viết, hãy thực hiện các yêu cầu sau:\n- Hãy viết tiêu đề video YouTube theo phong cách giật gân, chuẩn SEO, sử dụng từ ngữ gây tò mò hoặc sốc để thu hút người xem. Các từ khóa chính cần được VIẾT HOA để tăng khả năng nhận diện. Tiêu đề không được vượt quá 100 ký tự, khiến người xem tò mò về câu chuyện chưa từng được kể hoặc ít người biết đến và phải đủ sức khiến người xem muốn bấm vào ngay.\n- Hãy tạo lại một URL slug ngắn gọn, dễ nhớ, thân thiện với SEO. Slug chỉ sử dụng chữ thường và dấu gạch ngang, không có dấu tiếng Việt, không chứa ký tự đặc biệt, và phải phản ánh đúng nội dung chính của video. slug url không quá 50 ký tự.\n- Hãy viết một đoạn mô tả video YouTube hấp dẫn chuẩn SEO, đúng chủ đề và có chứa từ khóa chính để tăng khả năng SEO, đồng thời giữ chân người xem. Sau đó, đề xuất 3 hashtag không dấu liên quan trực tiếp đến nội dung video, đảm bảo là các từ khóa có thứ hạng cao và lượng tìm kiếm lớn (high volume, ranked tags) để tăng khả năng được YouTube đề xuất, các tag được viết trên 1 hàng,các tag phải có # ở đầu,trong 1 tag các từ được được viết liền nhau. ngắn gọn và viết hoa những chữ cần viết hoa.\n- Hãy gợi ý một bình luận ghim cho video với vai trò là chủ kênh. Nội dung bình luận cần viết thành một đoạn hoàn chỉnh, mang tính gợi mở hoặc đặt câu hỏi nhằm khuyến khích người xem tương tác, chia sẻ quan điểm hoặc cảm xúc về video. dùng icon, xuống dòng từng ý, ngắn gọn khoảng 1-2 dòng.\n- Dựa vào nội dung vid trên hãy Tạo 1 câu hỏi và 4 câu trả lời dành cho khán giả trả lời (câu hỏi không đc quá 100 ký tự, câu trả lời không đc quá 30 ký tự). sau đó hãy tạo nội dung giải thích cho câu hỏi (không được quá 200 ký tự).hãy chỉ ra câu trả lời đúng. bắt đầu bằng: theo các bạn...",
+                "metadata": "Dựa vào toàn bộ nội dung vừa viết, hãy thực hiện các yêu cầu sau:\n- Hãy viết tiêu đề video YouTube theo phong cách giật gân, chuẩn SEO, sử dụng từ ngữ gây tò mò hoặc sốc để thu hút người xem. Các từ khóa chính cần được VIẾT HOA để tăng khả năng nhận diện. Tiêu đề không được vượt quá 100 ký tự, khiến người xem tò mò về câu chuyện chưa từng được kể hoặc ít người biết đến và phải đủ sức khiến người xem muốn bấm vào ngay.\n- Hãy tạo lại một URL slug ngắn gọn, dễ nhớ, thân thiện với SEO. Slug chỉ sử dụng chữ thường và dấu gạch ngang, không có dấu tiếng Việt, không chứa ký tự đặc biệt, và phải phản ánh đúng nội dung chính của video. slug url không quá 50 ký tự.\n- Hãy viết một đoạn mô tả video ngắn gọn, súc tích, hấp dẫn chuẩn SEO, tóm tắt đúng nội dung cốt lõi của câu chuyện và lời kêu gọi tương tác ngắn. Sau đó, đề xuất chính xác từ 3 đến 5 hashtag liên quan trực tiếp nhất đến nội dung video (ưu tiên tên nhân vật, sự kiện lịch sử, chủ đề ngách), đảm bảo là các từ khóa có thứ hạng cao và lượng tìm kiếm lớn để tăng khả năng được đề xuất. Các tag được viết trên 1 hàng, có # ở đầu, trong 1 tag các từ viết liền nhau, tuyệt đối không viết quá 5 hashtag và không chèn các hashtag chung chung ngoài lề.\n- Hãy gợi ý một bình luận ghim cho video với vai trò là chủ kênh. Nội dung bình luận cần viết thành một đoạn hoàn chỉnh, mang tính gợi mở hoặc đặt câu hỏi nhằm khuyến khích người xem tương tác, chia sẻ quan điểm hoặc cảm xúc về video. dùng icon, xuống dòng từng ý, ngắn gọn khoảng 1-2 dòng.\n- Dựa vào nội dung vid trên hãy Tạo 1 câu hỏi và 4 câu trả lời dành cho khán giả trả lời (câu hỏi không đc quá 100 ký tự, câu trả lời không đc quá 30 ký tự). sau đó hãy tạo nội dung giải thích cho câu hỏi (không được quá 200 ký tự).hãy chỉ ra câu trả lời đúng. bắt đầu bằng: theo các bạn...",
                 
                 "chapters": "Dựa vào nội dung này, mình đã tạo 1 video dài, hãy tạo 1 chapter ngắn gọn, chuẩn SEO cho video. viết hoa đầu câu, viết hoa chữ cái đầu của tên riêng hoặc địa danh và viết hoa viết hoa chỗ cần viết hoa.\nví dụ:\nNội dung chính trong video:\n00:00 - N...\n04:30 - G...\n09:00 - A....",
                 

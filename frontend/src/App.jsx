@@ -1,13 +1,17 @@
 import { useState, useEffect, useRef } from 'react'
 import './App.css'
 import AutoLogin from './AutoLogin'
+import GoogleFlowLogin from './GoogleFlowLogin'
 import AudioReviewPanel from './AudioReviewPanel'
 import JobCenter from './JobCenter'
 import Settings from './Settings'
+import ChannelManager from './ChannelManager'
 import VideoQueuePanel from './VideoQueuePanel'
 import YouTubeDownloader from './YouTubeDownloader'
 import YouTubeComments from './YouTubeComments'
 import TTSSettings from './TTSSettings'
+import CrossPoster from './CrossPoster'
+import { openVideoStudioInGpm, openVideoWatchInGpm } from './gpmOpener'
 
 const SECONDS_PER_MINUTE = 60
 const SECONDS_PER_HOUR = 60 * SECONDS_PER_MINUTE
@@ -29,6 +33,21 @@ function voiceProviderName(providerId) {
   if (providerId === 'omnivoice') return 'OmniVoice'
   if (providerId === 'genmax') return 'Genmax'
   return providerId || 'TTS'
+}
+
+function videoProductionStatus(video) {
+  if (video.publish_status === 'published' || video.publication_privacy_status === 'public') return { label: 'Đã đăng', color: '#4caf50' }
+  if (video.publish_status === 'scheduled') return { label: 'Đã lên lịch', color: '#4dd0e1' }
+  if (video.publish_status === 'uploaded_private') return { label: 'Private', color: '#b794f6' }
+  if (video.current_stage === 'youtube_processing') return { label: 'YouTube đang xử lý', color: '#4dd0e1' }
+  if (['youtube_upload', 'youtube_assets'].includes(video.current_stage)) return { label: 'Đang upload', color: '#4dd0e1' }
+  if (video.current_stage === 'youtube_schedule') return { label: 'Đang đặt lịch', color: '#4dd0e1' }
+  if (video.render_status === 'waiting_for_image_service') return { label: 'Chờ tạo ảnh', color: '#f5b041' }
+  if (video.current_stage === 'scene_generation' && video.render_status === 'running') return { label: 'Đang tạo ảnh', color: '#b794f6' }
+  if (video.render_status === 'running') return { label: 'Đang render', color: '#b794f6' }
+  if (video.render_status === 'done' && !video.publish_status) return { label: 'MP4 đã hoàn thành', color: '#4dd0e1' }
+  if (video.render_status === 'error' || video.publish_status === 'error') return { label: 'Lỗi pipeline', color: '#ff6b6b' }
+  return null
 }
 
 function VoiceOptions({ voices }) {
@@ -141,6 +160,9 @@ function App() {
   const [isGenAudio, setIsGenAudio] = useState(false)
   const [audioStatus, setAudioStatus] = useState('not_started')
   const [audioMissingSegments, setAudioMissingSegments] = useState(0)
+  const [renderInfo, setRenderInfo] = useState(null)
+  const [isRendering, setIsRendering] = useState(false)
+  const [isCancelingRender, setIsCancelingRender] = useState(false)
   const [progressMsg, setProgressMsg] = useState('')
   const [queueRefreshKey, setQueueRefreshKey] = useState(0)
   const [currentVideoId, setCurrentVideoId] = useState(null)
@@ -514,6 +536,39 @@ function App() {
 
   useEffect(() => {
     if (!currentVideoId) {
+      setRenderInfo(null);
+      setIsRendering(false);
+      return undefined;
+    }
+
+    let stopped = false;
+    let intervalId = null;
+    const syncRender = async () => {
+      try {
+        const response = await fetch(
+          `http://127.0.0.1:8080/api/videos/${currentVideoId}/render-status`
+        );
+        if (stopped || !response.ok) return;
+        const data = await response.json();
+        if (stopped) return;
+        setRenderInfo(data);
+        const jobStatus = data.job?.status;
+        setIsRendering(jobStatus === 'queued' || jobStatus === 'running');
+      } catch (error) {
+        console.error('Failed to sync render status', error);
+      }
+    };
+
+    syncRender();
+    intervalId = setInterval(syncRender, 5000);
+    return () => {
+      stopped = true;
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [currentVideoId]);
+
+  useEffect(() => {
+    if (!currentVideoId) {
       setAudioReview(null)
       return undefined
     }
@@ -607,6 +662,7 @@ function App() {
       )
       setQueueRefreshKey(value => value + 1)
     } catch (error) {
+      setProgressMsg('')
       setErrorMsg(error.message || 'Không thể kết nối tới backend Python.')
     } finally {
       setIsFetching(false)
@@ -628,7 +684,7 @@ function App() {
     const blobUrl = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = blobUrl;
-    a.download = activeTab === 'summary' ? 'Kich_Ban_Auto_YT.txt' : 'Phu_De_Goc.txt';
+    a.download = activeTab === 'summary' ? 'Kich_Ban_Nexus.txt' : 'Phu_De_Goc.txt';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -662,6 +718,8 @@ function App() {
       setCurrentVideoHasCheckpoint(Boolean(data.has_checkpoint));
       setAudioStatus('not_started');
       setAudioMissingSegments(0);
+      setRenderInfo(null);
+      setIsRendering(false);
       setErrorMsg('');
       setProgressMsg('');
     } catch (err) {
@@ -693,6 +751,8 @@ function App() {
     setCurrentVideoHasCheckpoint(false);
     setAudioStatus('not_started');
     setAudioMissingSegments(0);
+    setRenderInfo(null);
+    setIsRendering(false);
     setErrorMsg('');
     setProgressMsg('');
   };
@@ -794,6 +854,24 @@ function App() {
     }
   };
 
+  const handleOpenStudio = async (videoId, publishedYoutubeVideoId) => {
+    try {
+      const data = await openVideoStudioInGpm(videoId);
+      alert(data.message || '🚀 Đã mở YouTube Studio trong GPM Profile!');
+    } catch (err) {
+      alert(`⚠️ Không thể mở Studio trong GPM: ${err.message}`);
+    }
+  };
+
+  const handleOpenWatch = async (videoId) => {
+    try {
+      const data = await openVideoWatchInGpm(videoId);
+      alert(data.message || '🚀 Đã mở video trên YouTube trong GPM Profile!');
+    } catch (err) {
+      alert(`⚠️ Không thể mở video trong GPM: ${err.message}`);
+    }
+  };
+
   const handleContinueGeneration = async () => {
     if (!currentVideoId || chatGptControlsDisabled) return;
     setIsFetching(true);
@@ -847,8 +925,8 @@ function App() {
           }
         }, 3000);
       });
-    } catch {
-      setErrorMsg('Lỗi tiếp tục: ' + err.message);
+    } catch (err) {
+      setErrorMsg('Lỗi tiếp tục: ' + (err?.message || String(err)));
     } finally {
       setIsFetching(false);
       setShowResult(true);
@@ -1123,6 +1201,61 @@ function App() {
     }
   };
 
+  const handleRenderVideo = async (mode = 'resume') => {
+    if (!currentVideoId || isRendering || currentVideoIsError) return;
+    setIsRendering(true);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/render-video?mode=${encodeURIComponent(mode)}`,
+        { method: 'POST' }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể bắt đầu dựng video.');
+      }
+      setRenderInfo(prev => ({
+        ...(prev || {}),
+        video_id: currentVideoId,
+        has_mp4: false,
+        job: {
+          status: 'queued',
+          title: `Dựng video MP4 cho #${currentVideoId}${mode === 'recreate' ? ' (Tạo mới)' : ''}`
+        }
+      }));
+    } catch (error) {
+      setIsRendering(false);
+      alert('Lỗi dựng video: ' + error.message);
+    }
+  };
+
+  const handleCancelRenderVideo = async () => {
+    if (!currentVideoId || isCancelingRender) return;
+    setIsCancelingRender(true);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/cancel-render`,
+        { method: 'POST' }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể dừng tác vụ dựng video.');
+      }
+      const statusRes = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/render-status`
+      );
+      if (statusRes.ok) {
+        const statusData = await statusRes.json();
+        setRenderInfo(statusData);
+        const jobStatus = statusData.job?.status;
+        setIsRendering(jobStatus === 'queued' || jobStatus === 'running');
+      }
+    } catch (error) {
+      alert('Lỗi dừng render: ' + error.message);
+    } finally {
+      setIsCancelingRender(false);
+    }
+  };
+
 
   const parseSections = (text) => {
     if (!text) return [];
@@ -1137,31 +1270,70 @@ function App() {
       const lines = text.split('\n');
       let currentTitle = 'METADATA';
       let currentBody = '';
+      let hashtagsSeen = false;
       
       const flush = () => {
         if (currentBody.trim()) {
-          subs.push({ title: currentTitle, content: currentBody.trim() });
+          let cleanContent = currentBody.trim();
+          if (currentTitle === 'URL SLUG') {
+            cleanContent = cleanContent.replace(/^(?:url\s+)?slug:\s*/i, '').trim();
+          }
+          subs.push({ title: currentTitle, content: cleanContent });
         }
         currentBody = '';
       };
 
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
+        const trimmed = line.trim();
         // Remove leading markdown asterisks, dashes, numbers, etc for matching
-        const cleanLower = line.toLowerCase().replace(/^[*\-\d.\s]+/, '').trim();
+        const cleanLower = trimmed.toLowerCase().replace(/^[*\-\d.\s]+/, '').trim();
         
         if (cleanLower.startsWith('tiêu đề') && cleanLower.includes(':')) {
           flush(); currentTitle = 'TIÊU ĐỀ VIDEO'; currentBody += line.split(':').slice(1).join(':').trim() + '\n';
-        } else if (cleanLower.startsWith('url slug') && cleanLower.includes(':')) {
-          flush(); currentTitle = 'URL SLUG'; currentBody += line.split(':').slice(1).join(':').trim() + '\n';
+        } else if ((cleanLower.startsWith('url slug') || cleanLower.startsWith('slug:') || cleanLower.startsWith('slug :')) && cleanLower.includes(':')) {
+          flush(); currentTitle = 'URL SLUG';
+          let slugVal = line.split(':').slice(1).join(':').trim();
+          slugVal = slugVal.replace(/^(?:url\s+)?slug:\s*/i, '').trim();
+          currentBody += slugVal + '\n';
         } else if (cleanLower.startsWith('mô tả') && cleanLower.includes(':')) {
           flush(); currentTitle = 'MÔ TẢ VIDEO'; currentBody += line.split(':').slice(1).join(':').trim() + '\n';
+        } else if ((cleanLower.startsWith('hashtag') || cleanLower.startsWith('tag')) && cleanLower.includes(':')) {
+          flush(); currentTitle = 'HASHTAG'; currentBody += line.split(':').slice(1).join(':').trim() + '\n';
+          hashtagsSeen = true;
+        } else if (cleanLower.startsWith('#') && currentTitle !== 'QUIZ TƯƠNG TÁC') {
+          flush(); currentTitle = 'HASHTAG'; currentBody += line + '\n';
+          hashtagsSeen = true;
         } else if (cleanLower.startsWith('bình luận ghim') && cleanLower.includes(':')) {
           flush(); currentTitle = 'BÌNH LUẬN GHIM'; currentBody += line.split(':').slice(1).join(':').trim() + '\n';
-        } else if (cleanLower.includes('câu hỏi:') || cleanLower.startsWith('theo các bạn')) {
-          flush(); currentTitle = 'QUIZ TƯƠNG TÁC'; currentBody += line + '\n';
+        } else if (
+          cleanLower.startsWith('quiz:') ||
+          cleanLower.startsWith('quiz :') ||
+          cleanLower.startsWith('câu hỏi:') ||
+          cleanLower.startsWith('câu hỏi :') ||
+          cleanLower.startsWith('trắc nghiệm:') ||
+          cleanLower.startsWith('câu hỏi trắc nghiệm:') ||
+          cleanLower.startsWith('theo các bạn') ||
+          cleanLower.startsWith('theo quý vị') ||
+          cleanLower.startsWith('theo ban') ||
+          cleanLower.startsWith('theo quy vi') ||
+          cleanLower.startsWith('theo cac ban') ||
+          /^(?:A|B|C|D)[.)]\s+/i.test(trimmed)
+        ) {
+          if (currentTitle !== 'QUIZ TƯƠNG TÁC') {
+            flush();
+            currentTitle = 'QUIZ TƯƠNG TÁC';
+          }
+          if (cleanLower.startsWith('quiz:') || cleanLower.startsWith('câu hỏi:')) {
+            const afterColon = line.split(':').slice(1).join(':').trim();
+            currentBody += (afterColon || line) + '\n';
+          } else {
+            currentBody += line + '\n';
+          }
         } else {
-          // Lines like hashtags (#) will just fall in here and be appended to the current block
+          if (currentTitle === 'METADATA' && trimmed) {
+            currentTitle = hashtagsSeen ? 'BÌNH LUẬN GHIM' : 'MÔ TẢ VIDEO';
+          }
           currentBody += line + '\n';
         }
       }
@@ -1194,31 +1366,34 @@ function App() {
       });
     }
 
-    // --- NEW LOGIC: Combine MÔ TẢ VIDEO, HASHTAG, and CHAPTERS ---
+    // --- Combine MÔ TẢ VIDEO, CHAPTERS, and HASHTAG in correct order ---
     const finalSections = [];
     let chaptersContent = '';
+    let hashtagContent = '';
 
-    // First pass to extract chapters content
+    // First pass to extract chapters and hashtags
     sections.forEach((sec) => {
       if (sec.title === 'CHAPTERS') {
         chaptersContent = sec.content;
       }
+      if (sec.title === 'HASHTAG') {
+        hashtagContent = sec.content;
+      }
     });
 
-    // Second pass to build final sections
+    // Second pass to build final sections in desired order
     sections.forEach(sec => {
-      if (sec.title === 'CHAPTERS') {
-        // Skip it, we merge it into MÔ TẢ VIDEO
-        return;
+      if (sec.title === 'CHAPTERS' || sec.title === 'HASHTAG') {
+        return; // Handled inside MÔ TẢ VIDEO & CHAPTERS
       }
       if (sec.title === 'MÔ TẢ VIDEO') {
-        let combinedContent = sec.content;
-        if (chaptersContent) {
-          combinedContent += '\n\n' + chaptersContent;
-        }
+        const combinedParts = [];
+        if (sec.content) combinedParts.push(sec.content);
+        if (chaptersContent) combinedParts.push(chaptersContent);
+        if (hashtagContent) combinedParts.push(hashtagContent);
         finalSections.push({
           title: 'MÔ TẢ VIDEO & CHAPTERS',
-          content: combinedContent
+          content: combinedParts.join('\n\n')
         });
       } else {
         finalSections.push(sec);
@@ -1260,13 +1435,18 @@ function App() {
       {/* Sidebar */}
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-icon">YT</div>
-          <div className="brand-name">Auto_YT</div>
+          <img src="/logoNexus.png" alt="Nexus Logo" className="brand-logo-img" />
+          <div className="brand-info">
+            <div className="brand-name">Nexus</div>
+            <div className="brand-subtitle">Studio Engine</div>
+          </div>
         </div>
         <ul className="nav-menu">
           <li className={`nav-item ${activeView === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveView('dashboard')}>Dashboard</li>
           <li className={`nav-item ${activeView === 'jobs' ? 'active' : ''}`} onClick={() => setActiveView('jobs')}>Trung tâm Job</li>
           <li className={`nav-item ${activeView === 'comments' ? 'active' : ''}`} onClick={() => setActiveView('comments')}>Bình luận YouTube</li>
+          <li className={`nav-item ${activeView === 'channels' ? 'active' : ''}`} onClick={() => setActiveView('channels')}>Channel Hub</li>
+          <li className={`nav-item ${activeView === 'crossposter' ? 'active' : ''}`} onClick={() => setActiveView('crossposter')}>Cross-Poster</li>
           <li className={`nav-item ${activeView === 'fetcher' ? 'active' : ''}`} onClick={() => setActiveView('fetcher')}>Video Fetcher</li>
           <li
             className={`nav-item ${activeView === 'downloader' ? 'active' : ''}`}
@@ -1278,6 +1458,10 @@ function App() {
             onClick={() => !chatGptControlsDisabled && setActiveView('autologin')}
             style={chatGptControlsDisabled ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}
           >Auto Login</li>
+          <li
+            className={`nav-item ${activeView === 'flowlogin' ? 'active' : ''}`}
+            onClick={() => setActiveView('flowlogin')}
+          >Google Flow</li>
           <li
             className={`nav-item ${activeView === 'tts' ? 'active' : ''}`}
             onClick={() => setActiveView('tts')}
@@ -1301,8 +1485,14 @@ function App() {
         <div className="view-container">
           {activeView === 'autologin' ? (
             <AutoLogin />
+          ) : activeView === 'flowlogin' ? (
+            <GoogleFlowLogin />
           ) : activeView === 'tts' ? (
             <TTSSettings />
+          ) : activeView === 'channels' ? (
+            <ChannelManager />
+          ) : activeView === 'crossposter' ? (
+            <CrossPoster />
           ) : activeView === 'settings' ? (
             <Settings
               lockedPromptVersion={chatGptStatus.promptVersion}
@@ -1427,10 +1617,16 @@ function App() {
                        cleanSnippet = video.snippet.replace(/### \[[^\]]+\]/g, '').replace(/\n/g, ' ').trim();
                        if (cleanSnippet.length > 80) cleanSnippet = cleanSnippet.substring(0, 80) + '...';
                     }
-                    const isPublished = Boolean(video.is_published);
-                    const isError = video.video_status === 'error';
-                    const statusColor = isError ? '#e74c3c' : isPublished ? '#4caf50' : '#f39c12';
-                    const lifecycleState = isError ? 'error' : isPublished ? 'published' : 'unpublished';
+                     const productionStatus = videoProductionStatus(video);
+                     const isPublished = Boolean(video.is_published);
+                     const isError = video.video_status === 'error';
+                     const statusColor = isError ? '#e74c3c' : productionStatus?.color || (isPublished ? '#4caf50' : '#f39c12');
+                     const lifecycleState = isError ? 'error' : isPublished ? 'published' : 'unpublished';
+                     const lifecycleLabel = isError
+                       ? '❌ Lỗi'
+                       : productionStatus
+                         ? productionStatus.label
+                         : isPublished ? '✅ Đã đăng' : '⏳ Chưa đăng';
                     return (
                       <div key={video.id} className="result-panel" style={{ padding: '20px', display: 'flex', flexDirection: 'column', borderTop: `3px solid ${statusColor}` }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '8px' }}>
@@ -1441,10 +1637,10 @@ function App() {
                             color: statusColor,
                             border: `1px solid ${statusColor}`
                           }}>
-                            {isError ? '❌ Lỗi' : isPublished ? '✅ Đã đăng' : '⏳ Chưa đăng'}
+                             {lifecycleLabel}
                           </span>
                         </div>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
+                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
                           <p style={{ color: '#888', fontSize: '0.9em', margin: 0 }}>{new Date(video.created_at).toLocaleString('vi-VN')}</p>
                           {isError ? (
                             <span style={{ color: '#e74c3c', fontSize: '0.8em' }}>Đã bỏ qua xử lý</span>
@@ -1456,11 +1652,41 @@ function App() {
                               audioReviewStatus={video.audio_review_status}
                             />
                           )}
-                        </div>
+                         </div>
+                         {productionStatus && (
+                           <div style={{ marginBottom: 8 }}>
+                             <span style={{ color: productionStatus.color, fontSize: '0.8em', fontWeight: 700 }}>
+                               ● {productionStatus.label}
+                             </span>
+                             {video.production_progress && (
+                               <span style={{ color: '#888', fontSize: '0.8em' }}> · {video.production_progress}</span>
+                             )}
+                             {video.blocking_reason && (
+                               <div style={{ color: '#ff6b6b', fontSize: '0.78em', marginTop: 4 }}>
+                                 {video.blocking_reason}
+                               </div>
+                             )}
+                           </div>
+                         )}
                         <div style={{ display: 'flex', gap: '15px', marginBottom: '10px', alignItems: 'center' }}>
                           <a href={video.url} target="_blank" rel="noreferrer" style={{ color: 'var(--accent)', fontSize: '0.9em', textDecoration: 'none' }}>▶ Video gốc</a>
                           {video.published_url && (
-                            <a href={video.published_url} target="_blank" rel="noreferrer" style={{ color: '#4dd0e1', fontSize: '0.9em', textDecoration: 'none' }}>📺 Video đã đăng</a>
+                            <button
+                              type="button"
+                              onClick={() => handleOpenWatch(video.id)}
+                              style={{
+                                background: 'none',
+                                border: 'none',
+                                color: '#4dd0e1',
+                                fontSize: '0.9em',
+                                cursor: 'pointer',
+                                padding: 0,
+                                textDecoration: 'none'
+                              }}
+                              title="Mở video trong GPM Profile của kênh"
+                            >
+                              📺 Video đã đăng
+                            </button>
                           )}
                           {video.chat_url && (
                             <a href={video.chat_url} target="_blank" rel="noreferrer" style={{ color: '#2ecc71', fontSize: '0.9em', textDecoration: 'none' }}>💬 Chat Gốc</a>
@@ -1495,8 +1721,29 @@ function App() {
                           {cleanSnippet || 'Không có nội dung...'}
                         </div>
                         
-                        <div style={{ marginTop: 'auto', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                          <button
+                         <div style={{ marginTop: 'auto', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                           {Boolean(video.final_artifact_id) && (
+                             <a
+                               className="btn-secondary"
+                               style={{ padding: '8px 10px', fontSize: '0.85em', textDecoration: 'none' }}
+                               href={`http://127.0.0.1:8080/api/video-artifacts/${video.final_artifact_id}/download`}
+                               target="_blank"
+                               rel="noreferrer"
+                             >
+                               🎬 Mở / tải MP4
+                             </a>
+                           )}
+                           {video.published_youtube_video_id && (
+                             <button
+                               className="btn-secondary"
+                               style={{ padding: '8px 10px', fontSize: '0.85em' }}
+                               onClick={() => handleOpenStudio(video.id, video.published_youtube_video_id)}
+                               title="Mở YouTube Studio trong GPM Profile của kênh"
+                             >
+                               📺 YouTube Studio
+                             </button>
+                           )}
+                           <button
                             className="btn-run"
                             style={{ padding: '8px', flex: 1, fontSize: '0.9em' }}
                             onClick={() => viewSavedVideo(video.id)}
@@ -1705,6 +1952,12 @@ function App() {
                 </div>
               )}
 
+              {errorMsg && !showResult && (
+                <div style={{ color: '#ff4b4b', textAlign: 'center', marginTop: '12px', background: 'rgba(255,75,75,0.1)', padding: '8px 16px', borderRadius: '6px' }}>
+                  ⚠️ {errorMsg}
+                </div>
+              )}
+
               <VideoQueuePanel
                 refreshKey={queueRefreshKey}
                 onOpenJobCenter={() => setActiveView('jobs')}
@@ -1717,7 +1970,7 @@ function App() {
                     <div className="thumbnail-placeholder">▶</div>
                     <div className="video-info">
                       <h3 title={videoTitle}>
-                        {videoTitle || 'Auto_YT Extraction'}
+                        {videoTitle || 'Nexus Extraction'}
                       </h3>
                       {currentVideoId && (
                         <div style={{
@@ -1846,20 +2099,20 @@ function App() {
                           </select>
                         )}
                         {currentVideoPublications.map(publication => (
-                          <a
+                          <button
                             key={publication.id}
-                            href={publication.published_url}
-                            target="_blank"
-                            rel="noreferrer"
+                            type="button"
+                            onClick={() => handleOpenWatch(currentVideoId)}
                             style={{
                               padding: '4px 12px', borderRadius: '4px',
                               border: '1px solid #4dd0e1', color: '#4dd0e1',
-                              textDecoration: 'none', fontWeight: 'bold', fontSize: '0.82em'
+                              background: 'transparent', cursor: 'pointer',
+                              fontWeight: 'bold', fontSize: '0.82em'
                             }}
                             title={publication.youtube_channel_id
-                              ? `${publication.channel_title}: ${publication.published_title || publication.published_url}`
+                              ? `${publication.channel_title}: ${publication.published_title || publication.published_url} (Bấm để mở trong GPM)`
                               : 'Chưa gắn kênh — link chưa được xác minh; bình luận chưa khả dụng'}
-                          >📺 {publication.channel_title || 'Chưa gắn kênh — link chưa được xác minh'}</a>
+                          >📺 {publication.channel_title || 'Chưa gắn kênh — link chưa được xác minh'}</button>
                         ))}
                         {isCurrentVideoPublished && currentVideoPublications.length === 0 && (
                           <button
@@ -2053,6 +2306,186 @@ function App() {
                                 }
                               }}
                             />
+
+                            {/* MP4 Render & Video Preview */}
+                            <div style={{ marginTop: '16px', paddingTop: '14px', borderTop: '1px solid rgba(255,255,255,0.1)' }}>
+                              <div style={{
+                                display: 'flex', justifyContent: 'space-between',
+                                alignItems: 'center', marginBottom: '8px',
+                                gap: '10px', flexWrap: 'wrap'
+                              }}>
+                                <div>
+                                  <h4 style={{ color: 'var(--accent)', margin: 0 }}>🎬 Video MP4 (Google Flow & Subtitles):</h4>
+                                  <div style={{
+                                    color: renderInfo?.has_mp4 ? '#2ecc71' : isRendering ? '#f5b041' : (renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed' || renderInfo?.job?.status === 'canceled') ? '#e74c3c' : '#aaa',
+                                    fontSize: '0.82em',
+                                    marginTop: '4px'
+                                  }}>
+                                    {renderInfo?.has_mp4
+                                      ? '✅ Video MP4 đã render hoàn tất'
+                                      : isRendering
+                                        ? `⏳ ${renderInfo?.job?.progress || (renderInfo?.job?.status === 'running' ? 'Đang tạo ảnh Flow & render MP4...' : 'Đang trong hàng đợi render...')}`
+                                        : renderInfo?.job?.status === 'canceled'
+                                          ? `⏹️ Đã dừng: ${renderInfo?.job?.progress || renderInfo?.job?.error || 'Tác vụ dựng video đã dừng'}`
+                                          : (renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed')
+                                            ? `❌ Lỗi: ${renderInfo?.job?.error || 'Render thất bại'}`
+                                            : 'Chưa dựng video MP4'}
+                                  </div>
+                                </div>
+                                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                                  {isRendering ? (
+                                    <>
+                                      <button
+                                        className="btn-primary"
+                                        disabled={true}
+                                        style={{
+                                          padding: '4px 14px',
+                                          fontSize: '0.82em',
+                                          background: '#333',
+                                          cursor: 'not-allowed',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          border: 'none',
+                                          color: '#aaa'
+                                        }}
+                                      >
+                                        ⏳ Đang dựng...
+                                      </button>
+                                      <button
+                                        className="btn-secondary"
+                                        onClick={handleCancelRenderVideo}
+                                        disabled={isCancelingRender}
+                                        title="Dừng tác vụ dựng video MP4 hiện tại"
+                                        style={{
+                                          padding: '4px 14px',
+                                          fontSize: '0.82em',
+                                          background: 'rgba(231, 76, 60, 0.2)',
+                                          border: '1px solid #e74c3c',
+                                          color: '#ff6b6b',
+                                          cursor: isCancelingRender ? 'not-allowed' : 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                      >
+                                        {isCancelingRender ? '⏳ Đang dừng...' : '⏹️ Dừng'}
+                                      </button>
+                                    </>
+                                  ) : (renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed' || renderInfo?.job?.status === 'canceled') ? (
+                                    <>
+                                      <button
+                                        className="btn-primary"
+                                        onClick={() => handleRenderVideo('resume')}
+                                        disabled={currentVideoIsError}
+                                        title="Dùng lại project cũ trên Google Flow và tiếp tục tạo các cảnh còn thiếu"
+                                        style={{
+                                          padding: '4px 14px',
+                                          fontSize: '0.82em',
+                                          background: 'linear-gradient(135deg, #1abc9c, #16a085)',
+                                          cursor: 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          border: 'none',
+                                          color: '#fff',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                      >
+                                        ▶️ Tạo tiếp
+                                      </button>
+                                      <button
+                                        className="btn-secondary"
+                                        onClick={() => handleRenderVideo('recreate')}
+                                        disabled={currentVideoIsError}
+                                        title="Tạo mới một project trên Google Flow và tạo lại toàn bộ từ cảnh 1"
+                                        style={{
+                                          padding: '4px 14px',
+                                          fontSize: '0.82em',
+                                          background: 'rgba(231, 76, 60, 0.15)',
+                                          border: '1px solid #e74c3c',
+                                          color: '#ff6b6b',
+                                          cursor: 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                      >
+                                        🔄 Tạo lại
+                                      </button>
+                                    </>
+                                  ) : !renderInfo?.has_mp4 ? (
+                                    <button
+                                      className="btn-primary"
+                                      onClick={() => handleRenderVideo('resume')}
+                                      disabled={currentVideoIsError}
+                                      style={{
+                                        padding: '4px 14px',
+                                        fontSize: '0.82em',
+                                        background: 'linear-gradient(135deg, #1abc9c, #16a085)',
+                                        cursor: 'pointer',
+                                        fontWeight: 'bold',
+                                        borderRadius: '4px',
+                                        border: 'none',
+                                        color: '#fff'
+                                      }}
+                                    >
+                                      🎬 Dựng video MP4
+                                    </button>
+                                  ) : null}
+                                  {renderInfo?.has_mp4 && (
+                                    <>
+                                      <button
+                                        className="btn-secondary"
+                                        onClick={() => handleRenderVideo('recreate')}
+                                        disabled={isRendering || currentVideoIsError}
+                                        style={{ padding: '4px 12px', fontSize: '0.8em' }}
+                                        title="Tạo mới 1 project trên Google Flow và dựng lại toàn bộ từ cảnh 1"
+                                      >
+                                        {isRendering ? '⏳ Đang dựng...' : '🔄 Tạo lại'}
+                                      </button>
+                                      <a
+                                        href={`http://127.0.0.1:8080/api/videos/${currentVideoId}/download-mp4`}
+                                        download={`video_${currentVideoId}.mp4`}
+                                        className="btn-secondary"
+                                        style={{
+                                          padding: '4px 12px',
+                                          fontSize: '0.8em',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '5px',
+                                          background: 'rgba(39, 174, 96, 0.2)',
+                                          border: '1px solid #27ae60',
+                                          color: '#2ecc71',
+                                          textDecoration: 'none',
+                                          borderRadius: '4px',
+                                          fontWeight: 'bold'
+                                        }}
+                                      >
+                                        📥 Tải Video MP4
+                                      </a>
+                                    </>
+                                  )}
+                                </div>
+                              </div>
+                              {renderInfo?.has_mp4 && (
+                                <video
+                                  controls
+                                  src={`http://127.0.0.1:8080/api/videos/${currentVideoId}/download-mp4`}
+                                  style={{
+                                    width: '100%',
+                                    maxHeight: '420px',
+                                    borderRadius: '6px',
+                                    background: '#000',
+                                    marginTop: '8px'
+                                  }}
+                                />
+                              )}
+                            </div>
                           </div>
                         )}
                         

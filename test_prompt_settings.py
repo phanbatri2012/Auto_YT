@@ -368,11 +368,166 @@ class PromptSettingsTests(unittest.TestCase):
         )
 
         saved = self.read_saved_data()
-        self.assertEqual(saved["versions"]["default"]["pipeline"], pipeline)
+        self.assertEqual(
+            saved["versions"]["default"]["pipeline"],
+            {
+                **pipeline,
+                "video_render": False,
+                "youtube_upload": False,
+                "youtube_schedule": False,
+            },
+        )
         self.assertEqual(
             saved["versions"]["second"]["pipeline"],
             before["versions"]["second"]["pipeline"],
         )
+
+    def test_pipeline_save_enables_video_render_and_persists(self):
+        result = main.save_prompt_pipeline(
+            "default",
+            main.PromptPipelineData(
+                metadata=True,
+                chapters=True,
+                thumbnail_with_text=True,
+                thumbnail_without_text=True,
+                audio=True,
+                video_render=True,
+            ),
+        )
+        saved = self.read_saved_data()
+        self.assertTrue(saved["versions"]["default"]["pipeline"]["video_render"])
+        self.assertTrue(result["pipeline"]["video_render"])
+
+    def test_image_generation_save_endpoint(self):
+        result = main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                style_prompt="cinematic dramatic lighting",
+                avoid_prompt="cartoon, 3D",
+                density=35,
+                thumbnail_variant="with_text",
+            ),
+        )
+        saved = self.read_saved_data()
+        saved_img = saved["versions"]["default"]["image_generation_settings"]
+        self.assertEqual(saved_img["style_prompt"], "cinematic dramatic lighting")
+        self.assertEqual(saved_img["avoid_prompt"], "cartoon, 3D")
+        self.assertEqual(saved_img["negative_prompt"], "cartoon, 3D")
+        self.assertEqual(saved_img["density"], 35)
+        self.assertEqual(saved_img["thumbnail_variant"], "with_text")
+        self.assertEqual(result["version"]["image_generation_settings"]["density"], 35)
+        self.assertEqual(result["version"]["image_generation_settings"]["negative_prompt"], "cartoon, 3D")
+
+    def test_image_generation_save_negative_prompt_from_frontend(self):
+        result = main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                style_prompt="cinematic dramatic lighting",
+                negative_prompt="blurry, distorted, 3D render",
+            ),
+        )
+        saved = self.read_saved_data()
+        saved_img = saved["versions"]["default"]["image_generation_settings"]
+        self.assertEqual(saved_img["negative_prompt"], "blurry, distorted, 3D render")
+        self.assertEqual(saved_img["avoid_prompt"], "blurry, distorted, 3D render")
+        self.assertEqual(
+            result["version"]["image_generation_settings"]["negative_prompt"],
+            "blurry, distorted, 3D render",
+        )
+
+    def test_image_generation_clear_negative_prompt(self):
+        main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                negative_prompt="blurry, distorted",
+                avoid_prompt="blurry, distorted",
+            ),
+        )
+        result = main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                negative_prompt="",
+                avoid_prompt="",
+            ),
+        )
+        saved = self.read_saved_data()
+        saved_img = saved["versions"]["default"]["image_generation_settings"]
+        self.assertEqual(saved_img["negative_prompt"], "")
+        self.assertEqual(saved_img["avoid_prompt"], "")
+        self.assertEqual(result["version"]["image_generation_settings"]["negative_prompt"], "")
+
+    def test_publishing_save_endpoint(self):
+        result = main.save_prompt_publishing(
+            "default",
+            main.PromptPublishingData(
+                category_id="22",
+                language="vi",
+                made_for_kids=False,
+                notify_subscribers=True,
+                contains_synthetic_media=True,
+            ),
+        )
+        saved = self.read_saved_data()
+        saved_pub = saved["versions"]["default"]["publishing_settings"]
+        self.assertEqual(saved_pub["category_id"], "22")
+        self.assertEqual(saved_pub["language"], "vi")
+        self.assertFalse(saved_pub["made_for_kids"])
+        self.assertEqual(result["version"]["publishing_settings"]["category_id"], "22")
+
+    def test_pipeline_dependencies_enable_every_required_step(self):
+        resolved, auto_enabled = chatgpt_projects.resolve_prompt_pipeline_dependencies(
+            {
+                **chatgpt_projects.DEFAULT_PROMPT_PIPELINE,
+                "metadata": False,
+                "chapters": False,
+                "thumbnail_without_text": False,
+                "audio": False,
+                "youtube_schedule": True,
+            },
+            "without_text",
+        )
+
+        self.assertTrue(resolved["youtube_upload"])
+        self.assertTrue(resolved["video_render"])
+        self.assertTrue(resolved["metadata"])
+        self.assertTrue(resolved["chapters"])
+        self.assertTrue(resolved["audio"])
+        self.assertTrue(resolved["thumbnail_without_text"])
+        self.assertEqual(len(auto_enabled), len(set(auto_enabled)))
+
+    def test_snapshot_normalization_preserves_selected_text_thumbnail(self):
+        pipeline = chatgpt_projects.normalize_prompt_pipeline(
+            {
+                **chatgpt_projects.DEFAULT_PROMPT_PIPELINE,
+                "thumbnail_with_text": True,
+                "thumbnail_without_text": False,
+                "youtube_upload": True,
+            }
+        )
+
+        self.assertTrue(pipeline["thumbnail_with_text"])
+        self.assertFalse(pipeline["thumbnail_without_text"])
+
+    def test_production_snapshot_embeds_google_flow_settings(self):
+        """Snapshot must include Google Flow image generation settings, not ComfyUI profile."""
+        version = main._read_prompts_config()["versions"]["default"]
+        version["image_generation_settings"] = {
+            "style_prompt": "cinematic documentary",
+            "avoid_prompt": "blurry text",
+            "density": 30,
+            "thumbnail_variant": "without_text",
+        }
+        snapshot = main._build_prompt_production_snapshot("default", version)
+        img = snapshot.get("image_generation_settings") or {}
+        self.assertEqual(img.get("provider"), "google_flow")
+        self.assertEqual(img.get("model"), "nano_banana_pro")
+        self.assertEqual(img.get("style_prompt"), "cinematic documentary")
+        self.assertEqual(img.get("avoid_prompt"), "blurry text")
+        self.assertEqual(img.get("density"), 30)
+        # Ensure no ComfyUI keys leak into new snapshots
+        self.assertNotIn("comfyui_workflow_profile", snapshot)
+        self.assertNotIn("workflow_profile_id", img)
+
 
     def test_rejects_blank_name_and_unknown_prompt(self):
         with self.assertRaises(HTTPException) as blank_name_error:

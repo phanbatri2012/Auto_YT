@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { openVideoWatchInGpm, openUrlInGpm } from './gpmOpener'
 
 const API_BASE = 'http://127.0.0.1:8080'
 
@@ -582,7 +583,40 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
                 <span style={{ color: publication.youtube_channel_id ? '#aaa' : '#f5b041' }}>
                   {publication.channel_title || 'Chưa gắn kênh — link chưa được xác minh'}:
                 </span>
-                <a href={publication.published_url} target="_blank" rel="noreferrer" style={{ color: '#4dd0e1', flex: 1 }}>{publication.published_title || publication.video_title || publication.published_url}</a>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (publication.video_id) {
+                      try {
+                        await openVideoWatchInGpm(publication.video_id)
+                        setMessage?.('🚀 Đã mở video trên YouTube trong Profile GPM!')
+                      } catch (err) {
+                        alert(`⚠️ Không thể mở video trong GPM: ${err.message}`)
+                      }
+                    } else if (publication.gpm_profile_id && publication.published_url) {
+                      try {
+                        await openUrlInGpm(publication.gpm_profile_id, publication.published_url)
+                      } catch (err) {
+                        alert(`⚠️ Lỗi mở trong GPM: ${err.message}`)
+                      }
+                    } else {
+                      alert('⚠️ Chưa có GPM Profile liên kết với video/kênh này.')
+                    }
+                  }}
+                  style={{
+                    color: '#4dd0e1',
+                    background: 'none',
+                    border: 'none',
+                    textAlign: 'left',
+                    cursor: 'pointer',
+                    flex: 1,
+                    textDecoration: 'underline',
+                    padding: 0
+                  }}
+                  title="Mở video trong GPM Profile của kênh"
+                >
+                  {publication.published_title || publication.video_title || publication.published_url}
+                </button>
                 {!publication.youtube_channel_id && (
                   <span style={{ color: '#888', fontSize: '.8em' }}>Bình luận chưa khả dụng</span>
                 )}

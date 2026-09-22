@@ -8,6 +8,7 @@ from collections import Counter
 
 
 REQUIRED_AUDIO_SECTIONS = ("INTRO", "BODY", "OUTRO")
+DUPLICATE_PARAGRAPH_MIN_WORDS = 25
 # Genmax voices vary considerably in cadence. Keep the estimate deliberately
 # broad and informational; it must never become a content-length requirement.
 WORDS_PER_MINUTE_SLOW = 160
@@ -139,26 +140,29 @@ def _find_duplicate_paragraphs(sections: dict[str, str]) -> list[dict[str, str]]
     for section_name, section_text in sections.items():
         for paragraph in re.split(r"\n[ \t]*\n+", section_text):
             cleaned = re.sub(r"\s+", " ", paragraph).strip()
-            if len(cleaned) < 160 or _word_count(cleaned) < 25:
+            if (
+                len(cleaned) < 160
+                or _word_count(cleaned) < DUPLICATE_PARAGRAPH_MIN_WORDS
+            ):
                 continue
-            normalized = re.sub(r"[^\w]+", " ", cleaned.lower(), flags=re.UNICODE).strip()
+            normalized = re.sub(r"\s+", " ", cleaned).strip()
             paragraphs.append((normalized, cleaned, section_name))
 
     counts = Counter(item[0] for item in paragraphs)
-    warnings: list[dict[str, str]] = []
+    duplicates: list[dict[str, str]] = []
     reported: set[str] = set()
     for normalized, paragraph, section_name in paragraphs:
         if counts[normalized] < 2 or normalized in reported:
             continue
         reported.add(normalized)
-        warnings.append(
+        duplicates.append(
             _issue(
                 "duplicate_paragraph",
                 f'Đoạn văn bị lặp {counts[normalized]} lần: “{paragraph[:100]}…”.',
                 section_name,
             )
         )
-    return warnings
+    return duplicates
 
 
 def audit_script_for_audio(script_text: str) -> dict:
@@ -206,7 +210,7 @@ def audit_script_for_audio(script_text: str) -> dict:
         )
 
     warnings.extend(_find_editorial_artifacts(sections))
-    warnings.extend(_find_duplicate_paragraphs(sections))
+    errors.extend(_find_duplicate_paragraphs(sections))
 
     word_count = _word_count(audio_script)
     character_count = len(audio_script)

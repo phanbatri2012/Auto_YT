@@ -4301,6 +4301,7 @@ def reserve_next_fb_queue_slot(
     *,
     minimum_lead_minutes: int = 30,
     clear_meta_object: bool = False,
+    max_horizon_days: int = 70,
 ) -> int:
     """Atomically reserve the next configured free slot for an item on its Fanpage."""
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
@@ -4364,7 +4365,8 @@ def reserve_next_fb_queue_slot(
         }
 
         reserved_ts = 0
-        for day_offset in range(367):
+        horizon_limit = max(1, min(int(max_horizon_days), 366))
+        for day_offset in range(horizon_limit):
             target_date = now.date() + datetime.timedelta(days=day_offset)
             for slot_time in valid_times:
                 candidate_ts = int(datetime.datetime.combine(target_date, slot_time).timestamp())
@@ -4376,6 +4378,19 @@ def reserve_next_fb_queue_slot(
                 break
             if reserved_ts:
                 break
+        if not reserved_ts and horizon_limit < 366:
+            for day_offset in range(horizon_limit, 367):
+                target_date = now.date() + datetime.timedelta(days=day_offset)
+                for slot_time in valid_times:
+                    candidate_ts = int(datetime.datetime.combine(target_date, slot_time).timestamp())
+                    if candidate_ts <= earliest_ts:
+                        continue
+                    if any(abs(candidate_ts - occupied_ts) < 900 for occupied_ts in occupied):
+                        continue
+                    reserved_ts = candidate_ts
+                    break
+                if reserved_ts:
+                    break
         if not reserved_ts:
             raise RuntimeError("Không tìm được slot Facebook trống trong 366 ngày tới")
 
@@ -4688,17 +4703,22 @@ def get_next_queue_items_for_pre_schedule(target_page_id: str, count: int) -> li
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
+        now_ts = int(datetime.datetime.now().timestamp())
         where_sql = "WHERE status IN ('pending', 'scheduled', 'error') AND (fb_post_id IS NULL OR fb_post_id = '')"
-        params = []
+        params: list[object] = []
         if target_page_id and target_page_id.strip():
             where_sql += " AND target_page_id = ?"
             params.append(target_page_id.strip())
-        params.append(max(1, count))
+        params.extend([now_ts, now_ts, max(1, count)])
 
         rows = conn.execute(f"""
             SELECT * FROM fb_crossposter_queue
             {where_sql}
-            ORDER BY sort_order ASC, id ASC
+            ORDER BY 
+                CASE WHEN scheduled_publish_time > ? THEN 0 ELSE 1 END,
+                CASE WHEN scheduled_publish_time > ? THEN scheduled_publish_time ELSE 9999999999 END ASC,
+                sort_order ASC,
+                id ASC
             LIMIT ?
         """, params).fetchall()
         return [dict(r) for r in rows]

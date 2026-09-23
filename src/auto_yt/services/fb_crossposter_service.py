@@ -1022,48 +1022,46 @@ def upload_large_video_resumable(
             if chunk_length <= 0:
                 chunk_length = min(chunk_size_bytes, file_size - start_offset)
 
-            vf.seek(start_offset)
-            chunk_data = vf.read(chunk_length)
-
-            boundary = f"----ResumableChunkBoundary{int(time.time() * 1000)}"
-            body = bytearray()
-
-            def add_chunk_field(name: str, value: str):
-                body.extend(f"--{boundary}\r\n".encode("utf-8"))
-                body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
-                body.extend(f"{value}\r\n".encode("utf-8"))
-
-            add_chunk_field("access_token", clean_token)
-            add_chunk_field("upload_phase", "transfer")
-            add_chunk_field("upload_session_id", session_id)
-            add_chunk_field("start_offset", str(start_offset))
-
-            body.extend(f"--{boundary}\r\n".encode("utf-8"))
-            body.extend(
-                b'Content-Disposition: form-data; name="video_file_chunk"; filename="chunk.bin"\r\n'
-            )
-            body.extend(b"Content-Type: application/octet-stream\r\n\r\n")
-            body.extend(chunk_data)
-            body.extend(b"\r\n")
-            body.extend(f"--{boundary}--\r\n".encode("utf-8"))
-
-            chunk_req = urllib.request.Request(
-                url,
-                data=bytes(body),
-                headers={
-                    "Content-Type": f"multipart/form-data; boundary={boundary}",
-                    "User-Agent": "NexusStudio/1.0",
-                },
-                method="POST",
-            )
-
-            # Retry loop for each chunk (up to 3 attempts with backoff)
-            max_retries = 3
+            max_retries = 5
             transfer_success = False
             last_transfer_error = None
 
             for attempt in range(1, max_retries + 1):
                 try:
+                    vf.seek(start_offset)
+                    chunk_data = vf.read(chunk_length)
+
+                    boundary = f"----ResumableChunkBoundary{int(time.time() * 1000)}"
+                    body = bytearray()
+
+                    def add_chunk_field(name: str, value: str):
+                        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+                        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+                        body.extend(f"{value}\r\n".encode("utf-8"))
+
+                    add_chunk_field("access_token", clean_token)
+                    add_chunk_field("upload_phase", "transfer")
+                    add_chunk_field("upload_session_id", session_id)
+                    add_chunk_field("start_offset", str(start_offset))
+
+                    body.extend(f"--{boundary}\r\n".encode("utf-8"))
+                    body.extend(
+                        b'Content-Disposition: form-data; name="video_file_chunk"; filename="chunk.bin"\r\n'
+                    )
+                    body.extend(b"Content-Type: application/octet-stream\r\n\r\n")
+                    body.extend(chunk_data)
+                    body.extend(b"\r\n")
+                    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+
+                    chunk_req = urllib.request.Request(
+                        url,
+                        data=bytes(body),
+                        headers={
+                            "Content-Type": f"multipart/form-data; boundary={boundary}",
+                            "User-Agent": "NexusStudio/1.0",
+                        },
+                        method="POST",
+                    )
                     with opener.open(chunk_req, timeout=180) as resp:
                         chunk_res = json.loads(resp.read().decode("utf-8"))
                         transfer_success = True
@@ -1076,6 +1074,18 @@ def upload_large_video_resumable(
                             (start_offset / file_size) * 100.0,
                         )
                         break
+                except urllib.error.HTTPError as h_err:
+                    h_body = h_err.read().decode("utf-8", errors="ignore")
+                    formatted_err = format_facebook_api_error(h_body, h_err.code)
+                    last_transfer_error = RuntimeError(f"HTTP {h_err.code}: {formatted_err}")
+                    logger.warning(
+                        "Chunk transfer attempt %d failed (offset %d): %s. Retrying in %ds...",
+                        attempt,
+                        start_offset,
+                        formatted_err,
+                        attempt * 3,
+                    )
+                    time.sleep(attempt * 3)
                 except Exception as c_err:
                     last_transfer_error = c_err
                     logger.warning(
@@ -1112,6 +1122,10 @@ def upload_large_video_resumable(
         if scheduled_publish_time <= now_ts + 600:
             raise RuntimeError(
                 "Thời điểm đặt lịch còn dưới 10 phút; cần phân bổ slot mới trước khi hoàn tất upload"
+            )
+        if scheduled_publish_time > now_ts + (70 * 86400):
+            raise RuntimeError(
+                "Thời điểm đặt lịch vượt quá giới hạn 70 ngày của Meta; cần phân bổ slot mới trước khi upload"
             )
         finish_params["published"] = "false"
         finish_params["scheduled_publish_time"] = str(scheduled_publish_time)
@@ -1332,6 +1346,10 @@ def upload_video_to_facebook(
         if scheduled_publish_time <= now_ts + 600:
             raise RuntimeError(
                 "Thời điểm đặt lịch còn dưới 10 phút; cần phân bổ slot mới trước khi upload"
+            )
+        if scheduled_publish_time > now_ts + (70 * 86400):
+            raise RuntimeError(
+                "Thời điểm đặt lịch vượt quá giới hạn 70 ngày của Meta; cần phân bổ slot mới trước khi upload"
             )
         fields["published"] = "false"
         fields["scheduled_publish_time"] = str(scheduled_publish_time)
@@ -1837,6 +1855,74 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
             state_message = "Meta Video ID không còn tồn tại hoặc không thể truy cập"
         else:
             raise
+
+    upload_session_id = str(item.get("upload_session_id") or "").strip()
+    if (
+        not dry_run
+        and upload_session_id
+        and verified_status == "processing"
+        and (
+            str(item.get("upload_phase") or "") in {"finishing", "finish_retry", "finish_failed"}
+            or (
+                isinstance(metadata.get("status"), dict)
+                and metadata["status"].get("uploading_phase", {}).get("status") == "in_progress"
+            )
+        )
+    ):
+        try:
+            proxy_url = _get_proxy_for_gpm_profile(str(settings.get("target_gpm_profile_id") or ""))
+            opener = _build_urllib_opener(proxy_url)
+            finish_url = f"{GRAPH_VIDEO_API_BASE}/{target_page_id}/videos"
+            finish_params: dict[str, str] = {
+                "access_token": access_token,
+                "upload_phase": "finish",
+                "upload_session_id": upload_session_id,
+                "title": (item.get("fb_title") or item.get("original_title") or "")[:255],
+                "description": item.get("fb_description") or item.get("original_description") or "",
+            }
+            sched_ts = int(item.get("scheduled_publish_time") or 0)
+            now_ts = int(time.time())
+            if sched_ts:
+                if sched_ts > now_ts + 600 and sched_ts <= now_ts + (70 * 86400):
+                    finish_params["published"] = "false"
+                    finish_params["scheduled_publish_time"] = str(sched_ts)
+                else:
+                    sched_ts = db.reserve_next_fb_queue_slot(item_id, max_horizon_days=70)
+                    finish_params["published"] = "false"
+                    finish_params["scheduled_publish_time"] = str(sched_ts)
+                    requested_schedule = sched_ts
+            else:
+                finish_params["published"] = "true"
+
+            finish_body = urllib.parse.urlencode(finish_params).encode("utf-8")
+            finish_req = urllib.request.Request(
+                finish_url,
+                data=finish_body,
+                headers={
+                    "User-Agent": "NexusStudio/1.0",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                method="POST",
+            )
+            with opener.open(finish_req, timeout=30) as resp:
+                fin_resp = json.loads(resp.read().decode("utf-8"))
+                if fin_resp.get("success") or fin_resp.get("id"):
+                    logger.info("Auto-finished pending Meta upload session for item #%d", item_id)
+                    time.sleep(2)
+                    metadata = get_facebook_video_metadata(
+                        video_id,
+                        access_token,
+                        target_gpm_profile_id=str(settings.get("target_gpm_profile_id") or ""),
+                    )
+                    verified_status, fields, state_message = inspect_facebook_publication(
+                        metadata,
+                        requested_schedule,
+                    )
+        except urllib.error.HTTPError as h_err:
+            h_body = h_err.read().decode("utf-8", errors="ignore")
+            logger.debug("Auto-finish attempt on item #%d HTTP %s: %s", item_id, h_err.code, h_body)
+        except Exception as f_err:
+            logger.debug("Auto-finish attempt on item #%d failed: %s", item_id, f_err)
 
     if _meta_state_is_stale(item, verified_status, metadata=metadata):
         verified_status = "stalled"
@@ -2706,10 +2792,12 @@ def process_queue_item_jit(
         db.update_fb_crossposter_queue_item(item_id, {"scheduled_publish_time": 0})
     else:
         scheduled_time = int(item.get("scheduled_publish_time") or 0)
-        if not scheduled_time:
-            raise ValueError("Video chưa có thời điểm đặt lịch")
-        if scheduled_time <= int(time.time()) + 600:
-            raise RuntimeError("Thời điểm đặt lịch còn dưới 10 phút; hãy tính lại lịch trước khi upload")
+        now_ts = int(time.time())
+        max_horizon_seconds = 70 * 86400
+        if not scheduled_time or scheduled_time <= now_ts + 600 or scheduled_time > now_ts + max_horizon_seconds:
+            logger.info("Auto-allocating valid Meta schedule slot for video #%d (current: %s)", item_id, scheduled_time)
+            scheduled_time = db.reserve_next_fb_queue_slot(item_id, max_horizon_days=70)
+            item["scheduled_publish_time"] = scheduled_time
 
     # Step 1: Set status to downloading
     db.update_fb_crossposter_queue_item(item_id, {"status": "downloading", "error_message": ""})

@@ -1639,6 +1639,98 @@ Câu chuyện về vị tướng quả cảm.
             self.assertEqual(result["scheduled_publish_time"], 1799999999)
             reserve_slot.assert_called_once_with(93, minimum_lead_minutes=30, clear_meta_object=True)
 
+    def test_reserve_next_fb_queue_slot_respects_max_horizon(self):
+        db.save_fb_crossposter_settings({
+            "target_fb_page_id": "page_horizon_test",
+            "schedule_times": ["10:00", "16:00"],
+            "daily_quota": 2,
+            "lead_time_minutes": 30,
+        })
+        items = [{
+            "youtube_id": "yt_horizon_1",
+            "original_title": "Test Horizon 1",
+            "sort_order": 1,
+            "target_page_id": "page_horizon_test",
+        }]
+        db.upsert_fb_crossposter_queue_items(items, target_page_id="page_horizon_test")
+        item_row = db.get_fb_crossposter_queue(target_page_id="page_horizon_test")["items"][0]
+        slot = db.reserve_next_fb_queue_slot(item_row["id"], max_horizon_days=70)
+        now_ts = int(datetime.datetime.now().timestamp())
+        self.assertGreater(slot, now_ts + 1800)
+        self.assertLessEqual(slot, now_ts + (70 * 86400) + 86400)
+
+    def test_get_next_queue_items_for_pre_schedule_orders_chronologically(self):
+        page_id = "page_presched_sort"
+        now_ts = int(datetime.datetime.now().timestamp())
+        items = [
+            {"youtube_id": "yt_far", "original_title": "Far Future", "sort_order": 1, "target_page_id": page_id},
+            {"youtube_id": "yt_near", "original_title": "Near Future", "sort_order": 2, "target_page_id": page_id},
+            {"youtube_id": "yt_unset", "original_title": "Unset Time", "sort_order": 3, "target_page_id": page_id},
+        ]
+        db.upsert_fb_crossposter_queue_items(items, target_page_id=page_id)
+        rows = db.get_fb_crossposter_queue(target_page_id=page_id)["items"]
+        row_map = {r["youtube_id"]: r["id"] for r in rows}
+
+        # Set scheduled times
+        db.update_fb_crossposter_queue_item(row_map["yt_far"], {"scheduled_publish_time": now_ts + 86400 * 10, "status": "scheduled"})
+        db.update_fb_crossposter_queue_item(row_map["yt_near"], {"scheduled_publish_time": now_ts + 86400 * 2, "status": "scheduled"})
+        db.update_fb_crossposter_queue_item(row_map["yt_unset"], {"scheduled_publish_time": 0, "status": "pending"})
+
+        fetched = db.get_next_queue_items_for_pre_schedule(page_id, count=3)
+        self.assertEqual(len(fetched), 3)
+        # yt_near (2 days away) should come first, then yt_far (10 days away), then yt_unset
+        self.assertEqual(fetched[0]["youtube_id"], "yt_near")
+        self.assertEqual(fetched[1]["youtube_id"], "yt_far")
+        self.assertEqual(fetched[2]["youtube_id"], "yt_unset")
+
+    def test_reconcile_auto_finishes_resumable_session(self):
+        page_id = "page_autofinish"
+        now_ts = int(datetime.datetime.now().timestamp())
+        items = [{
+            "youtube_id": "yt_auto_finish",
+            "original_title": "Auto Finish Video",
+            "sort_order": 1,
+            "target_page_id": page_id,
+        }]
+        db.upsert_fb_crossposter_queue_items(items, target_page_id=page_id)
+        item_id = db.get_fb_crossposter_queue(target_page_id=page_id)["items"][0]["id"]
+        db.update_fb_crossposter_queue_item(item_id, {
+            "upload_session_id": "sess_12345",
+            "upload_video_id": "meta_vid_12345",
+            "upload_phase": "finish_failed",
+            "scheduled_publish_time": now_ts + 7200,
+            "status": "processing",
+        })
+
+        meta_before = {
+            "id": "meta_vid_12345",
+            "published": True,
+            "status": {"video_status": "uploading", "uploading_phase": {"status": "in_progress"}},
+        }
+        meta_after = {
+            "id": "meta_vid_12345",
+            "published": False,
+            "scheduled_publish_time": datetime.datetime.fromtimestamp(now_ts + 7200, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+0000"),
+            "status": {"video_status": "processing", "uploading_phase": {"status": "complete"}},
+        }
+
+        opener = MagicMock()
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({"success": True}).encode("utf-8")
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = None
+        opener.open.return_value = resp
+
+        with (
+            patch.object(db, "get_fb_crossposter_runtime_settings", return_value={"target_access_token": "token", "target_gpm_profile_id": ""}),
+            patch.object(fb_crossposter_service, "_get_proxy_for_gpm_profile", return_value=None),
+            patch.object(fb_crossposter_service, "_build_urllib_opener", return_value=opener),
+            patch.object(fb_crossposter_service, "get_facebook_video_metadata", side_effect=[meta_before, meta_after]),
+        ):
+            res = fb_crossposter_service.reconcile_fb_queue_item(item_id)
+            self.assertEqual(res["status"], "meta_scheduled")
+            self.assertEqual(res["fb_post_id"], "meta_vid_12345")
+
 
 if __name__ == "__main__":
     unittest.main()

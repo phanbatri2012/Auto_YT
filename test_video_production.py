@@ -15,6 +15,7 @@ from auto_yt.services import database
 from auto_yt.services import publication_scheduler
 from auto_yt.services import video_production
 from auto_yt.services import youtube_publisher
+from auto_yt.services import youtube_publish_workflow
 
 
 class VideoProductionServiceTests(unittest.TestCase):
@@ -291,7 +292,13 @@ class VideoProductionServiceTests(unittest.TestCase):
                 return FakeResponse({"id": "caption-safe-test"})
             if url.startswith(f"{youtube_publisher.YOUTUBE_API_BASE}/videos?"):
                 if method == "PUT":
-                    return FakeResponse({"id": "youtube-safe-test"})
+                    request_payload = json.loads(request.data.decode("utf-8"))
+                    return FakeResponse(
+                        {
+                            "id": "youtube-safe-test",
+                            "status": request_payload["status"],
+                        }
+                    )
                 return FakeResponse(
                     {
                         "items": [
@@ -357,7 +364,7 @@ class VideoProductionServiceTests(unittest.TestCase):
             youtube_publisher.schedule_video(
                 "fake-token",
                 uploaded["id"],
-                "2026-09-20T02:00:00+00:00",
+                "2099-09-20T02:00:00+00:00",
             )
 
         self.assertEqual(created_session, session_url)
@@ -383,6 +390,9 @@ class VideoProductionServiceTests(unittest.TestCase):
         channel = database.save_youtube_channel(
             channel_id=f"UC-upload-{int(schedule)}",
             title="Upload channel",
+            access_token_encrypted="encrypted-access",
+            gpm_profile_id="gpm-profile",
+            gpm_proxy_info="127.0.0.1:8899:user:password",
         )
         channel = database.update_youtube_channel(
             channel["id"], public_upload_verified=int(schedule)
@@ -442,8 +452,6 @@ class VideoProductionServiceTests(unittest.TestCase):
         )
         return database.get_system_job(job["id"]), channel, video_id
 
-    import unittest
-    @unittest.skip("Not implemented")
     def test_upload_without_schedule_stops_at_private(self):
         job, channel, video_id = self._make_publish_job(schedule=False)
         thumbnail_directory = Path(self.temporary_directory.name) / "thumbnails"
@@ -454,14 +462,14 @@ class VideoProductionServiceTests(unittest.TestCase):
         with (
             patch.object(main, "THUMBNAILS_DIR", thumbnail_directory),
             patch.object(
-                main,
-                "_get_youtube_access_token",
-                return_value=(channel, "token"),
+                youtube_publish_workflow.youtube_comments,
+                "access_token_for_channel",
+                return_value="token",
             ),
             patch.object(
-                main.youtube_comments,
+                youtube_publish_workflow.secret_store,
                 "encrypt_secret",
-                return_value="encrypted-session",
+                side_effect=lambda value: f"encrypted:{value}",
             ),
             patch.object(
                 youtube_publisher,
@@ -474,7 +482,12 @@ class VideoProductionServiceTests(unittest.TestCase):
                 return_value={"id": "youtube-private", "snippet": {}},
             ),
             patch.object(youtube_publisher, "upload_thumbnail"),
-            patch.object(youtube_publisher, "upload_caption"),
+            patch.object(youtube_publisher, "find_caption_track", return_value=""),
+            patch.object(
+                youtube_publisher,
+                "upload_caption",
+                return_value={"id": "caption-private"},
+            ),
             patch.object(youtube_publisher, "require_processing_succeeded"),
             patch.object(youtube_publisher, "schedule_video") as schedule_video,
         ):

@@ -117,9 +117,10 @@ Use Puppeteer to search Official Docs or StackOverflow ONLY when:
 - **Dual Directory Parity**: Always maintain identical execution wrappers (`run_autoyt.bat`, `run_autoyt_restart.bat`, `run_autoyt_stop.bat`) at both the project root (`Auto_YT\`) and subfolder (`Tool-auto-login-GPT\`).
 - **Post-Fix Safe Restart & Idle Verification Invariant (MANDATORY)**:
   Whenever code fixes or modifications are completed:
-  1. **Idle Verification First**: MUST check whether any generation, TTS, rendering, or browser pipeline processes/jobs are currently running (e.g. active `system_jobs` in `processing`/`running` states, background worker loops, or active Playwright browser sessions).
+  1. **Idle Verification First**: MUST check whether any generation, TTS, rendering, or browser pipeline processes/jobs are currently running or immediately claimable. This includes `system_jobs` in `processing`/`running`, `queued`, and due `retry_wait` states, background worker loops, active Playwright sessions, and any job that can launch a channel GPM profile.
   2. **Active Process Handling**: If any background job or process is active, DO NOT restart immediately. Wait and monitor until all active jobs have completed and the system returns to an idle state.
   3. **Clean Restart**: Only once the system is verified idle, trigger `run_autoyt_restart.bat` to safely apply the code updates across all services without interrupting active work.
+  4. **No GPM Launch During Startup**: Starting or restarting Auto_YT MUST NOT directly activate comment jobs, scanners, or other channel work that can launch a GPM profile. GPM profiles may open only for work scheduled after the application is fully ready or for an explicit user action.
 
 ## 11. Anti-Detect Browser (GPM-Login) & Zero-Footprint Channel Isolation Policy
 - **GPM-Login API Versioning**:

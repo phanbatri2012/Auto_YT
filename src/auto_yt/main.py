@@ -84,6 +84,7 @@ from auto_yt.services import (
     gpm_service,
     gpm_youtube_automation,
     local_browser_service,
+    maintenance_guard,
     security_logging,
 )
 from auto_yt.services.generation_checkpoint import (
@@ -458,6 +459,11 @@ def get_health():
     }
 
 
+@app.get("/api/system/maintenance-status")
+def get_maintenance_status():
+    return maintenance_guard.get_maintenance_status()
+
+
 def _resolve_media_file(
     root: Path,
     filename: str,
@@ -675,7 +681,7 @@ class CommentVideoImportRequest(BaseModel):
 
 
 class CommentIdsRequest(BaseModel):
-    comment_ids: List[str] = Field(min_length=1, max_length=100)
+    comment_ids: List[str] = Field(min_length=1, max_length=5000)
 
 
 class CommentUpdateRequest(BaseModel):
@@ -2890,6 +2896,46 @@ def _get_youtube_access_token(channel_db_id: int) -> tuple[dict, str]:
     return channel, token
 
 
+def _reconcile_channel_publication_states(
+    channel: dict,
+    access_token: str,
+) -> int:
+    publications = db.list_channel_pending_publications(int(channel["id"]))
+    if not publications:
+        return 0
+    remote_videos = youtube_comments.get_videos_details(
+        access_token,
+        [item["youtube_video_id"] for item in publications],
+        proxy=channel.get("gpm_proxy_info"),
+    )
+    remote_by_id = {
+        item["youtube_video_id"]: item
+        for item in remote_videos
+        if item.get("youtube_video_id")
+    }
+    reconciled = 0
+    for publication in publications:
+        remote = remote_by_id.get(publication["youtube_video_id"])
+        if not remote or str(remote.get("channel_id") or "") != str(
+            channel.get("channel_id") or ""
+        ):
+            continue
+        changes = {
+            "privacy_status": str(
+                remote.get("privacy_status") or publication.get("privacy_status") or ""
+            ),
+            "scheduled_at": str(remote.get("scheduled_publish_at") or ""),
+        }
+        if remote.get("title"):
+            changes["published_title"] = str(remote["title"])
+        if remote.get("published_at"):
+            changes["published_at"] = str(remote["published_at"])
+        if any(publication.get(key) != value for key, value in changes.items()):
+            db.update_video_publication(publication["id"], **changes)
+            reconciled += 1
+    return reconciled
+
+
 def _create_comment_system_job(
     job_type: str,
     *,
@@ -3050,7 +3096,9 @@ def _reconcile_active_comment_draft_job_duplicates() -> int:
 
 def _enqueue_comment_publish_jobs(comment_ids: list[str]) -> list[dict]:
     jobs = []
-    for comment in db.get_youtube_comments(list(dict.fromkeys(comment_ids))):
+    for comment in db.get_youtube_comments(
+        list(dict.fromkeys(comment_ids))[: youtube_comments.MAX_SYNC_COMMENTS]
+    ):
         if (
             comment.get("status") in {"scheduled", "publishing", "replied"}
             or comment.get("reply_youtube_id")
@@ -3106,6 +3154,10 @@ def _execute_comment_sync_job(job: dict) -> None:
     channel_db_id = int((job.get("payload") or {}).get("channel_id") or 0)
     channel, access_token = _get_youtube_access_token(channel_db_id)
     proxy_info = channel.get("gpm_proxy_info")
+    reconciled_publications = _reconcile_channel_publication_states(
+        channel,
+        access_token,
+    )
     db.update_system_job(job["id"], progress="Đang đọc bình luận mới từ YouTube")
     remote_comments = youtube_comments.list_channel_comment_threads(
         access_token, channel["channel_id"], proxy=proxy_info
@@ -3201,7 +3253,12 @@ def _execute_comment_sync_job(job: dict) -> None:
         progress=(
             f"Đã đồng bộ {len(matched_ids)} bình luận; bỏ qua {ignored} video chưa liên kết"
         ),
-        result_json={"matched": len(matched_ids), "ignored": ignored, "draft_jobs": len(draft_jobs)},
+        result_json={
+            "matched": len(matched_ids),
+            "ignored": ignored,
+            "draft_jobs": len(draft_jobs),
+            "reconciled_publications": reconciled_publications,
+        },
         finished_at=db.utc_now(),
         error="",
     )
@@ -4039,10 +4096,12 @@ def resume_background_jobs() -> None:
     _reconcile_active_comment_draft_job_duplicates()
     db.pause_queued_attention_jobs()
     _kick_video_queue()
-    _kick_comment_queue()
     _kick_production_queue()
     _comment_sync_stop_event.clear()
-    _enqueue_due_comment_syncs()
+    # Do not activate channel jobs during application startup. A due comment
+    # publish can launch its assigned GPM profile, which must never be a side
+    # effect of starting or restarting Auto_YT. The scheduler performs the
+    # first normal queue check after the application is fully ready.
     if _comment_sync_thread is None or not _comment_sync_thread.is_alive():
         _comment_sync_thread = threading.Thread(
             target=_comment_sync_scheduler,
@@ -4762,11 +4821,12 @@ def _pause_youtube_publish_job(
 
 def _schedule_youtube_publish_recovery(job: dict, error: str) -> bool:
     current = db.get_system_job(job["id"]) or job
-    recovery_count = int(current.get("recovery_count") or 0)
-    if recovery_count >= len(YOUTUBE_RECOVERY_DELAYS_SECONDS):
-        return False
-    delay_seconds = YOUTUBE_RECOVERY_DELAYS_SECONDS[recovery_count]
     result = dict(current.get("result") or {})
+    network_retry_count = int(result.get("network_retry_count") or 0)
+    if network_retry_count >= len(YOUTUBE_RECOVERY_DELAYS_SECONDS):
+        return False
+    delay_seconds = YOUTUBE_RECOVERY_DELAYS_SECONDS[network_retry_count]
+    result["network_retry_count"] = network_retry_count + 1
     result.pop("attention_required", None)
     result.pop("missing_configuration", None)
     recovered = db.schedule_system_job_recovery(
@@ -4787,6 +4847,33 @@ def _schedule_youtube_publish_recovery(job: dict, error: str) -> bool:
         db.update_youtube_publish_workflow(
             workflow["id"], status="retry_wait", error=error
         )
+    return True
+
+
+def _schedule_youtube_processing_poll(
+    job: dict,
+    pending: youtube_publisher.YouTubeProcessingPending,
+) -> bool:
+    current = db.get_system_job(job["id"]) or job
+    result = dict(current.get("result") or {})
+    result["processing_poll_count"] = int(result.get("processing_poll_count") or 0) + 1
+    result["publish_stage"] = "processing"
+    result.pop("attention_required", None)
+    result.pop("missing_configuration", None)
+    delay_seconds = max(0.0, float(pending.delay_seconds))
+    recovered = db.schedule_system_job_recovery(
+        job["id"],
+        resume_from_step="processing",
+        delay_seconds=delay_seconds,
+        error=security_logging.redact_sensitive(str(pending)),
+        result_json=result,
+    )
+    if not recovered:
+        return False
+    db.update_system_job(
+        job["id"],
+        progress=f"YouTube đang xử lý video; kiểm tra lại sau {delay_seconds:g} giây",
+    )
     return True
 
 
@@ -4864,13 +4951,10 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             missing_configuration=["youtube_oauth"],
         )
         return
-    if isinstance(
-        exc,
-        (
-            youtube_publisher.YouTubeProcessingPending,
-            youtube_publisher.YouTubeTransientError,
-        ),
-    ) or _is_transient_youtube_error(exc):
+    if isinstance(exc, youtube_publisher.YouTubeProcessingPending):
+        if _schedule_youtube_processing_poll(job, exc):
+            return
+    elif isinstance(exc, youtube_publisher.YouTubeTransientError) or _is_transient_youtube_error(exc):
         if _schedule_youtube_publish_recovery(job, safe_error):
             return
     if workflow:
@@ -6000,6 +6084,7 @@ def _run_system_job_center_action(
                     fb_crossposter_service.start_schedule_ahead_batch(
                         target_page_id=str(page_id),
                         days_ahead=int(days_ahead),
+                        existing_sys_job_id=job_id,
                     )
                 elif item_id:
                     threading.Thread(
@@ -8358,10 +8443,14 @@ def save_prompt_pipeline(version_id: str, payload: PromptPipelineData):
         for key, enabled in validated_pipeline.items()
         if enabled and not requested_pipeline.get(key, False)
     ]
+    readiness = youtube_publish_workflow.evaluate_prompt_publish_readiness(
+        normalized_data["versions"][version_id]
+    )
     return {
         "version_id": version_id,
         "pipeline": normalized_data["versions"][version_id]["pipeline"],
         "auto_enabled": auto_enabled,
+        **readiness,
     }
 
 
@@ -8863,6 +8952,8 @@ class FBCrossPosterSettingsPayload(BaseModel):
     auto_sync_interval_hours: int = 6
     auto_sync_fixed_times: list[str] = Field(default_factory=lambda: ["06:00", "18:00"])
     auto_publish_enabled: bool = False
+    convert_to_vertical: bool = False
+    default_tags: list[str] = Field(default_factory=list)
 
 
 class FBCrossPosterSyncPayload(BaseModel):
@@ -9136,6 +9227,19 @@ def recalculate_fb_crossposter_schedule(
         "updated_count": updated_count,
         "stats": stats,
         "message": f"Đã tính toán và phân bổ lịch đăng cho {updated_count} video.",
+    }
+
+
+@app.post("/api/fb-crossposter/fix-schedule-collisions")
+def fix_fb_crossposter_schedule_collisions(page_id: str = Query(default="")):
+    """Automatically resolve schedule collisions and re-distribute queue items into unoccupied slots."""
+    result = db.fix_fb_queue_schedule_collisions(target_page_id=page_id)
+    stats = db.get_fb_crossposter_stats(page_id)
+    return {
+        "success": True,
+        "recalculated_count": result.get("recalculated_count", 0),
+        "stats": stats,
+        "message": f"Đã tự động sắp xếp lại lịch chống trùng cho {result.get('recalculated_count', 0)} video.",
     }
 
 

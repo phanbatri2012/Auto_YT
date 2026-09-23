@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 import urllib.error
@@ -26,7 +27,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageFilter, ImageOps, UnidentifiedImageError
 from yt_dlp import YoutubeDL
 
 from auto_yt.services.youtube_downloader import ensure_ffmpeg_directory
@@ -41,6 +42,11 @@ GRAPH_API_VERSION = "v26.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 GRAPH_VIDEO_API_BASE = f"https://graph-video.facebook.com/{GRAPH_API_VERSION}"
 META_THUMBNAIL_MAX_BYTES = 10 * 1024 * 1024
+VERTICAL_VIDEO_WIDTH = 1080
+VERTICAL_VIDEO_HEIGHT = 1920
+MAX_CAPTION_HASHTAGS = 5
+MAX_CUSTOM_LABELS = 8
+MAX_META_CONTENT_TAGS = 10
 
 # Concurrency guards for sync
 _sync_lock = threading.Lock()
@@ -180,8 +186,8 @@ def format_facebook_api_error(err_body: str, code: int = 400) -> str:
 
 
 def is_transient_meta_error(error_str_or_exc: Any, code: int = 400) -> bool:
-    """Determine if a Meta Graph API error is a transient/temporary cluster glitch that can be retried."""
-    if code in {500, 502, 503, 504}:
+    """Determine if a Meta Graph API error is a transient/temporary cluster glitch or rate limit that can be retried."""
+    if code in {500, 502, 503, 504, 429, 408}:
         return True
 
     err_text = str(error_str_or_exc or "").strip()
@@ -196,9 +202,9 @@ def is_transient_meta_error(error_str_or_exc: Any, code: int = 400) -> bool:
             if isinstance(err_dict, dict):
                 if err_dict.get("is_transient") is True:
                     return True
-                if err_dict.get("error_subcode") in {1363047, 1363030}:
+                if err_dict.get("error_subcode") in {1363047, 1363030, 1363019}:
                     return True
-                if err_dict.get("code") in {1, 2}:
+                if err_dict.get("code") in {1, 2, 4, 17, 341}:
                     return True
     except Exception:
         pass
@@ -206,13 +212,15 @@ def is_transient_meta_error(error_str_or_exc: Any, code: int = 400) -> bool:
     err_lower = err_text.lower()
     if '"is_transient": true' in err_lower or '"is_transient":true' in err_lower:
         return True
-    if "1363047" in err_lower:
+    if any(subcode in err_lower for subcode in ("1363047", "1363030", "1363019")):
         return True
-    if re.search(r'"code"\s*:\s*[12]\b', err_lower):
+    if re.search(r'"code"\s*:\s*(?:1|2|4|17|341)\b', err_lower):
         return True
     if "service temporarily unavailable" in err_lower or "temporarily unavailable" in err_lower:
         return True
     if "please try again" in err_lower or "vui lòng thử lại" in err_lower:
+        return True
+    if "timed out" in err_lower or "timeout" in err_lower:
         return True
 
     return False
@@ -245,24 +253,52 @@ def extract_hashtags_from_description(raw_description: str) -> list[str]:
 def get_effective_tags(
     tags: list[str] | str = None,
     raw_description: str = "",
-    max_count: int = 5,
+    max_count: int = MAX_CAPTION_HASHTAGS,
+    default_tags: list[str] | str = None,
 ) -> list[str]:
-    """Combine tags extracted from YouTube description and metadata tags, capped at max_count."""
+    """Combine default and YouTube tags in priority order, capped at max_count."""
     effective: list[str] = []
     seen: set[str] = set()
 
-    # 1. First priority: tags/hashtags directly from description
+    def add_tag(raw_tag: object, *, allow_blacklisted: bool = False) -> bool:
+        clean_name = re.sub(
+            r"[^\w\sÀ-ỹ]",
+            "",
+            str(raw_tag or "").strip().lstrip("#").strip(),
+        ).strip()
+        norm = _normalized_text(clean_name)
+        if (
+            not norm
+            or norm in seen
+            or (not allow_blacklisted and norm in GENERIC_HASHTAG_BLACKLIST)
+        ):
+            return False
+        seen.add(norm)
+        effective.append(clean_name)
+        return len(effective) >= max_count
+
+    if isinstance(default_tags, str):
+        try:
+            parsed_default_tags = json.loads(default_tags)
+            default_tags = (
+                parsed_default_tags
+                if isinstance(parsed_default_tags, list)
+                else re.split(r"[,\n]", default_tags)
+            )
+        except Exception:
+            default_tags = re.split(r"[,\n]", default_tags)
+    if isinstance(default_tags, list):
+        for raw_tag in default_tags:
+            if add_tag(raw_tag, allow_blacklisted=True):
+                return effective
+
+    # 2. Hashtags extracted directly from the source description
     desc_tags = extract_hashtags_from_description(raw_description)
     for tag_str in desc_tags:
-        clean_name = tag_str.lstrip("#").strip()
-        norm = _normalized_text(clean_name)
-        if norm and norm not in seen and norm not in GENERIC_HASHTAG_BLACKLIST:
-            seen.add(norm)
-            effective.append(clean_name)
-        if len(effective) >= max_count:
+        if add_tag(tag_str):
             return effective
 
-    # 2. Second priority: metadata tags
+    # 3. YouTube metadata tags
     if isinstance(tags, str):
         try:
             tags = json.loads(tags)
@@ -273,13 +309,7 @@ def get_effective_tags(
         for raw_tag in tags:
             if not raw_tag or not isinstance(raw_tag, str):
                 continue
-            clean_name = re.sub(r"[^\w\sÀ-ỹ]", "", raw_tag).strip()
-            norm = _normalized_text(clean_name)
-            if not norm or norm in seen or norm in GENERIC_HASHTAG_BLACKLIST:
-                continue
-            seen.add(norm)
-            effective.append(clean_name)
-            if len(effective) >= max_count:
+            if add_tag(raw_tag):
                 break
 
     return effective
@@ -314,11 +344,17 @@ def sanitize_description(raw_description: str, title: str = "") -> str:
 
 def format_hashtags(
     tags: list[str] | str = None,
-    max_count: int = 5,
+    max_count: int = MAX_CAPTION_HASHTAGS,
     raw_description: str = "",
+    default_tags: list[str] | str = None,
 ) -> str:
     """Convert a list of raw tag keywords or description hashtags into at most max_count hashtag strings."""
-    effective_tags = get_effective_tags(tags, raw_description=raw_description, max_count=max_count)
+    effective_tags = get_effective_tags(
+        tags,
+        raw_description=raw_description,
+        max_count=max_count,
+        default_tags=default_tags,
+    )
     if not effective_tags:
         return ""
 
@@ -346,11 +382,17 @@ def build_fb_caption(
     youtube_url: str = "",
     *,
     include_youtube_url: bool = False,
-    max_hashtags: int = 5,
+    max_hashtags: int = MAX_CAPTION_HASHTAGS,
+    default_tags: list[str] | str = None,
 ) -> str:
     """Combine sanitized description, at most 5 relevant hashtags, and title according to user template."""
     clean_desc = sanitize_description(raw_description, title=title)
-    hashtags_str = format_hashtags(tags, max_count=max_hashtags, raw_description=raw_description)
+    hashtags_str = format_hashtags(
+        tags,
+        max_count=max_hashtags,
+        raw_description=raw_description,
+        default_tags=default_tags,
+    )
 
     if not template or not template.strip():
         template = "{title}\n\n{clean_description}\n\n---\n📌 Like & Follow Fanpage để xem thêm nhiều video hay nhé!\n{hashtags}"
@@ -367,7 +409,41 @@ def build_fb_caption(
     return re.sub(r"\n{3,}", "\n\n", caption).strip()
 
 
-def _caption_is_automatic(item: dict[str, Any], template: str) -> bool:
+def append_missing_default_hashtags(
+    caption: str,
+    default_tags: list[str] | str = None,
+) -> str:
+    prioritized_defaults = get_effective_tags(
+        [],
+        max_count=MAX_CAPTION_HASHTAGS,
+        default_tags=default_tags,
+    )
+    if not prioritized_defaults:
+        return str(caption or "").strip()
+
+    existing = {
+        _normalized_text(tag)
+        for tag in HASHTAG_PATTERN.findall(str(caption or ""))
+        if _normalized_text(tag)
+    }
+    missing = [
+        tag for tag in prioritized_defaults if _normalized_text(tag) not in existing
+    ]
+    missing_hashtags = format_hashtags(
+        [],
+        max_count=MAX_CAPTION_HASHTAGS,
+        default_tags=missing,
+    )
+    if not missing_hashtags:
+        return str(caption or "").strip()
+    return f"{str(caption or '').strip()}\n\n{missing_hashtags}".strip()
+
+
+def _caption_is_automatic(
+    item: dict[str, Any],
+    template: str,
+    default_tags: list[str] | str = None,
+) -> bool:
     source = str(item.get("fb_description_source") or "").strip().casefold()
     if source == "manual":
         return False
@@ -384,13 +460,23 @@ def _caption_is_automatic(item: dict[str, Any], template: str) -> bool:
         template,
         item.get("youtube_url", ""),
         include_youtube_url=True,
+        default_tags=default_tags,
     )
     normalize = lambda value: re.sub(r"\s+", " ", str(value or "")).strip().casefold()
     return normalize(current_caption) == normalize(legacy_caption)
 
 
-def _unique_tag_keywords(tags: list[str] | str = None, raw_description: str = "") -> list[str]:
-    effective = get_effective_tags(tags, raw_description=raw_description, max_count=10)
+def _unique_tag_keywords(
+    tags: list[str] | str = None,
+    raw_description: str = "",
+    default_tags: list[str] | str = None,
+) -> list[str]:
+    effective = get_effective_tags(
+        tags,
+        raw_description=raw_description,
+        max_count=MAX_META_CONTENT_TAGS,
+        default_tags=default_tags,
+    )
     if not effective and tags:
         if isinstance(tags, str):
             try:
@@ -415,10 +501,16 @@ def _unique_tag_keywords(tags: list[str] | str = None, raw_description: str = ""
 def get_custom_labels(
     tags: list[str] | str = None,
     raw_description: str = "",
-    max_count: int = 8,
+    max_count: int = MAX_CUSTOM_LABELS,
+    default_tags: list[str] | str = None,
 ) -> list[str]:
     """Extract clean, human-readable Vietnamese tag strings for Meta custom_labels."""
-    candidates = get_effective_tags(tags, raw_description=raw_description, max_count=max_count)
+    candidates = get_effective_tags(
+        tags,
+        raw_description=raw_description,
+        max_count=max_count,
+        default_tags=default_tags,
+    )
     labels: list[str] = []
     seen: set[str] = set()
     for raw in candidates:
@@ -460,9 +552,14 @@ def resolve_content_tag_ids(
     access_token: str = "",
     target_gpm_profile_id: str = "",
     raw_description: str = "",
+    default_tags: list[str] | str = None,
 ) -> tuple[list[str], list[str]]:
     """Resolve YouTube tag text and domain keywords to Meta interest IDs without blocking publication."""
-    candidates = _unique_tag_keywords(tags, raw_description=raw_description)
+    candidates = _unique_tag_keywords(
+        tags,
+        raw_description=raw_description,
+        default_tags=default_tags,
+    )
     clean_token = sanitize_fb_token(access_token)
     if not candidates:
         return [], []
@@ -667,6 +764,7 @@ def sync_channel_public_videos(
 
         settings = db.get_fb_crossposter_settings(target_page_id)
         post_template = settings.get("post_template", "")
+        default_tags = settings.get("default_tags", [])
 
         items_to_upsert = []
         for idx, entry in enumerate(valid_entries):
@@ -678,7 +776,14 @@ def sync_channel_public_videos(
             yt_url = f"https://www.youtube.com/watch?v={yt_id}"
 
             thumbnail_url = entry.get("thumbnail") or f"https://i.ytimg.com/vi/{yt_id}/maxresdefault.jpg"
-            fb_caption = build_fb_caption(title, description, tags, post_template, yt_url)
+            fb_caption = build_fb_caption(
+                title,
+                description,
+                tags,
+                post_template,
+                yt_url,
+                default_tags=default_tags,
+            )
 
             items_to_upsert.append({
                 "youtube_id": yt_id,
@@ -936,7 +1041,7 @@ def upload_large_video_resumable(
                     f"Truyền dữ liệu video thất bại tại offset {start_offset}/{file_size} sau {max_retries} lần thử: {last_transfer_error}"
                 )
 
-    # --- Phase 3: Finish (with auto-retry for transient cluster errors) ---
+    # --- Phase 3: Finish (with clean urlencoded form and auto-retry for transient cluster errors) ---
     finish_params: dict[str, str] = {
         "access_token": clean_token,
         "upload_phase": "finish",
@@ -956,29 +1061,31 @@ def upload_large_video_resumable(
     else:
         finish_params["published"] = "true"
 
-    finish_files: list[tuple[str, Path, str]] = []
-    if thumb_path and thumb_path.is_file():
-        finish_files.append(("thumb", thumb_path, "image/jpeg"))
+    # Initial grace period: Allow Meta's backend cluster time to assemble and verify chunks
+    logger.info(
+        "All chunks transferred for %s (%.2f MB). Waiting 10s grace period before finalizing post...",
+        video_path.name,
+        file_size / (1024 * 1024),
+    )
+    time.sleep(10)
 
-    max_finish_retries = 3
-    finish_delays = [5, 10, 20]
+    max_finish_retries = 10
+    finish_delays = [10, 15, 20, 30, 45, 60, 60, 90, 90, 120]
     last_finish_error = None
+    finish_data: dict[str, Any] | None = None
+
+    finish_body = urllib.parse.urlencode(finish_params).encode("utf-8")
+    finish_req = urllib.request.Request(
+        url,
+        data=finish_body,
+        headers={
+            "User-Agent": "NexusStudio/1.0",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
 
     for attempt in range(1, max_finish_retries + 1):
-        finish_payload, finish_boundary = _build_multipart_body(
-            finish_params,
-            finish_files,
-        )
-        finish_req = urllib.request.Request(
-            url,
-            data=finish_payload,
-            headers={
-                "User-Agent": "NexusStudio/1.0",
-                "Content-Type": f"multipart/form-data; boundary={finish_boundary}",
-            },
-            method="POST",
-        )
-
         try:
             with opener.open(finish_req, timeout=60) as resp:
                 finish_data = json.loads(resp.read().decode("utf-8"))
@@ -990,16 +1097,38 @@ def upload_large_video_resumable(
                     attempt,
                     max_finish_retries,
                 )
-                return finish_data
+                break
         except urllib.error.HTTPError as err:
             err_msg = err.read().decode("utf-8", errors="ignore")
             formatted = format_facebook_api_error(err_msg, err.code)
             last_finish_error = RuntimeError(f"Lỗi hoàn tất upload video: {formatted}")
             is_transient = is_transient_meta_error(err_msg, err.code)
+
+            # Check if Meta backend actually processed the video despite transient response
+            check_id = video_id or session_id
+            if check_id:
+                try:
+                    check_url = f"{GRAPH_API_BASE}/{check_id}?fields=id,status&access_token={clean_token}"
+                    check_req = urllib.request.Request(
+                        check_url,
+                        headers={"User-Agent": "NexusStudio/1.0"},
+                    )
+                    with opener.open(check_req, timeout=15) as c_resp:
+                        c_data = json.loads(c_resp.read().decode("utf-8"))
+                        if c_data.get("id"):
+                            logger.info(
+                                "Video %s verified existing on Meta cluster despite transient finish response!",
+                                c_data["id"],
+                            )
+                            finish_data = {"id": c_data["id"], "success": True}
+                            break
+                except Exception:
+                    pass
+
             if attempt < max_finish_retries and is_transient:
-                delay = finish_delays[attempt - 1]
+                delay = finish_delays[min(attempt - 1, len(finish_delays) - 1)]
                 logger.warning(
-                    "Resumable Finish Phase attempt %d/%d failed with transient Meta error: %s. Retrying in %ds...",
+                    "Resumable Finish Phase attempt %d/%d failed with transient Meta error: %s. Retrying in %ds (waiting for Meta cluster to assemble video)...",
                     attempt,
                     max_finish_retries,
                     formatted,
@@ -1012,7 +1141,7 @@ def upload_large_video_resumable(
         except Exception as exc:
             last_finish_error = exc
             if attempt < max_finish_retries:
-                delay = finish_delays[attempt - 1]
+                delay = finish_delays[min(attempt - 1, len(finish_delays) - 1)]
                 logger.warning(
                     "Resumable Finish Phase attempt %d/%d failed: %s. Retrying in %ds...",
                     attempt,
@@ -1025,8 +1154,37 @@ def upload_large_video_resumable(
             logger.error("Resumable Finish Phase Failed: %s", exc)
             raise RuntimeError(f"Không thể hoàn tất upload video: {exc}") from exc
 
-    if last_finish_error:
-        raise last_finish_error
+    if not finish_data:
+        if last_finish_error:
+            raise last_finish_error
+        raise RuntimeError("Không thể hoàn tất phiên upload video lên Facebook")
+
+    fb_id = str(finish_data.get("id") or "").strip()
+
+    # Upload preferred thumbnail separately if provided
+    if thumb_path and thumb_path.is_file() and fb_id:
+        try:
+            logger.info("Uploading preferred thumbnail for resumable video %s...", fb_id)
+            thumb_body, thumb_boundary = _build_multipart_body(
+                {"access_token": clean_token, "is_preferred": "true"},
+                [("source", thumb_path, "image/jpeg")],
+            )
+            thumb_req = urllib.request.Request(
+                f"{GRAPH_API_BASE}/{fb_id}/thumbnails",
+                data=thumb_body,
+                headers={
+                    "User-Agent": "NexusStudio/1.0",
+                    "Content-Type": f"multipart/form-data; boundary={thumb_boundary}",
+                },
+                method="POST",
+            )
+            with opener.open(thumb_req, timeout=60) as t_resp:
+                t_data = json.loads(t_resp.read().decode("utf-8"))
+                logger.info("Preferred thumbnail attached to video %s successfully: %s", fb_id, t_data)
+        except Exception as t_err:
+            logger.warning("Could not attach thumbnail to video %s (video upload succeeded): %s", fb_id, t_err)
+
+    return finish_data
 
 
 def upload_video_to_facebook(
@@ -1105,8 +1263,8 @@ def upload_video_to_facebook(
 
     opener = _build_urllib_opener(proxy_url)
 
-    max_small_retries = 3
-    small_delays = [5, 10, 20]
+    max_small_retries = 5
+    small_delays = [10, 20, 30, 45, 60]
     last_small_error = None
 
     for attempt in range(1, max_small_retries + 1):
@@ -1130,7 +1288,7 @@ def upload_video_to_facebook(
             last_small_error = RuntimeError(f"Lỗi tải video lên Facebook: {formatted}")
             is_transient = is_transient_meta_error(err_body, err.code)
             if attempt < max_small_retries and is_transient:
-                delay = small_delays[attempt - 1]
+                delay = small_delays[min(attempt - 1, len(small_delays) - 1)]
                 logger.warning(
                     "Facebook Small Video Upload attempt %d/%d failed with transient error: %s. Retrying in %ds...",
                     attempt,
@@ -1145,7 +1303,7 @@ def upload_video_to_facebook(
         except Exception as exc:
             last_small_error = exc
             if attempt < max_small_retries:
-                delay = small_delays[attempt - 1]
+                delay = small_delays[min(attempt - 1, len(small_delays) - 1)]
                 logger.warning(
                     "Facebook Video Upload attempt %d/%d failed: %s. Retrying in %ds...",
                     attempt,
@@ -1160,6 +1318,116 @@ def upload_video_to_facebook(
 
     if last_small_error:
         raise last_small_error
+
+
+def convert_video_to_vertical(source_path: Path, output_path: Path) -> Path:
+    """Render a 1080x1920 H.264 copy with the full source centered over a blurred fill."""
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Không tìm thấy video nguồn để chuyển 9:16: {source_path.name}")
+
+    ffmpeg_directory = Path(ensure_ffmpeg_directory())
+    ffmpeg_executable = ffmpeg_directory / "ffmpeg.exe"
+    if not ffmpeg_executable.is_file():
+        raise RuntimeError("Không tìm thấy FFmpeg để chuyển video sang 9:16")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.unlink(missing_ok=True)
+    filter_graph = (
+        "[0:v]split=2[background][foreground];"
+        f"[background]scale={VERTICAL_VIDEO_WIDTH}:{VERTICAL_VIDEO_HEIGHT}:"
+        "force_original_aspect_ratio=increase,"
+        f"crop={VERTICAL_VIDEO_WIDTH}:{VERTICAL_VIDEO_HEIGHT},"
+        "boxblur=30:2[blurred];"
+        f"[foreground]scale={VERTICAL_VIDEO_WIDTH}:{VERTICAL_VIDEO_HEIGHT}:"
+        "force_original_aspect_ratio=decrease[content];"
+        "[blurred][content]overlay=(W-w)/2:(H-h)/2,"
+        "setsar=1,format=yuv420p[vertical]"
+    )
+    command = [
+        str(ffmpeg_executable),
+        "-y",
+        "-i",
+        str(source_path),
+        "-filter_complex",
+        filter_graph,
+        "-map",
+        "[vertical]",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "20",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not output_path.is_file() or output_path.stat().st_size <= 0:
+        output_path.unlink(missing_ok=True)
+        error_detail = str(result.stderr or "FFmpeg không tạo được file đầu ra").strip()
+        if len(error_detail) > 1200:
+            error_detail = error_detail[-1200:]
+        raise RuntimeError(f"Không thể chuyển video sang 9:16: {error_detail}")
+    return output_path
+
+
+def convert_thumbnail_to_vertical(
+    source_path: Path,
+    output_path: Path | None = None,
+) -> Path:
+    """Create a 1080x1920 JPEG with centered source artwork over a blurred fill."""
+    target_path = output_path or source_path
+    if not source_path.is_file():
+        raise FileNotFoundError(
+            f"Không tìm thấy thumbnail nguồn để chuyển 9:16: {source_path.name}"
+        )
+
+    try:
+        with Image.open(source_path) as source_image:
+            source_image.load()
+            image = source_image.convert("RGB")
+
+        target_size = (VERTICAL_VIDEO_WIDTH, VERTICAL_VIDEO_HEIGHT)
+        background = ImageOps.fit(
+            image,
+            target_size,
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        ).filter(ImageFilter.GaussianBlur(radius=32))
+        foreground = ImageOps.contain(
+            image,
+            target_size,
+            method=Image.Resampling.LANCZOS,
+        )
+        paste_position = (
+            (VERTICAL_VIDEO_WIDTH - foreground.width) // 2,
+            (VERTICAL_VIDEO_HEIGHT - foreground.height) // 2,
+        )
+        background.paste(foreground, paste_position)
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        for quality in (92, 85, 75, 65):
+            background.save(target_path, format="JPEG", quality=quality, optimize=True)
+            if target_path.stat().st_size <= META_THUMBNAIL_MAX_BYTES:
+                return target_path
+        target_path.unlink(missing_ok=True)
+        raise ValueError("Thumbnail 9:16 vẫn vượt giới hạn 10 MB của Meta")
+    except (OSError, ValueError, UnidentifiedImageError) as exc:
+        if target_path != source_path:
+            target_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Không thể chuyển thumbnail sang 9:16: {exc}") from exc
 
 
 def download_thumbnail(
@@ -1276,8 +1544,9 @@ def update_facebook_video_metadata(
     custom_labels: list[str] | None = None,
     thumb_path: Path | None = None,
     target_gpm_profile_id: str = "",
+    scheduled_publish_time: int | None = None,
 ) -> dict[str, Any]:
-    """Update an existing Page video, upload a preferred thumbnail, and verify the result."""
+    """Update an existing Page video, upload a preferred thumbnail, optionally update schedule, and verify the result."""
     clean_video_id = str(video_id or "").strip()
     clean_token = sanitize_fb_token(access_token)
     if not clean_video_id or not clean_token:
@@ -1296,6 +1565,8 @@ def update_facebook_video_metadata(
         "title": str(title or "")[:255],
         "description": str(description or ""),
     }
+    if scheduled_publish_time and scheduled_publish_time > int(time.time()) + 600:
+        update_fields["scheduled_publish_time"] = str(scheduled_publish_time)
     if content_tag_ids:
         update_fields["content_tags"] = json.dumps(content_tag_ids)
     if custom_labels:
@@ -1439,6 +1710,7 @@ def repair_fb_queue_item(
         raise ValueError("Page Access Token Facebook đang trống hoặc không hợp lệ")
     source_profile_id = str(settings.get("source_gpm_profile_id") or "")
     target_profile_id = str(settings.get("target_gpm_profile_id") or "")
+    default_tags = settings.get("default_tags", [])
     source_info = _fetch_source_metadata(item["youtube_url"], source_profile_id)
 
     source_title = str(source_info.get("title") or item.get("original_title") or "").strip()
@@ -1449,16 +1721,24 @@ def repair_fb_queue_item(
     source_thumbnail_url = str(
         source_info.get("thumbnail") or item.get("thumbnail_url") or ""
     ).strip()
-    auto_caption = _caption_is_automatic(item, settings.get("post_template", ""))
+    auto_caption = _caption_is_automatic(
+        item,
+        settings.get("post_template", ""),
+        default_tags=default_tags,
+    )
     caption = (
         build_fb_caption(
             item.get("fb_title") or source_title,
             source_description,
             source_tags,
             settings.get("post_template"),
+            default_tags=default_tags,
         )
         if auto_caption
-        else str(item.get("fb_description") or "")
+        else append_missing_default_hashtags(
+            str(item.get("fb_description") or ""),
+            default_tags,
+        )
     )
     title = str(item.get("fb_title") or source_title)
     content_tag_ids, skipped_tags = resolve_content_tag_ids(
@@ -1466,10 +1746,12 @@ def repair_fb_queue_item(
         access_token,
         target_gpm_profile_id=target_profile_id,
         raw_description=source_description,
+        default_tags=default_tags,
     )
     custom_labels = get_custom_labels(
         source_tags,
         raw_description=source_description,
+        default_tags=default_tags,
     )
 
     TEMP_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -1480,6 +1762,12 @@ def repair_fb_queue_item(
         source_gpm_profile_id=source_profile_id,
     ):
         raise RuntimeError("Không thể chuẩn bị thumbnail để sửa video Facebook")
+    if settings.get("convert_to_vertical"):
+        try:
+            convert_thumbnail_to_vertical(thumb_path)
+        except Exception:
+            thumb_path.unlink(missing_ok=True)
+            raise
 
     db.update_fb_crossposter_queue_item(item_id, {
         "original_title": source_title,
@@ -1614,6 +1902,7 @@ def process_queue_item_jit(
     v_title = item.get("fb_title") or item.get("original_title", f"Video {youtube_id}")
     source_gpm_profile_id = settings.get("source_gpm_profile_id", "")
     target_gpm_profile_id = settings.get("target_gpm_profile_id", "")
+    default_tags = settings.get("default_tags", [])
 
     # Idempotency Guard: Do not re-publish videos that have already succeeded unless explicitly forced
     existing_post_id = str(item.get("fb_post_id") or "").strip()
@@ -1671,7 +1960,9 @@ def process_queue_item_jit(
 
     TEMP_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     video_file = TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}.mp4"
+    vertical_video_file = TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}_vertical.mp4"
     thumb_file = TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}.jpg"
+    vertical_video_file.unlink(missing_ok=True)
 
     # Step 1: Set status to downloading
     db.update_fb_crossposter_queue_item(item_id, {"status": "downloading", "error_message": ""})
@@ -1709,9 +2000,6 @@ def process_queue_item_jit(
             else:
                 raise FileNotFoundError(f"Không tìm thấy file video sau khi tải: {youtube_id}")
 
-        file_size_bytes = video_file.stat().st_size
-        db.update_fb_crossposter_queue_item(item_id, {"file_size_bytes": file_size_bytes})
-
         source_title = str(source_info.get("title") or item.get("original_title") or "").strip()
         source_description = str(
             source_info.get("description") or item.get("original_description") or ""
@@ -1722,7 +2010,11 @@ def process_queue_item_jit(
         source_thumbnail_url = str(
             source_info.get("thumbnail") or item.get("thumbnail_url") or ""
         ).strip()
-        auto_caption = _caption_is_automatic(item, settings.get("post_template", ""))
+        auto_caption = _caption_is_automatic(
+            item,
+            settings.get("post_template", ""),
+            default_tags=default_tags,
+        )
 
         metadata_updates: dict[str, Any] = {
             "original_title": source_title,
@@ -1737,6 +2029,7 @@ def process_queue_item_jit(
                     source_description,
                     source_tags,
                     settings.get("post_template"),
+                    default_tags=default_tags,
                 ),
                 "fb_description_source": "auto",
             })
@@ -1753,6 +2046,28 @@ def process_queue_item_jit(
         ):
             raise RuntimeError("Không thể tải hoặc chuẩn hóa thumbnail YouTube")
 
+        upload_video_file = video_file
+        if settings.get("convert_to_vertical"):
+            if sys_job_id:
+                try:
+                    db.update_system_job(
+                        sys_job_id,
+                        status="running",
+                        progress="Đang chuyển video và thumbnail sang 9:16...",
+                    )
+                except Exception:
+                    pass
+            upload_video_file = convert_video_to_vertical(
+                video_file,
+                vertical_video_file,
+            )
+            convert_thumbnail_to_vertical(thumb_file)
+
+        db.update_fb_crossposter_queue_item(
+            item_id,
+            {"file_size_bytes": upload_video_file.stat().st_size},
+        )
+
         # Step 2: Set status to uploading
         db.update_fb_crossposter_queue_item(item_id, {"status": "uploading"})
         if sys_job_id:
@@ -1766,7 +2081,10 @@ def process_queue_item_jit(
             item.get("original_description", ""),
             item.get("original_tags", []),
             settings.get("post_template"),
+            default_tags=default_tags,
         )
+        if not auto_caption:
+            caption = append_missing_default_hashtags(caption, default_tags)
         title = item.get("fb_title") or item.get("original_title", "")
         scheduled_time = item.get("scheduled_publish_time")
         content_tag_ids, skipped_tags = resolve_content_tag_ids(
@@ -1774,10 +2092,12 @@ def process_queue_item_jit(
             access_token,
             target_gpm_profile_id=target_gpm_profile_id,
             raw_description=item.get("original_description", ""),
+            default_tags=default_tags,
         )
         custom_labels = get_custom_labels(
             item.get("original_tags", []),
             raw_description=item.get("original_description", ""),
+            default_tags=default_tags,
         )
         if skipped_tags:
             logger.warning(
@@ -1789,7 +2109,7 @@ def process_queue_item_jit(
         upload_result = upload_video_to_facebook(
             page_id=page_id,
             access_token=access_token,
-            video_path=video_file,
+            video_path=upload_video_file,
             title=title,
             description=caption,
             scheduled_publish_time=scheduled_time,
@@ -1814,7 +2134,8 @@ def process_queue_item_jit(
                     status="completed",
                     progress=(
                         f"Đăng thành công lên Fanpage (Post ID: {fb_post_id}; "
-                        f"thẻ Meta: {len(content_tag_ids)}/{len(_unique_tag_keywords(source_tags))})"
+                        f"thẻ Meta: {len(content_tag_ids)}/"
+                        f"{len(_unique_tag_keywords(source_tags, default_tags=default_tags))})"
                     ),
                     finished_at=db.utc_now(),
                 )
@@ -1852,6 +2173,11 @@ def process_queue_item_jit(
         if video_file.exists():
             try:
                 video_file.unlink()
+            except Exception:
+                pass
+        if vertical_video_file.exists():
+            try:
+                vertical_video_file.unlink()
             except Exception:
                 pass
         if thumb_file.exists():
@@ -1923,9 +2249,15 @@ def cancel_schedule_ahead_batch(task_id: str | None = None, page_id: str | None 
     return cancelled
 
 
-def _run_schedule_ahead_worker(task_id: str, target_page_id: str, days_ahead: int):
+def _run_schedule_ahead_worker(
+    task_id: str,
+    target_page_id: str,
+    days_ahead: int,
+    sys_job_id: str = "",
+):
     """Background worker thread executing the pre-scheduling batch."""
-    sys_job_id = f"fb-crosspost-{task_id}"
+    if not sys_job_id:
+        sys_job_id = f"fb-crosspost-{task_id}"
     try:
         # Fetch due items from queue that have scheduled_publish_time set within range
         items = db.get_fb_queue_items_for_schedule_ahead(days_ahead=days_ahead, target_page_id=target_page_id)
@@ -1946,6 +2278,7 @@ def _run_schedule_ahead_worker(task_id: str, target_page_id: str, days_ahead: in
             pass
 
         completed_count = 0
+        last_error = ""
         for idx, item in enumerate(items):
             # Check cancel request (from RAM or system_jobs)
             sys_job = db.get_system_job(sys_job_id) if hasattr(db, "get_system_job") else None
@@ -2002,6 +2335,32 @@ def _run_schedule_ahead_worker(task_id: str, target_page_id: str, days_ahead: in
                 _schedule_ahead_tasks[task_id]["completed_count"] = completed_count
                 _schedule_ahead_tasks[task_id]["progress_percent"] = round(((idx + 1) / len(items)) * 100, 1)
 
+            # Cooldown pause between consecutive videos to allow Meta ingest pipeline to settle
+            if idx < len(items) - 1:
+                with _schedule_ahead_lock:
+                    _schedule_ahead_tasks[task_id]["phase"] = "cooldown"
+                logger.info(
+                    "Video %d/%d processed. Pausing 15s cooldown before next video in batch...",
+                    idx + 1,
+                    len(items),
+                )
+                try:
+                    db.update_system_job(
+                        sys_job_id,
+                        progress=f"[{idx + 1}/{len(items)}] Hoàn tất. Đang nghỉ 15s trước video tiếp theo...",
+                    )
+                except Exception:
+                    pass
+                for _ in range(15):
+                    sys_job = db.get_system_job(sys_job_id) if hasattr(db, "get_system_job") else None
+                    if (
+                        _schedule_ahead_tasks[task_id].get("cancel_requested")
+                        or (sys_job and sys_job.get("cancel_requested") == 1)
+                        or (sys_job and sys_job.get("status") == "canceled")
+                    ):
+                        break
+                    time.sleep(1)
+
         if completed_count == 0 and len(items) > 0:
             msg = f"Lỗi: Không thể tải/đăng video nào ({last_error or 'Lỗi kết nối Facebook'})"
             task_status = "error"
@@ -2043,7 +2402,11 @@ def _run_schedule_ahead_worker(task_id: str, target_page_id: str, days_ahead: in
             pass
 
 
-def start_schedule_ahead_batch(target_page_id: str, days_ahead: int) -> dict[str, Any]:
+def start_schedule_ahead_batch(
+    target_page_id: str,
+    days_ahead: int,
+    existing_sys_job_id: str = "",
+) -> dict[str, Any]:
     """Start background sequential batch upload to Meta Cloud for N days ahead."""
     if days_ahead < 1 or days_ahead > 60:
         raise ValueError("Số ngày đặt lịch trước phải từ 1 đến 60 ngày")
@@ -2054,11 +2417,20 @@ def start_schedule_ahead_batch(target_page_id: str, days_ahead: int) -> dict[str
     if not settings.get("target_fb_page_id") and not target_page_id:
         raise ValueError("Chưa cấu hình Fanpage ID cho chiến dịch này.")
 
-    task_id = f"task_{int(time.time())}_{target_page_id or 'default'}"
+    if existing_sys_job_id:
+        sys_job_id = existing_sys_job_id
+        if sys_job_id.startswith("fb-crosspost-"):
+            task_id = sys_job_id[len("fb-crosspost-"):]
+        else:
+            task_id = f"task_{int(time.time())}_{target_page_id or 'default'}"
+    else:
+        task_id = f"task_{int(time.time())}_{target_page_id or 'default'}"
+        sys_job_id = f"fb-crosspost-{task_id}"
+
     with _schedule_ahead_lock:
         # Check if already running for this page
         for tid, tdata in _schedule_ahead_tasks.items():
-            if tdata.get("page_id") == target_page_id and tdata.get("status") in {"running", "starting"}:
+            if tid != task_id and tdata.get("page_id") == target_page_id and tdata.get("status") in {"running", "starting"}:
                 return tdata
 
         task_record = {
@@ -2078,23 +2450,23 @@ def start_schedule_ahead_batch(target_page_id: str, days_ahead: int) -> dict[str
         }
         _schedule_ahead_tasks[task_id] = task_record
 
-    # Create system_job for central monitoring in Job Center
+    # Create or update system_job for central monitoring in Job Center
     try:
         page_name = settings.get("page_name") or target_page_id or "Fanpage"
-        sys_job_id = f"fb-crosspost-{task_id}"
-        db.create_system_job(
-            job_id=sys_job_id,
-            job_type="fb_crosspost",
-            title=f"Đăng chéo Facebook ({page_name}) - Đặt lịch {days_ahead} ngày",
-            payload={"task_id": task_id, "page_id": target_page_id, "days_ahead": days_ahead},
-        )
+        if not existing_sys_job_id:
+            db.create_system_job(
+                job_id=sys_job_id,
+                job_type="fb_crosspost",
+                title=f"Đăng chéo Facebook ({page_name}) - Đặt lịch {days_ahead} ngày",
+                payload={"task_id": task_id, "page_id": target_page_id, "days_ahead": days_ahead},
+            )
         db.update_system_job(sys_job_id, status="running", progress="Đang khởi tạo danh sách video...")
     except Exception as exc:
         logger.warning("Could not register fb_crosspost system_job: %s", exc)
 
     worker_thread = threading.Thread(
         target=_run_schedule_ahead_worker,
-        args=(task_id, target_page_id, days_ahead),
+        args=(task_id, target_page_id, days_ahead, sys_job_id),
         name=f"ScheduleAheadWorker-{target_page_id}",
         daemon=True,
     )

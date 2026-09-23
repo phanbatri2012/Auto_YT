@@ -193,6 +193,21 @@ class PromptSettingsTests(unittest.TestCase):
 
         self.assertEqual(error.exception.status_code, 400)
 
+    def test_pipeline_save_returns_stable_publish_readiness_codes(self):
+        response = main.save_prompt_pipeline(
+            "default",
+            main.PromptPipelineData(
+                youtube_upload=True,
+                youtube_schedule=True,
+            ),
+        )
+
+        self.assertFalse(response["ready"])
+        self.assertIn(
+            "default_youtube_channel_id", response["missing_configuration"]
+        )
+        self.assertIn("made_for_kids", response["missing_configuration"])
+
     def test_disconnecting_channel_clears_every_prompt_reference(self):
         data = self.read_saved_data()
         for version in data["versions"].values():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import mimetypes
 import re
@@ -30,6 +31,18 @@ class YouTubeUploadReconciliationRequired(YouTubePublishError):
 
 
 class YouTubePublicUploadRestricted(YouTubePublishError):
+    pass
+
+
+class YouTubeAuthenticationError(YouTubePublishError):
+    pass
+
+
+class YouTubeQuotaExceeded(YouTubePublishError):
+    pass
+
+
+class YouTubeProcessingFailed(YouTubePublishError):
     pass
 
 
@@ -80,8 +93,26 @@ def _publish_error_from_http(error: urllib.error.HTTPError) -> YouTubePublishErr
             "YouTube giới hạn video của API project ở chế độ Private; "
             "hãy hoàn tất API Compliance Audit trước khi đặt lịch."
         )
-    if error.code == 429 or 500 <= error.code <= 599:
+    if error.code == 401 or reasons & {
+        "authError",
+        "invalidCredentials",
+        "youtubeSignupRequired",
+    }:
+        return YouTubeAuthenticationError(
+            "Quyền OAuth YouTube không còn hợp lệ; hãy kết nối lại kênh."
+        )
+    if reasons & {"quotaExceeded", "dailyLimitExceeded", "uploadLimitExceeded"}:
+        return YouTubeQuotaExceeded(
+            "YouTube API đã hết quota; hãy chờ quota được cấp lại rồi tiếp tục."
+        )
+    if (
+        error.code == 429
+        or reasons & {"rateLimitExceeded", "userRateLimitExceeded"}
+        or 500 <= error.code <= 599
+    ):
         return YouTubeTransientError(message)
+    if error.code == 403:
+        return YouTubeAuthenticationError(message)
     return YouTubePublishError(message)
 
 
@@ -141,9 +172,12 @@ def build_upload_metadata(video: dict, publishing_settings: dict) -> dict:
         "status": {
             "privacyStatus": "private",
             "selfDeclaredMadeForKids": made_for_kids,
-            "containsSyntheticMedia": True,
+            "containsSyntheticMedia": bool(
+                publishing_settings.get("contains_synthetic_media", True)
+            ),
             "embeddable": True,
             "license": "youtube",
+            "publicStatsViewable": True,
         },
     }
 
@@ -396,21 +430,72 @@ def require_processing_succeeded(token: str, youtube_video_id: str, proxy: str |
             or details["processing"].get("processingFailureReason")
             or "unknown"
         )
-        raise YouTubePublishError(f"YouTube xử lý video thất bại: {reason}")
+        raise YouTubeProcessingFailed(f"YouTube xử lý video thất bại: {reason}")
     if upload_status != "processed" and processing_status != "succeeded":
         raise YouTubeProcessingPending("YouTube vẫn đang xử lý video.")
     return details
 
 
-def schedule_video(token: str, youtube_video_id: str, publish_at: str, proxy: str | None = None) -> dict:
+def _parse_api_datetime(value: str) -> dt.datetime:
+    parsed = dt.datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def schedule_video(
+    token: str,
+    youtube_video_id: str,
+    publish_at: str,
+    *,
+    preserved_status: dict | None = None,
+    proxy: str | None = None,
+) -> dict:
+    try:
+        requested_publish_at = _parse_api_datetime(publish_at)
+    except (TypeError, ValueError) as exc:
+        raise YouTubePublishError("Khung giờ đăng YouTube không hợp lệ.") from exc
+    if requested_publish_at <= dt.datetime.now(dt.timezone.utc):
+        raise YouTubePublishError(
+            "Từ chối đặt lịch YouTube trong quá khứ để tránh công khai ngay lập tức."
+        )
+    source_status = preserved_status if isinstance(preserved_status, dict) else {}
+    status = {
+        "privacyStatus": "private",
+        "publishAt": publish_at,
+        "selfDeclaredMadeForKids": bool(
+            source_status.get("selfDeclaredMadeForKids", False)
+        ),
+        "containsSyntheticMedia": bool(
+            source_status.get("containsSyntheticMedia", True)
+        ),
+        "license": str(source_status.get("license") or "youtube"),
+        "embeddable": bool(source_status.get("embeddable", True)),
+        "publicStatsViewable": bool(source_status.get("publicStatsViewable", True)),
+    }
     query = urllib.parse.urlencode({"part": "status"})
-    return _api_json(
+    result = _api_json(
         f"{YOUTUBE_API_BASE}/videos?{query}",
         token,
         method="PUT",
-        payload={
-            "id": youtube_video_id,
-            "status": {"privacyStatus": "private", "publishAt": publish_at},
-        },
+        payload={"id": youtube_video_id, "status": status},
         proxy=proxy,
     )
+    response_status = result.get("status") if isinstance(result, dict) else None
+    try:
+        confirmed_publish_at = _parse_api_datetime(
+            str((response_status or {}).get("publishAt") or "")
+        )
+    except (TypeError, ValueError) as exc:
+        raise YouTubeUploadReconciliationRequired(
+            "YouTube đã nhận yêu cầu nhưng không xác nhận khung giờ; cần đối soát từ xa."
+        ) from exc
+    if (
+        str(result.get("id") or "") != youtube_video_id
+        or str((response_status or {}).get("privacyStatus") or "") != "private"
+        or confirmed_publish_at != requested_publish_at
+    ):
+        raise YouTubeUploadReconciliationRequired(
+            "YouTube trả về trạng thái đặt lịch không khớp; cần đối soát từ xa."
+        )
+    return result

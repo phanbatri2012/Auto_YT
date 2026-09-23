@@ -77,6 +77,21 @@ const PIPELINE_STEP_LABELS = Object.fromEntries(
   PIPELINE_STEPS.map(step => [step.key, step.label])
 );
 
+const PUBLISH_CONFIGURATION_LABELS = {
+  default_youtube_channel_id: 'kênh YouTube mặc định',
+  youtube_oauth: 'OAuth YouTube',
+  gpm_profile_id: 'GPM Profile riêng',
+  gpm_profile_exclusive: 'GPM Profile không dùng chung với kênh khác',
+  gpm_proxy_info: 'proxy riêng của GPM Profile',
+  publication_timezone: 'múi giờ đăng',
+  publication_slots: 'khung giờ đăng',
+  publication_daily_limit: 'giới hạn video mỗi ngày',
+  publication_lead_minutes: 'khoảng an toàn trước giờ đăng',
+  publication_paused: 'bỏ tạm dừng lịch đăng',
+  public_upload_verified: 'xác minh quyền đặt lịch public',
+  made_for_kids: 'lựa chọn dành cho trẻ em'
+};
+
 function pipelineDependencies(thumbnailVariant) {
   return {
     video_render: ['audio', 'chapters'],
@@ -709,11 +724,21 @@ export default function Settings({
           }
         }
       }));
+      const notices = [];
       if (Array.isArray(result.auto_enabled) && result.auto_enabled.length) {
-        setPipelineNotice(
+        notices.push(
           `Backend đã tự bật: ${result.auto_enabled.map(key => PIPELINE_STEP_LABELS[key]).join(', ')}.`
         );
       }
+      if (result.ready === false) {
+        const missing = (result.missing_configuration || [])
+          .map(key => PUBLISH_CONFIGURATION_LABELS[key] || key)
+          .join(', ');
+        notices.push(`Chưa sẵn sàng chạy tự động: ${missing}.`);
+      } else if (result.pipeline?.youtube_upload) {
+        notices.push('Cấu hình upload/đặt lịch đã sẵn sàng; artifact sẽ được kiểm tra lại khi job chạy.');
+      }
+      setPipelineNotice(notices.join(' '));
     }
   };
 
@@ -1430,7 +1455,10 @@ export default function Settings({
           Kết quả: <strong>{pipelineOutcome(currentPipeline)}</strong>
         </div>
         {pipelineNotice && (
-          <div className="help-text" style={{ marginTop: 8, color: '#4dd0e1' }}>
+          <div className="help-text" style={{
+            marginTop: 8,
+            color: pipelineNotice.includes('Chưa sẵn sàng') ? '#f5b041' : '#4dd0e1'
+          }}>
             {pipelineNotice}
           </div>
         )}

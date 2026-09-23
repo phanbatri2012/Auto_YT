@@ -36,16 +36,18 @@ function voiceProviderName(providerId) {
 }
 
 function videoProductionStatus(video) {
-  if (video.publish_status === 'published' || video.publication_privacy_status === 'public') return { label: 'Đã đăng', color: '#4caf50' }
+  if (['public', 'published'].includes(video.publish_status) || video.publication_privacy_status === 'public') return { label: 'Đã đăng', color: '#4caf50' }
   if (video.publish_status === 'scheduled') return { label: 'Đã lên lịch', color: '#4dd0e1' }
   if (video.publish_status === 'uploaded_private') return { label: 'Private', color: '#b794f6' }
-  if (video.current_stage === 'youtube_processing') return { label: 'YouTube đang xử lý', color: '#4dd0e1' }
-  if (['youtube_upload', 'youtube_assets'].includes(video.current_stage)) return { label: 'Đang upload', color: '#4dd0e1' }
-  if (video.current_stage === 'youtube_schedule') return { label: 'Đang đặt lịch', color: '#4dd0e1' }
+  if (video.publish_status === 'paused') return { label: 'Tạm dừng đăng', color: '#f1c40f' }
+  if (video.publish_status === 'canceled') return { label: 'Đã hủy đăng', color: '#999' }
+  if (video.publish_status === 'processing' || video.current_stage === 'processing') return { label: 'YouTube đang xử lý', color: '#4dd0e1' }
+  if (['session_created', 'uploading', 'uploaded', 'thumbnail_done', 'caption_done'].includes(video.current_stage)) return { label: 'Đang upload', color: '#4dd0e1' }
+  if (video.current_stage === 'slot_reserved') return { label: 'Đang đặt lịch', color: '#4dd0e1' }
   if (video.render_status === 'waiting_for_image_service') return { label: 'Chờ tạo ảnh', color: '#f5b041' }
   if (video.current_stage === 'scene_generation' && video.render_status === 'running') return { label: 'Đang tạo ảnh', color: '#b794f6' }
   if (video.render_status === 'running') return { label: 'Đang render', color: '#b794f6' }
-  if (video.render_status === 'done' && !video.publish_status) return { label: 'MP4 đã hoàn thành', color: '#4dd0e1' }
+  if (['done', 'completed'].includes(video.render_status) && !video.publish_status) return { label: 'MP4 đã hoàn thành', color: '#4dd0e1' }
   if (video.render_status === 'error' || video.publish_status === 'error') return { label: 'Lỗi pipeline', color: '#ff6b6b' }
   return null
 }

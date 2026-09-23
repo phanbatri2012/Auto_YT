@@ -50,6 +50,19 @@ function formatBytes(bytes) {
   return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`
 }
 
+function normalizeDefaultTags(value) {
+  const seen = new Set()
+  return String(value || '')
+    .split(/[,\n]/)
+    .map(tag => tag.trim().replace(/^#+/, '').replace(/\s+/g, ' '))
+    .filter(tag => {
+      const key = tag.toLocaleLowerCase('vi-VN')
+      if (!tag || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+}
+
 export default function CrossPoster() {
   // Campaigns & Active Page Tab
   const [campaigns, setCampaigns] = useState([])
@@ -75,8 +88,11 @@ export default function CrossPoster() {
     auto_sync_interval_hours: 6,
     auto_sync_fixed_times: ['06:00', '18:00'],
     auto_publish_enabled: false,
+    convert_to_vertical: false,
+    default_tags: [],
     last_synced_at: ''
   })
+  const [defaultTagsDraft, setDefaultTagsDraft] = useState('')
 
   const [stats, setStats] = useState({
     total: 0,
@@ -198,6 +214,11 @@ export default function CrossPoster() {
 
       if (data.settings) {
         setSettings(prev => ({ ...prev, ...data.settings, target_access_token: '' }))
+        setDefaultTagsDraft(
+          Array.isArray(data.settings.default_tags)
+            ? data.settings.default_tags.join(', ')
+            : ''
+        )
       }
       if (data.stats) {
         setStats(data.stats)
@@ -348,7 +369,8 @@ export default function CrossPoster() {
 
       const settingsToSave = {
         ...settings,
-        schedule_times: currentTimes
+        schedule_times: currentTimes,
+        default_tags: normalizeDefaultTags(defaultTagsDraft)
       }
 
       const params = new URLSearchParams()
@@ -365,6 +387,11 @@ export default function CrossPoster() {
       const data = await res.json()
       if (data.settings) {
         setSettings(prev => ({ ...prev, ...data.settings, target_access_token: '' }))
+        setDefaultTagsDraft(
+          Array.isArray(data.settings.default_tags)
+            ? data.settings.default_tags.join(', ')
+            : ''
+        )
       }
       setNewTimeSlot('')
       setIsAddingTime(false)
@@ -1352,7 +1379,43 @@ export default function CrossPoster() {
               </div>
             </div>
 
-            {/* Row 4: Post Template */}
+            {/* Row 4: Vertical Media & Default Tags */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+              <div className="fb-form-group" style={{ background: 'rgba(56, 189, 248, 0.06)', padding: '14px', borderRadius: '8px' }}>
+                <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(settings.convert_to_vertical)}
+                    onChange={(e) => setSettings(prev => ({ ...prev, convert_to_vertical: e.target.checked }))}
+                  />
+                  <span>Chuyển video & thumbnail sang 9:16 – nền mờ</span>
+                </label>
+                <span style={{ fontSize: '0.78rem', color: '#94a3b8' }}>
+                  Khi bật, file được chuyển thành 1080×1920 trước khi upload. Nội dung 16:9 được giữ trọn ở giữa và không bị crop.
+                </span>
+              </div>
+
+              <div className="fb-form-group">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label>Tag mặc định của Fanpage</label>
+                  <span style={{ fontSize: '0.75rem', color: '#38bdf8' }}>
+                    {normalizeDefaultTags(defaultTagsDraft).length} tag
+                  </span>
+                </div>
+                <textarea
+                  className="fb-textarea"
+                  rows="3"
+                  value={defaultTagsDraft}
+                  onChange={(e) => setDefaultTagsDraft(e.target.value)}
+                  placeholder="Ví dụ: Tên thương hiệu, Lịch sử Việt Nam, Kiến thức"
+                />
+                <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>
+                  Phân cách bằng dấu phẩy hoặc xuống dòng. Tag mặc định được ưu tiên trước; tối đa 5 hashtag caption, 8 custom labels và 10 Meta content tags.
+                </span>
+              </div>
+            </div>
+
+            {/* Row 5: Post Template */}
             <div className="fb-form-group">
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <label>Khung mẫu bài đăng (Post Template)</label>

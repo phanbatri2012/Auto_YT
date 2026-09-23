@@ -4,6 +4,7 @@ cd /d "%~dp0"
 
 title Restart Auto_YT
 set "AUTOYT_NO_PAUSE=1"
+set "AUTOYT_REQUIRE_GPM_IDLE=1"
 
 echo [Auto_YT] Stopping the current system...
 call "%~dp0run_autoyt_stop.bat"

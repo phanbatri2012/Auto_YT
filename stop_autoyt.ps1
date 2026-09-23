@@ -25,6 +25,32 @@ function Write-Step {
     Write-Host "[Auto_YT] $Message" -ForegroundColor Cyan
 }
 
+function Get-RestartMaintenanceStatus {
+    $pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
+        throw "Cannot verify GPM jobs because the project Python environment is missing."
+    }
+
+    $previousPythonPath = $env:PYTHONPATH
+    $previousPythonIoEncoding = $env:PYTHONIOENCODING
+    try {
+        $env:PYTHONPATH = Join-Path $projectRoot "src"
+        $env:PYTHONIOENCODING = "utf-8"
+        $statusJson = & $pythonPath -m auto_yt.services.maintenance_guard
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($statusJson)) {
+            throw "Maintenance guard returned no status."
+        }
+        return ($statusJson | ConvertFrom-Json)
+    }
+    catch {
+        throw "Cannot verify whether GPM channel jobs are idle: $($_.Exception.Message)"
+    }
+    finally {
+        $env:PYTHONPATH = $previousPythonPath
+        $env:PYTHONIOENCODING = $previousPythonIoEncoding
+    }
+}
+
 function Get-ProcessSnapshot {
     return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
 }
@@ -168,6 +194,16 @@ if (-not $createdNew) {
 
 try {
     Write-Step "Analyzing running Auto_YT services and processes..."
+
+    if ($env:AUTOYT_REQUIRE_GPM_IDLE -eq "1") {
+        $maintenanceStatus = Get-RestartMaintenanceStatus
+        if ($maintenanceStatus -and -not $maintenanceStatus.safe_to_restart) {
+            foreach ($job in @($maintenanceStatus.gpm_blocking_jobs) | Select-Object -First 5) {
+                Write-Warning "GPM job is not idle: $($job.status) - $($job.channel_title) - $($job.title)"
+            }
+            throw "Restart blocked because a queued or active job can open a channel GPM profile. Let the job finish or pause it, then retry."
+        }
+    }
     
     Request-BrowserServiceStop "chatgpt_browser_service"
     Request-BrowserServiceStop "google_flow_browser_service"

@@ -639,6 +639,7 @@ def init_db():
             reply_published_at TEXT DEFAULT '',
             auto_reply_priority INTEGER DEFAULT 0,
             auto_reply_reason TEXT DEFAULT '',
+            is_hearted INTEGER DEFAULT 0,
             error TEXT DEFAULT '',
             synced_at TEXT NOT NULL,
             created_at TEXT NOT NULL,
@@ -677,6 +678,7 @@ def init_db():
         "reply_published_at TEXT DEFAULT ''",
         "auto_reply_priority INTEGER DEFAULT 0",
         "auto_reply_reason TEXT DEFAULT ''",
+        "is_hearted INTEGER DEFAULT 0",
     ):
         try:
             c.execute(f"ALTER TABLE youtube_comments ADD COLUMN {column_definition}")
@@ -806,6 +808,8 @@ def init_db():
             auto_sync_fixed_times_json TEXT DEFAULT '["06:00", "18:00"]',
             last_synced_at TEXT DEFAULT '',
             auto_publish_enabled INTEGER DEFAULT 0,
+            convert_to_vertical INTEGER DEFAULT 0,
+            default_tags_json TEXT DEFAULT '[]',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT ''
         )
@@ -846,6 +850,16 @@ def init_db():
         )
     except sqlite3.OperationalError:
         pass
+    for column_definition in (
+        "convert_to_vertical INTEGER DEFAULT 0",
+        "default_tags_json TEXT DEFAULT '[]'",
+    ):
+        try:
+            c.execute(
+                f"ALTER TABLE fb_crossposter_settings ADD COLUMN {column_definition}"
+            )
+        except sqlite3.OperationalError:
+            pass
     _migrate_fb_crossposter_token_storage(conn)
 
     _backup_database_before_video_production()
@@ -1216,7 +1230,8 @@ def get_all_videos(
         "COALESCE(NULLIF(generated_title, ''), title) AS title, "
         'created_at, is_published, video_status, chat_url, '
         'prompt_version, voice_id, voice_name, tts_provider_id, '
-        'audio_duration_seconds, '
+        'audio_duration_seconds, render_status, publish_status, current_stage, '
+        'production_progress, blocking_reason, '
         "COALESCE((SELECT status FROM audio_reviews WHERE video_id = videos.id), '') "
         'AS audio_review_status, '
         'SUBSTR(generated_script, 1, 300) as snippet, '
@@ -1226,6 +1241,15 @@ def get_all_videos(
         "COALESCE((SELECT youtube_video_id FROM video_publications "
         "WHERE video_id = videos.id ORDER BY id DESC LIMIT 1), '') "
         'AS published_youtube_video_id, '
+        "COALESCE((SELECT privacy_status FROM video_publications "
+        "WHERE video_id = videos.id ORDER BY id DESC LIMIT 1), '') "
+        'AS publication_privacy_status, '
+        "COALESCE((SELECT processing_status FROM video_publications "
+        "WHERE video_id = videos.id ORDER BY id DESC LIMIT 1), '') "
+        'AS publication_processing_status, '
+        "COALESCE((SELECT scheduled_at FROM video_publications "
+        "WHERE video_id = videos.id ORDER BY id DESC LIMIT 1), '') "
+        'AS publication_scheduled_at, '
         'COALESCE('
         'NULLIF((SELECT audio_url FROM audio_tasks WHERE video_id = videos.id), \'\'), '
         'CASE WHEN INSTR(generated_script, \'### [AUDIO]\') > 0 '
@@ -1925,6 +1949,10 @@ def save_video_publication(
     published_url: str,
     published_title: str = "",
     published_at: str = "",
+    privacy_status: str = "public",
+    processing_status: str = "succeeded",
+    scheduled_at: str = "",
+    artifact_hash: str = "",
 ) -> dict:
     now = utc_now()
     conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
@@ -1966,14 +1994,19 @@ def save_video_publication(
             '''
             INSERT INTO video_publications (
                 video_id, youtube_channel_id, youtube_video_id, published_url,
-                published_title, published_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                published_title, published_at, privacy_status, processing_status,
+                scheduled_at, artifact_hash, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(youtube_video_id) DO UPDATE SET
                 video_id = excluded.video_id,
                 youtube_channel_id = excluded.youtube_channel_id,
                 published_url = excluded.published_url,
                 published_title = excluded.published_title,
                 published_at = excluded.published_at,
+                privacy_status = excluded.privacy_status,
+                processing_status = excluded.processing_status,
+                scheduled_at = excluded.scheduled_at,
+                artifact_hash = excluded.artifact_hash,
                 updated_at = excluded.updated_at
             ''',
             (
@@ -1983,11 +2016,25 @@ def save_video_publication(
                 published_url,
                 published_title,
                 published_at,
+                privacy_status,
+                processing_status,
+                scheduled_at,
+                artifact_hash,
                 now,
                 now,
             ),
         )
-        conn.execute("UPDATE videos SET is_published = 1 WHERE id = ?", (video_id,))
+        conn.execute(
+            """
+            UPDATE videos
+            SET is_published = CASE WHEN EXISTS (
+                SELECT 1 FROM video_publications
+                WHERE video_id = ? AND privacy_status = 'public'
+            ) THEN 1 ELSE 0 END
+            WHERE id = ?
+            """,
+            (video_id, video_id),
+        )
         row = conn.execute(
             "SELECT * FROM video_publications WHERE youtube_video_id = ?",
             (youtube_video_id,),
@@ -2305,6 +2352,7 @@ def update_youtube_comment(comment_id: str, **changes) -> dict | None:
         "reply_published_at",
         "auto_reply_priority",
         "auto_reply_reason",
+        "is_hearted",
     }
     invalid = set(changes) - allowed
     if invalid:
@@ -3554,7 +3602,7 @@ def retry_system_job(job_id: str) -> dict | None:
     job = get_system_job(job_id)
     if not job:
         return None
-    if job["status"] not in {"error", "canceled"}:
+    if job["status"] not in {"error", "failed", "canceled"}:
         raise ValueError("Chỉ có thể chạy lại job lỗi hoặc đã hủy.")
     if job.get("video_id") is not None:
         video = get_video(int(job["video_id"]))
@@ -3601,6 +3649,29 @@ init_db()
 # Facebook Cross-Poster Database Methods
 # =========================================================================
 
+
+def _normalize_fb_crossposter_default_tags(value: object) -> list[str]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            value = parsed if isinstance(parsed, list) else re.split(r"[,\n]", value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value = re.split(r"[,\n]", value)
+    if not isinstance(value, list):
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_tag in value:
+        tag = re.sub(r"\s+", " ", str(raw_tag or "").strip().lstrip("#").strip())
+        key = tag.casefold()
+        if not tag or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(tag)
+    return normalized
+
+
 def _load_fb_crossposter_settings(page_id: str | None = None) -> dict:
     """Load one settings row, including encrypted fields for trusted backend callers."""
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
@@ -3644,6 +3715,10 @@ def _load_fb_crossposter_settings(page_id: str | None = None) -> dict:
         else:
             data["auto_sync_fixed_times"] = ["06:00", "18:00"]
 
+        data["default_tags"] = _normalize_fb_crossposter_default_tags(
+            data.get("default_tags_json", "[]")
+        )
+        data["convert_to_vertical"] = bool(data.get("convert_to_vertical"))
         data["lead_time_minutes"] = int(data.get("lead_time_minutes") or 60)
         return data
     finally:
@@ -3693,6 +3768,10 @@ def list_all_crossposter_campaigns() -> list[dict]:
                 d["schedule_times"] = json.loads(d.get("schedule_times_json") or "[]")
             except Exception:
                 d["schedule_times"] = ["11:30", "19:30"]
+            d["default_tags"] = _normalize_fb_crossposter_default_tags(
+                d.get("default_tags_json", "[]")
+            )
+            d["convert_to_vertical"] = bool(d.get("convert_to_vertical"))
             campaigns.append(d)
         return campaigns
     finally:
@@ -3713,6 +3792,11 @@ def save_fb_crossposter_settings(settings: dict, page_id: str | None = None) -> 
 
         fixed_times = settings.get("auto_sync_fixed_times", ["06:00", "18:00"])
         fixed_times_json = json.dumps(fixed_times) if not isinstance(fixed_times, str) else fixed_times
+
+        default_tags = _normalize_fb_crossposter_default_tags(
+            settings.get("default_tags", [])
+        )
+        default_tags_json = json.dumps(default_tags, ensure_ascii=False)
 
         lead_time = int(settings.get("lead_time_minutes") or 60)
 
@@ -3766,6 +3850,8 @@ def save_fb_crossposter_settings(settings: dict, page_id: str | None = None) -> 
             fixed_times_json,
             last_synced_at_val,
             1 if settings.get("auto_publish_enabled") else 0,
+            1 if settings.get("convert_to_vertical") else 0,
+            default_tags_json,
             now_iso,
         )
 
@@ -3791,6 +3877,8 @@ def save_fb_crossposter_settings(settings: dict, page_id: str | None = None) -> 
                     auto_sync_fixed_times_json = ?,
                     last_synced_at = ?,
                     auto_publish_enabled = ?,
+                    convert_to_vertical = ?,
+                    default_tags_json = ?,
                     updated_at = ?
                 WHERE id = ?
             """, (*values, existing["id"]))
@@ -3803,8 +3891,9 @@ def save_fb_crossposter_settings(settings: dict, page_id: str | None = None) -> 
                     daily_quota, schedule_times_json, lead_time_minutes, post_template,
                     sort_order_mode, auto_sync_enabled, auto_sync_type,
                     auto_sync_interval_hours, auto_sync_fixed_times_json,
-                    last_synced_at, auto_publish_enabled, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_synced_at, auto_publish_enabled, convert_to_vertical,
+                    default_tags_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, values)
         conn.commit()
     finally:
@@ -4071,17 +4160,18 @@ def recalculate_fb_queue_schedule(
     target_page_id: str = "",
     start_date: datetime.date | None = None
 ) -> int:
-    """Recalculate scheduled_publish_time for pending/scheduled items of a specific Fanpage."""
+    """Recalculate scheduled_publish_time for pending/scheduled items of a specific Fanpage with smart collision prevention."""
     if daily_quota <= 0 or not times_list:
         return 0
 
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     try:
+        target_pid = (target_page_id or "").strip()
         where_sql = "WHERE status IN ('pending', 'scheduled') AND (fb_post_id IS NULL OR fb_post_id = '')"
         params = []
-        if target_page_id and target_page_id.strip():
+        if target_pid:
             where_sql += " AND target_page_id = ?"
-            params.append(target_page_id.strip())
+            params.append(target_pid)
         else:
             where_sql += " AND (target_page_id = '' OR target_page_id IS NULL)"
 
@@ -4095,41 +4185,71 @@ def recalculate_fb_queue_schedule(
             return 0
 
         now = datetime.datetime.now()
+        now_ts = int(now.timestamp())
         current_date = start_date or now.date()
         time_slots = sorted(times_list)
         slot_count = len(time_slots)
+        effective_slots_per_day = min(daily_quota, slot_count)
+
+        # 1. Collect all occupied slots (published or already uploaded to Meta Cloud with future publish time)
+        occ_params = [now_ts]
+        occ_where = "WHERE scheduled_publish_time > ? AND ((fb_post_id IS NOT NULL AND fb_post_id != '') OR status = 'published')"
+        if target_pid:
+            occ_where += " AND target_page_id = ?"
+            occ_params.append(target_pid)
+        else:
+            occ_where += " AND (target_page_id = '' OR target_page_id IS NULL)"
+
+        occupied_rows = conn.execute(f"""
+            SELECT scheduled_publish_time FROM fb_crossposter_queue
+            {occ_where}
+        """, occ_params).fetchall()
+
+        occupied_slots: set[int] = {r[0] for r in occupied_rows if r[0] and r[0] > 0}
 
         slot_index = 0
         date_offset = 0
         updated_count = 0
 
-        # If current date is today, find next available time slot (>10 mins in future)
-        if current_date == now.date():
-            found_future_slot = False
-            for s_idx, t_str in enumerate(time_slots):
-                try:
-                    hour, minute = map(int, t_str.split(":"))
-                    slot_dt = datetime.datetime.combine(current_date, datetime.time(hour, minute))
-                    if slot_dt > now + datetime.timedelta(minutes=10):
-                        slot_index = s_idx
-                        found_future_slot = True
-                        break
-                except Exception:
-                    continue
-            if not found_future_slot:
-                date_offset = 1
-                slot_index = 0
-
         for row in rows:
             item_id = row[0]
-            target_date = current_date + datetime.timedelta(days=date_offset)
-            t_str = time_slots[slot_index % slot_count]
-            try:
-                hour, minute = map(int, t_str.split(":"))
-                scheduled_dt = datetime.datetime.combine(target_date, datetime.time(hour, minute))
-                scheduled_ts = int(scheduled_dt.timestamp())
-            except Exception:
-                scheduled_ts = int((now + datetime.timedelta(hours=2)).timestamp())
+
+            # Find next free, non-colliding time slot
+            while True:
+                target_date = current_date + datetime.timedelta(days=date_offset)
+                t_str = time_slots[slot_index % slot_count]
+                try:
+                    hour, minute = map(int, t_str.split(":"))
+                    candidate_dt = datetime.datetime.combine(target_date, datetime.time(hour, minute))
+                    candidate_ts = int(candidate_dt.timestamp())
+                except Exception:
+                    candidate_ts = int((now + datetime.timedelta(hours=2)).timestamp())
+
+                # If candidate slot is in the past or < 10 mins in future, advance to next slot
+                if candidate_ts <= (now_ts + 600):
+                    slot_index += 1
+                    if slot_index % effective_slots_per_day == 0:
+                        date_offset += 1
+                        slot_index = 0
+                    continue
+
+                # Check collision with already occupied slots (within 15 minutes window)
+                is_colliding = any(abs(candidate_ts - occ_ts) < 900 for occ_ts in occupied_slots)
+                if is_colliding:
+                    slot_index += 1
+                    if slot_index % effective_slots_per_day == 0:
+                        date_offset += 1
+                        slot_index = 0
+                    continue
+
+                # Found free slot!
+                scheduled_ts = candidate_ts
+                occupied_slots.add(scheduled_ts)
+                slot_index += 1
+                if slot_index % effective_slots_per_day == 0:
+                    date_offset += 1
+                    slot_index = 0
+                break
 
             conn.execute("""
                 UPDATE fb_crossposter_queue
@@ -4137,11 +4257,6 @@ def recalculate_fb_queue_schedule(
                 WHERE id = ?
             """, (scheduled_ts, datetime.datetime.now().isoformat(), item_id))
             updated_count += 1
-
-            slot_index += 1
-            if slot_index % min(daily_quota, slot_count) == 0:
-                date_offset += 1
-                slot_index = 0
 
         conn.commit()
         return updated_count
@@ -4251,6 +4366,34 @@ def reset_fb_crossposter_queue_errors(target_page_id: str = "") -> int:
         return cursor.rowcount
     finally:
         conn.close()
+
+
+def fix_fb_queue_schedule_collisions(target_page_id: str = "") -> dict:
+    """Detect and automatically resolve schedule slot collisions for one or all Fanpages."""
+    target_pid = (target_page_id or "").strip()
+    campaigns = []
+    if target_pid:
+        campaigns = [target_pid]
+    else:
+        all_camps = list_all_crossposter_campaigns()
+        if all_camps:
+            campaigns = [c.get("page_id", "") for c in all_camps]
+        else:
+            campaigns = [""]
+
+    total_recalculated = 0
+    for pid in campaigns:
+        settings = get_fb_crossposter_settings(pid)
+        daily_quota = settings.get("daily_quota", 2)
+        schedule_times = settings.get("schedule_times", ["11:30", "19:30"])
+        updated = recalculate_fb_queue_schedule(daily_quota, schedule_times, target_page_id=pid)
+        total_recalculated += updated
+
+    return {
+        "success": True,
+        "recalculated_count": total_recalculated,
+        "campaigns_processed": len(campaigns),
+    }
 
 
 def delete_fb_crossposter_campaign(page_id: str) -> bool:
@@ -4845,22 +4988,69 @@ def reserve_youtube_publication_slot(
     now_utc: datetime.datetime | None = None,
 ) -> str:
     from auto_yt.services.publication_scheduler import find_next_publication_slot
-    workflow = get_youtube_publish_workflow(workflow_id)
-    if not workflow:
-        raise ValueError(f"Workflow not found: {workflow_id}")
-    channel = get_youtube_channel(int(workflow["youtube_channel_id"]))
-    if not channel:
-        raise ValueError(f"Channel not found: {workflow['youtube_channel_id']}")
-
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        workflow = conn.execute(
+            "SELECT * FROM youtube_publish_workflows WHERE id = ?",
+            (workflow_id,),
+        ).fetchone()
+        if workflow is None:
+            raise ValueError(f"Workflow not found: {workflow_id}")
+        channel = conn.execute(
+            "SELECT * FROM youtube_channels WHERE id = ?",
+            (workflow["youtube_channel_id"],),
+        ).fetchone()
+        if channel is None:
+            raise ValueError(f"Channel not found: {workflow['youtube_channel_id']}")
+
+        lead_minutes = int(channel["publication_lead_minutes"] or 120)
+        now = now_utc or datetime.datetime.now(datetime.timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=datetime.timezone.utc)
+        earliest = now.astimezone(datetime.timezone.utc) + datetime.timedelta(
+            minutes=max(1, lead_minutes)
+        )
+        reservation = conn.execute(
+            "SELECT * FROM channel_schedule_reservations WHERE workflow_id = ?",
+            (workflow_id,),
+        ).fetchone()
+        if reservation is not None and reservation["status"] == "scheduled":
+            conn.execute("COMMIT")
+            return str(reservation["scheduled_at"])
+        if reservation is not None and reservation["status"] == "reserved":
+            try:
+                reserved_at = datetime.datetime.fromisoformat(
+                    str(reservation["scheduled_at"] or "").replace("Z", "+00:00")
+                )
+                if reserved_at.tzinfo is None:
+                    reserved_at = reserved_at.replace(tzinfo=datetime.timezone.utc)
+            except ValueError:
+                reserved_at = None
+            if reserved_at is not None and reserved_at >= earliest:
+                conn.execute(
+                    "UPDATE youtube_publish_workflows SET scheduled_at = ?, updated_at = ? WHERE id = ?",
+                    (reservation["scheduled_at"], utc_now(), workflow_id),
+                )
+                conn.execute("COMMIT")
+                return str(reservation["scheduled_at"])
+            conn.execute(
+                "UPDATE channel_schedule_reservations SET status = 'canceled', updated_at = ? WHERE workflow_id = ?",
+                (utc_now(), workflow_id),
+            )
+
         res_rows = conn.execute(
             "SELECT scheduled_at FROM channel_schedule_reservations WHERE youtube_channel_id = ? AND workflow_id != ? AND status IN ('reserved', 'scheduled')",
             (channel["id"], workflow_id),
         ).fetchall()
         pub_rows = conn.execute(
-            "SELECT published_at FROM video_publications WHERE youtube_channel_id = ? AND published_at != ''",
+            """
+            SELECT COALESCE(NULLIF(scheduled_at, ''), NULLIF(published_at, ''))
+            FROM video_publications
+            WHERE youtube_channel_id = ?
+              AND COALESCE(NULLIF(scheduled_at, ''), NULLIF(published_at, '')) IS NOT NULL
+            """,
             (channel["id"],),
         ).fetchall()
 
@@ -4869,10 +5059,12 @@ def reserve_youtube_publication_slot(
             | set(str(r[0]) for r in pub_rows if r[0])
         )
 
-        timezone_name = channel.get("publication_timezone") or "Asia/Ho_Chi_Minh"
-        slots = channel.get("publication_slots") or []
-        daily_limit = int(channel.get("publication_daily_limit") or 1)
-        lead_minutes = int(channel.get("publication_lead_minutes") or 120)
+        timezone_name = channel["publication_timezone"] or "Asia/Ho_Chi_Minh"
+        try:
+            slots = json.loads(channel["publication_slots_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            slots = []
+        daily_limit = int(channel["publication_daily_limit"] or 1)
 
         slot = find_next_publication_slot(
             timezone_name=timezone_name,
@@ -4883,13 +5075,126 @@ def reserve_youtube_publication_slot(
             now_utc=now_utc,
         )
 
-        reserve_channel_schedule(
-            youtube_channel_id=channel["id"],
-            workflow_id=workflow_id,
-            scheduled_at=slot,
+        if reservation is None:
+            conn.execute(
+                """
+                INSERT INTO channel_schedule_reservations (
+                    youtube_channel_id, workflow_id, scheduled_at, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, 'reserved', ?, ?)
+                """,
+                (channel["id"], workflow_id, slot, utc_now(), utc_now()),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE channel_schedule_reservations
+                SET scheduled_at = ?, status = 'reserved', updated_at = ?
+                WHERE workflow_id = ?
+                """,
+                (slot, utc_now(), workflow_id),
+            )
+        conn.execute(
+            "UPDATE youtube_publish_workflows SET scheduled_at = ?, updated_at = ? WHERE id = ?",
+            (slot, utc_now(), workflow_id),
         )
-        update_youtube_publish_workflow(workflow_id, scheduled_at=slot)
+        conn.execute("COMMIT")
         return slot
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def cancel_youtube_publication_reservation(workflow_id: str) -> dict | None:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        reservation = conn.execute(
+            "SELECT * FROM channel_schedule_reservations WHERE workflow_id = ?",
+            (workflow_id,),
+        ).fetchone()
+        if reservation is not None and reservation["status"] == "reserved":
+            conn.execute(
+                "UPDATE channel_schedule_reservations SET status = 'canceled', updated_at = ? WHERE workflow_id = ?",
+                (now, workflow_id),
+            )
+            conn.execute(
+                "UPDATE youtube_publish_workflows SET scheduled_at = '', updated_at = ? WHERE id = ?",
+                (now, workflow_id),
+            )
+        row = conn.execute(
+            "SELECT * FROM channel_schedule_reservations WHERE workflow_id = ?",
+            (workflow_id,),
+        ).fetchone()
+        conn.execute("COMMIT")
+        return dict(row) if row else None
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def complete_youtube_schedule(
+    workflow_id: str,
+    publication_id: int,
+    scheduled_at: str,
+) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        reservation = conn.execute(
+            "SELECT * FROM channel_schedule_reservations WHERE workflow_id = ?",
+            (workflow_id,),
+        ).fetchone()
+        if (
+            reservation is None
+            or reservation["status"] != "reserved"
+            or str(reservation["scheduled_at"]) != str(scheduled_at)
+        ):
+            raise ValueError("Khung giờ đăng không còn thuộc workflow này.")
+        conn.execute(
+            "UPDATE channel_schedule_reservations SET status = 'scheduled', updated_at = ? WHERE workflow_id = ?",
+            (now, workflow_id),
+        )
+        conn.execute(
+            """
+            UPDATE video_publications
+            SET privacy_status = 'private', processing_status = 'succeeded',
+                scheduled_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (scheduled_at, now, publication_id),
+        )
+        conn.execute(
+            """
+            UPDATE youtube_publish_workflows
+            SET status = 'scheduled', stage = 'scheduled', scheduled_at = ?,
+                upload_session_encrypted = '', error = '', updated_at = ?
+            WHERE id = ?
+            """,
+            (scheduled_at, now, workflow_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM youtube_publish_workflows WHERE id = ?",
+            (workflow_id,),
+        ).fetchone()
+        conn.execute("COMMIT")
+        if row is None:
+            raise ValueError(f"Workflow not found: {workflow_id}")
+        return _decode_publish_workflow(row)
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
 
@@ -5013,6 +5318,23 @@ def update_video_publication(publication_id: int, **changes) -> dict | None:
         f"UPDATE video_publications SET {assignments} WHERE id = ?",
         (*changes.values(), publication_id),
     )
+    publication_video = conn.execute(
+        "SELECT video_id FROM video_publications WHERE id = ?",
+        (publication_id,),
+    ).fetchone()
+    if publication_video is not None:
+        video_id = int(publication_video[0])
+        conn.execute(
+            """
+            UPDATE videos
+            SET is_published = CASE WHEN EXISTS (
+                SELECT 1 FROM video_publications
+                WHERE video_id = ? AND privacy_status = 'public'
+            ) THEN 1 ELSE 0 END
+            WHERE id = ?
+            """,
+            (video_id, video_id),
+        )
     conn.commit()
     row = conn.execute(
         "SELECT * FROM video_publications WHERE id = ?", (publication_id,)

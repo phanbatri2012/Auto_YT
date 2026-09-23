@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { openVideoWatchInGpm, openUrlInGpm } from './gpmOpener'
+import { extractErrorMessage } from './apiError'
+
+export { extractErrorMessage }
 
 const API_BASE = 'http://127.0.0.1:8080'
 
@@ -83,34 +86,34 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
 
   const loadChannels = useCallback(async () => {
     const response = await fetch(`${API_BASE}/api/youtube-comments/channels`)
-    const data = await response.json()
-    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
-    const items = Array.isArray(data.items) ? data.items : []
+    const data = await response.json().catch(() => null)
+    if (!response.ok) throw new Error(extractErrorMessage(data, `HTTP ${response.status}`))
+    const items = Array.isArray(data?.items) ? data.items : []
     setChannels(items)
   }, [])
 
   const loadVideos = useCallback(async () => {
     const response = await fetch(`${API_BASE}/api/videos?limit=500&offset=0&video_status=active`)
-    const data = await response.json()
-    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
-    const items = Array.isArray(data.items) ? data.items : []
+    const data = await response.json().catch(() => null)
+    if (!response.ok) throw new Error(extractErrorMessage(data, `HTTP ${response.status}`))
+    const items = Array.isArray(data?.items) ? data.items : []
     setVideos(items)
   }, [])
 
   const loadPromptVersions = useCallback(async () => {
     const response = await fetch(`${API_BASE}/api/prompts`)
-    const data = await response.json()
-    if (!response.ok || !data.versions) {
-      throw new Error(data.detail || 'Không thể tải tên các bộ prompt.')
+    const data = await response.json().catch(() => null)
+    if (!response.ok || !data?.versions) {
+      throw new Error(extractErrorMessage(data, 'Không thể tải tên các bộ prompt.'))
     }
     setPromptVersions(data.versions)
   }, [])
 
   const loadPublications = useCallback(async () => {
     const response = await fetch(`${API_BASE}/api/video-publications`)
-    const data = await response.json()
-    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
-    setPublications(Array.isArray(data.items) ? data.items : [])
+    const data = await response.json().catch(() => null)
+    if (!response.ok) throw new Error(extractErrorMessage(data, `HTTP ${response.status}`))
+    setPublications(Array.isArray(data?.items) ? data.items : [])
   }, [])
 
   const loadComments = useCallback(async () => {
@@ -120,10 +123,10 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
     if (statusFilter) params.set('status', statusFilter)
     if (debouncedSearch) params.set('search', debouncedSearch)
     const response = await fetch(`${API_BASE}/api/youtube-comments?${params}`)
-    const data = await response.json()
-    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
-    setComments(Array.isArray(data.items) ? data.items : [])
-    setCounts(data.counts || {})
+    const data = await response.json().catch(() => null)
+    if (!response.ok) throw new Error(extractErrorMessage(data, `HTTP ${response.status}`))
+    setComments(Array.isArray(data?.items) ? data.items : [])
+    setCounts(data?.counts || {})
   }, [channelFilter, videoFilter, statusFilter, debouncedSearch])
 
   const refreshLegacyVideoInventory = useCallback(async () => {
@@ -135,9 +138,9 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
         published_url: importUrl.trim()
       })
     })
-    const data = await response.json()
-    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
-    const items = Array.isArray(data.items) ? data.items : []
+    const data = await response.json().catch(() => null)
+    if (!response.ok) throw new Error(extractErrorMessage(data, `HTTP ${response.status}`))
+    const items = Array.isArray(data?.items) ? data.items : []
     setImportItems(items)
     setImportCounts(data.counts || {})
     setImportSelectedIds(items.filter(item => item.eligible).map(item => item.youtube_video_id))
@@ -294,8 +297,8 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: payload ? JSON.stringify(payload) : undefined
       })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(extractErrorMessage(data, `HTTP ${response.status}`))
       setMessage(`✅ ${successMessage}`)
       setSelectedIds([])
       await loadComments()
@@ -319,8 +322,8 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
     try {
       for (const channel of channels) {
         const response = await fetch(`${API_BASE}/api/youtube-comments/sync/${channel.id}`, { method: 'POST' })
-        const data = await response.json()
-        if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+        const data = await response.json().catch(() => null)
+        if (!response.ok) throw new Error(extractErrorMessage(data, `HTTP ${response.status}`))
       }
       setMessage(`✅ Đã đưa ${channels.length} kênh vào hàng đợi đồng bộ.`)
     } catch (error) {
@@ -342,8 +345,8 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
           })
         }
       )
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(extractErrorMessage(data, `HTTP ${response.status}`))
       setPublicationForm(previous => ({ ...previous, url: '' }))
       await Promise.all([loadVideos(), loadPublications()])
       setMessage('✅ Đã gắn link video đã đăng; trạng thái Dashboard được đồng bộ.')
@@ -383,11 +386,11 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
           youtube_video_ids: importSelectedIds
         })
       })
-      const data = await response.json()
-      if (!response.ok || data.success === false) {
-        throw new Error(data.detail || data.error || `HTTP ${response.status}`)
+      const data = await response.json().catch(() => null)
+      if (!response.ok || data?.success === false) {
+        throw new Error(extractErrorMessage(data, `HTTP ${response.status}`))
       }
-      const trackedJobIds = Array.isArray(data.job_ids)
+      const trackedJobIds = Array.isArray(data?.job_ids)
         ? data.job_ids.filter(jobId => typeof jobId === 'string' && jobId)
         : []
       setImportTrackedJobIds(trackedJobIds)
@@ -421,14 +424,14 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
       try {
         const jobs = await Promise.all(importTrackedJobIds.map(async jobId => {
           const response = await fetch(`${API_BASE}/api/jobs/${jobId}`)
-          const data = await response.json()
-          if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+          const data = await response.json().catch(() => null)
+          if (!response.ok) throw new Error(extractErrorMessage(data, `HTTP ${response.status}`))
           return data
         }))
         if (stopped) return
 
-        const activeCount = jobs.filter(job => ACTIVE_IMPORT_JOB_STATUSES.has(job.status)).length
-        const succeeded = jobs.filter(job => job.status === 'done').length
+        const activeCount = jobs.filter(job => ACTIVE_IMPORT_JOB_STATUSES.has(job?.status)).length
+        const succeeded = jobs.filter(job => job?.status === 'done').length
         const failed = jobs.length - activeCount - succeeded
         if (activeCount) {
           setImportMessage(
@@ -482,8 +485,8 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
         `${API_BASE}/api/videos/${publication.video_id}/publications/${publication.id}`,
         { method: 'DELETE' }
       )
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(extractErrorMessage(data, `HTTP ${response.status}`))
       await Promise.all([loadVideos(), loadPublications(), loadComments()])
       setMessage('✅ Đã xóa liên kết video đã đăng.')
     } catch (error) {
@@ -501,8 +504,8 @@ export default function YouTubeComments({ onOpenVideo, refreshKey }) {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ draft_reply: reply })
       })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(extractErrorMessage(data, `HTTP ${response.status}`))
       setEditing(previous => {
         const next = { ...previous }; delete next[comment.comment_id]; return next
       })

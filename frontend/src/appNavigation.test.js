@@ -151,5 +151,9 @@ test('wires Cross-Poster into navigation and view rendering', async () => {
   assert.match(crossPosterSource, /Tính Lại Lịch Đăng/)
   assert.match(crossPosterSource, /api\/fb-crossposter\/settings/)
   assert.match(crossPosterSource, /api\/fb-crossposter\/queue/)
+  assert.match(crossPosterSource, /convert_to_vertical/)
+  assert.match(crossPosterSource, /default_tags/)
+  assert.match(crossPosterSource, /Chuyển video & thumbnail sang 9:16/)
+  assert.match(crossPosterSource, /Tag mặc định của Fanpage/)
 })
 

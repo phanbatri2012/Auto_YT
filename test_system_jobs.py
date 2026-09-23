@@ -46,6 +46,89 @@ class SystemJobTests(unittest.TestCase):
             main._automatic_login_job_ids.clear()
             main._automatic_login_last_failure_at = 0.0
 
+    def test_startup_does_not_activate_comment_jobs_that_can_open_gpm(self):
+        with (
+            patch.object(main.account_store, "load_account"),
+            patch.object(main.tts, "migrate_api_key_storage"),
+            patch.object(
+                main.voice_config,
+                "get_provider",
+                return_value={"enabled": False},
+            ),
+            patch.object(
+                main.chatgpt_browser_service,
+                "start_browser_service",
+                return_value={"connected": True},
+            ),
+            patch.object(
+                main.google_flow_browser_service,
+                "start_browser_service",
+                return_value={"connected": True},
+            ),
+            patch.object(database, "get_active_audio_tasks", return_value=[]),
+            patch.object(database, "recover_interrupted_system_jobs"),
+            patch.object(main, "_reconcile_active_comment_draft_job_duplicates"),
+            patch.object(database, "pause_queued_attention_jobs"),
+            patch.object(main, "_kick_video_queue"),
+            patch.object(main, "_kick_comment_queue") as kick_comment,
+            patch.object(main, "_kick_production_queue"),
+            patch.object(main, "_enqueue_due_comment_syncs") as enqueue_comment_syncs,
+            patch.object(main, "_cleanup_expired_tts_previews"),
+            patch.object(main.threading, "Thread") as thread_class,
+        ):
+            main.resume_background_jobs()
+
+        kick_comment.assert_not_called()
+        enqueue_comment_syncs.assert_not_called()
+        thread_names = {
+            call.kwargs.get("name")
+            for call in thread_class.call_args_list
+        }
+        self.assertIn("youtube-comment-sync", thread_names)
+
+    def test_maintenance_status_blocks_due_gpm_comment_job(self):
+        channel = database.save_youtube_channel(
+            channel_id="UC-gpm-maintenance",
+            title="GPM maintenance channel",
+            gpm_profile_id="gpm-profile-1",
+            gpm_profile_name="Profile 1",
+            interaction_mode="gpm_browser",
+        )
+        database.create_system_job(
+            job_id="comment-publish-maintenance",
+            job_type="comment_publish",
+            title="Due GPM comment",
+            payload={"channel_id": channel["id"], "comment_ids": ["comment-1"]},
+        )
+
+        status = main.get_maintenance_status()
+
+        self.assertFalse(status["safe_to_restart"])
+        self.assertEqual(status["gpm_blocking_job_count"], 1)
+        self.assertEqual(
+            status["gpm_blocking_jobs"][0]["id"],
+            "comment-publish-maintenance",
+        )
+
+    def test_maintenance_status_ignores_direct_api_comment_job(self):
+        channel = database.save_youtube_channel(
+            channel_id="UC-direct-maintenance",
+            title="Direct API maintenance channel",
+            gpm_profile_id="gpm-profile-2",
+            interaction_mode="direct_api",
+        )
+        database.create_system_job(
+            job_id="comment-publish-direct",
+            job_type="comment_publish",
+            title="Direct API comment",
+            payload={"channel_id": channel["id"], "comment_ids": ["comment-2"]},
+        )
+
+        status = main.get_maintenance_status()
+
+        self.assertTrue(status["safe_to_restart"])
+        self.assertEqual(status["gpm_blocking_job_count"], 0)
+
     def test_claims_video_jobs_in_fifo_order(self):
         self.create_job("first")
         self.create_job("second")
@@ -1128,8 +1211,28 @@ class SystemJobTests(unittest.TestCase):
             retried = main.retry_job("fb-crosspost-task_retry1")
             self.assertTrue(retried["success"])
             job = database.get_system_job("fb-crosspost-task_retry1")
-            self.assertEqual(job["status"], "queued")
-            mock_start.assert_called_once_with(target_page_id="page_123", days_ahead=2)
+            mock_start.assert_called_once_with(
+                target_page_id="page_123",
+                days_ahead=2,
+                existing_sys_job_id="fb-crosspost-task_retry1",
+            )
+
+    def test_job_center_fb_crosspost_retry_failed_status(self):
+        database.create_system_job(
+            job_id="fb-crosspost-task_failed1",
+            job_type="fb_crosspost",
+            title="FB Retry Failed Status Test",
+            payload={"page_id": "page_456", "days_ahead": 3},
+        )
+        database.update_system_job("fb-crosspost-task_failed1", status="failed", error="Fatal batch error")
+        with patch("auto_yt.services.fb_crossposter_service.start_schedule_ahead_batch") as mock_start:
+            retried = main.retry_job("fb-crosspost-task_failed1")
+            self.assertTrue(retried["success"])
+            mock_start.assert_called_once_with(
+                target_page_id="page_456",
+                days_ahead=3,
+                existing_sys_job_id="fb-crosspost-task_failed1",
+            )
 
     def test_job_center_supports_all_new_publishing_and_utility_jobs(self):
         database.create_system_job(

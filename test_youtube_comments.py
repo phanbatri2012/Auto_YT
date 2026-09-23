@@ -372,6 +372,58 @@ class YouTubeCommentDatabaseTests(unittest.TestCase):
         self.assertEqual(reservation["video"]["chat_url"], original_chat)
         self.assertEqual(reservation["video"]["prompt_version"], "prompt-a")
 
+    def test_comment_ids_request_supports_large_batches_and_enforces_5000_limit(self):
+        from pydantic import ValidationError
+
+        req_139 = main.CommentIdsRequest(comment_ids=[f"comment_{i}" for i in range(139)])
+        self.assertEqual(len(req_139.comment_ids), 139)
+
+        req_5000 = main.CommentIdsRequest(comment_ids=[f"comment_{i}" for i in range(5000)])
+        self.assertEqual(len(req_5000.comment_ids), 5000)
+
+        with self.assertRaises(ValidationError):
+            main.CommentIdsRequest(comment_ids=[f"comment_{i}" for i in range(5001)])
+
+    def test_publish_endpoint_processes_large_batch_selection(self):
+        publication = database.save_video_publication(
+            video_id=self.video_id,
+            youtube_channel_id=self.channel["id"],
+            youtube_video_id="published_batch",
+            published_url="https://youtu.be/published_batch",
+            published_title="Published Batch",
+        )
+
+        comment_ids = []
+        for i in range(139):
+            cid = f"batch_comment_{i}"
+            comment_ids.append(cid)
+            database.upsert_youtube_comment(
+                publication["id"],
+                {
+                    "comment_id": cid,
+                    "author_name": f"Viewer {i}",
+                    "text": f"Bình luận số {i}",
+                    "published_at": "2026-09-22T10:00:00Z",
+                },
+            )
+            database.update_youtube_comment(
+                cid,
+                status="draft_ready",
+                draft_reply=f"Cảm ơn bạn đã xem video {i}!",
+                risk_level="low",
+            )
+
+        with patch.object(main, "_kick_comment_queue"):
+            result = main.publish_youtube_comment_replies(
+                main.CommentIdsRequest(comment_ids=comment_ids)
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(len(result["job_ids"]), 139)
+
+        jobs = database.list_system_jobs(limit=None, job_type="comment_publish")
+        self.assertEqual(len(jobs), 139)
+
 
 class YouTubeCommentHelperTests(unittest.TestCase):
     def test_comment_prompt_accepts_question_mark_without_following_space(self):

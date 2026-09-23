@@ -9,7 +9,12 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from auto_yt.services import database as db
-from auto_yt.services import secret_store, youtube_comments, youtube_publisher
+from auto_yt.services import (
+    publication_scheduler,
+    secret_store,
+    youtube_comments,
+    youtube_publisher,
+)
 from auto_yt.services.proxy_utils import parse_proxy_url
 
 
@@ -27,6 +32,81 @@ class PublishConfigurationRequired(RuntimeError):
     def __init__(self, missing_configuration: list[str], message: str):
         super().__init__(message)
         self.missing_configuration = list(dict.fromkeys(missing_configuration))
+
+
+def _channel_missing_configuration(
+    channel: dict | None,
+    *,
+    schedule_enabled: bool,
+) -> list[str]:
+    if channel is None:
+        return ["default_youtube_channel_id"]
+    missing = []
+    if channel.get("status") != "connected" or not (
+        channel.get("access_token_encrypted")
+        or channel.get("refresh_token_encrypted")
+        or channel.get("has_refresh_token")
+    ):
+        missing.append("youtube_oauth")
+    profile_id = str(channel.get("gpm_profile_id") or "").strip()
+    if not profile_id:
+        missing.append("gpm_profile_id")
+    elif any(
+        int(other.get("id") or 0) != int(channel.get("id") or 0)
+        and str(other.get("gpm_profile_id") or "").strip() == profile_id
+        for other in db.list_youtube_channels()
+    ):
+        missing.append("gpm_profile_exclusive")
+    if not parse_proxy_url(str(channel.get("gpm_proxy_info") or "").strip()):
+        missing.append("gpm_proxy_info")
+    if schedule_enabled:
+        if bool(channel.get("publication_paused")):
+            missing.append("publication_paused")
+        try:
+            publication_scheduler.validate_timezone(
+                str(channel.get("publication_timezone") or "")
+            )
+        except ValueError:
+            missing.append("publication_timezone")
+        try:
+            slots = publication_scheduler.validate_publication_slots(
+                channel.get("publication_slots")
+            )
+        except ValueError:
+            slots = []
+        if not slots:
+            missing.append("publication_slots")
+        if int(channel.get("publication_daily_limit") or 0) < 1:
+            missing.append("publication_daily_limit")
+        if int(channel.get("publication_lead_minutes") or 0) < 1:
+            missing.append("publication_lead_minutes")
+        if not bool(channel.get("public_upload_verified")):
+            missing.append("public_upload_verified")
+    return list(dict.fromkeys(missing))
+
+
+def evaluate_prompt_publish_readiness(version: dict) -> dict:
+    pipeline = version.get("pipeline") if isinstance(version.get("pipeline"), dict) else {}
+    if not pipeline.get("youtube_upload"):
+        return {"ready": True, "missing_configuration": []}
+    schedule_enabled = bool(pipeline.get("youtube_schedule"))
+    stable_channel_id = str(version.get("default_youtube_channel_id") or "").strip()
+    channel = (
+        db.get_youtube_channel_by_channel_id(stable_channel_id, include_tokens=True)
+        if stable_channel_id
+        else None
+    )
+    missing = _channel_missing_configuration(
+        channel,
+        schedule_enabled=schedule_enabled,
+    )
+    publishing_settings = version.get("publishing_settings")
+    if not isinstance(publishing_settings, dict) or not isinstance(
+        publishing_settings.get("made_for_kids"), bool
+    ):
+        missing.append("made_for_kids")
+    missing = list(dict.fromkeys(missing))
+    return {"ready": not missing, "missing_configuration": missing}
 
 
 def _sha256_file(path: Path) -> str:
@@ -83,11 +163,13 @@ def _resolve_thumbnail_path(script: str, variant: str, thumbnails_dir: Path) -> 
 
 
 def _artifact_snapshot(artifact: dict) -> dict:
+    path = Path(str(artifact.get("path") or ""))
     return {
         "id": int(artifact["id"]),
         "path": str(artifact.get("path") or ""),
         "content_hash": str(artifact.get("content_hash") or ""),
         "size_bytes": int(artifact.get("size_bytes") or 0),
+        "sha256": _sha256_file(path),
     }
 
 
@@ -97,6 +179,7 @@ def _validate_artifact(
     video_id: int,
     artifact_type: str,
     missing_key: str,
+    allowed_suffixes: set[str],
 ) -> tuple[dict, Path]:
     path = Path(str((artifact or {}).get("path") or ""))
     if (
@@ -107,6 +190,7 @@ def _validate_artifact(
         or not str(artifact.get("content_hash") or "")
         or not path.is_file()
         or path.stat().st_size <= 0
+        or path.suffix.casefold() not in allowed_suffixes
     ):
         raise PublishConfigurationRequired(
             [missing_key],
@@ -165,28 +249,11 @@ def _resolve_channel(
 
 
 def _validate_dynamic_channel(channel: dict, *, schedule_enabled: bool) -> str:
-    missing = []
-    if channel.get("status") != "connected":
-        missing.append("youtube_oauth")
-    if not (
-        channel.get("access_token_encrypted")
-        or channel.get("refresh_token_encrypted")
-    ):
-        missing.append("youtube_oauth")
-    if not str(channel.get("gpm_profile_id") or "").strip():
-        missing.append("gpm_profile_id")
+    missing = _channel_missing_configuration(
+        channel,
+        schedule_enabled=schedule_enabled,
+    )
     raw_proxy = str(channel.get("gpm_proxy_info") or "").strip()
-    if not parse_proxy_url(raw_proxy):
-        missing.append("gpm_proxy_info")
-    if schedule_enabled:
-        if bool(channel.get("publication_paused")):
-            missing.append("publication_paused")
-        if not str(channel.get("publication_timezone") or "").strip():
-            missing.append("publication_timezone")
-        if not channel.get("publication_slots"):
-            missing.append("publication_slots")
-        if not bool(channel.get("public_upload_verified")):
-            missing.append("public_upload_verified")
     if missing:
         raise PublishConfigurationRequired(
             missing,
@@ -244,12 +311,14 @@ def _build_preflight_context(
         video_id=video_id,
         artifact_type="final_mp4",
         missing_key="final_mp4",
+        allowed_suffixes={".mp4"},
     )
     caption_artifact, caption_path = _validate_artifact(
         db.get_latest_video_artifact(video_id, "captions", status="ready"),
         video_id=video_id,
         artifact_type="captions",
         missing_key="captions_srt",
+        allowed_suffixes={".srt"},
     )
 
     publishing_settings = snapshot.get("publishing_settings")
@@ -286,21 +355,45 @@ def _build_preflight_context(
             ["thumbnail"],
             "Không tìm thấy ảnh local hợp lệ trong đúng mục thumbnail đã chọn.",
         )
+    if thumbnail_path.suffix.casefold() not in {".png", ".jpg", ".jpeg", ".webp"}:
+        raise PublishConfigurationRequired(
+            ["thumbnail"],
+            "Thumbnail upload phải là PNG, JPG hoặc WebP.",
+        )
 
     artifact_snapshot = snapshot.get("artifacts")
+    current_video_snapshot = _artifact_snapshot(final_artifact)
+    current_caption_snapshot = _artifact_snapshot(caption_artifact)
+    current_thumbnail_snapshot = {
+        "path": str(thumbnail_path),
+        "sha256": _sha256_file(thumbnail_path),
+    }
     if isinstance(artifact_snapshot, dict) and artifact_snapshot:
         expected_video = artifact_snapshot.get("final_mp4") or {}
         expected_caption = artifact_snapshot.get("captions") or {}
         expected_thumbnail = artifact_snapshot.get("thumbnail") or {}
         changed = []
-        if expected_video != _artifact_snapshot(final_artifact):
+        if any(
+            expected_video.get(key) != current_video_snapshot.get(key)
+            for key in ("id", "path", "content_hash", "size_bytes")
+        ) or (
+            expected_video.get("sha256")
+            and expected_video.get("sha256") != current_video_snapshot["sha256"]
+        ):
             changed.append("final_mp4")
-        if expected_caption != _artifact_snapshot(caption_artifact):
+        if any(
+            expected_caption.get(key) != current_caption_snapshot.get(key)
+            for key in ("id", "path", "content_hash", "size_bytes")
+        ) or (
+            expected_caption.get("sha256")
+            and expected_caption.get("sha256") != current_caption_snapshot["sha256"]
+        ):
             changed.append("captions_srt")
         if (
-            str(expected_thumbnail.get("path") or "") != str(thumbnail_path)
+            str(expected_thumbnail.get("path") or "")
+            != current_thumbnail_snapshot["path"]
             or str(expected_thumbnail.get("sha256") or "")
-            != _sha256_file(thumbnail_path)
+            != current_thumbnail_snapshot["sha256"]
         ):
             changed.append("thumbnail")
         if changed:
@@ -308,15 +401,11 @@ def _build_preflight_context(
                 changed,
                 "Artifact publish đã thay đổi so với snapshot; cần khôi phục đúng bản đã reserve.",
             )
-    else:
-        snapshot["artifacts"] = {
-            "final_mp4": _artifact_snapshot(final_artifact),
-            "captions": _artifact_snapshot(caption_artifact),
-            "thumbnail": {
-                "path": str(thumbnail_path),
-                "sha256": _sha256_file(thumbnail_path),
-            },
-        }
+    snapshot["artifacts"] = {
+        "final_mp4": current_video_snapshot,
+        "captions": current_caption_snapshot,
+        "thumbnail": current_thumbnail_snapshot,
+    }
     snapshot["prompt_version"] = prompt_version
     snapshot["default_youtube_channel_id"] = str(channel.get("channel_id") or "")
 
@@ -340,6 +429,7 @@ def _build_preflight_context(
         "workflow": workflow,
         "snapshot": snapshot,
         "video": video,
+        "final_artifact": final_artifact,
         "video_path": video_path,
         "caption_path": caption_path,
         "thumbnail_path": thumbnail_path,
@@ -367,12 +457,22 @@ def execute_publish_job(
     workflow = context["workflow"]
     workflow_id = str(workflow["id"])
     video_id = int(workflow["video_id"])
-    if workflow.get("status") == "completed":
+    if workflow.get("status") in {
+        "completed",
+        "uploaded_private",
+        "scheduled",
+        "published",
+    }:
         return {
             "workflow_id": workflow_id,
             "youtube_video_id": workflow.get("youtube_video_id") or "",
             "scheduled_at": workflow.get("scheduled_at") or "",
-            "stage": "completed",
+            "stage": str(workflow.get("stage") or workflow.get("status") or "completed"),
+            "publish_stage": str(
+                workflow.get("stage") or workflow.get("status") or "completed"
+            ),
+            "ready": True,
+            "missing_configuration": [],
         }
 
     db.update_youtube_publish_workflow(
@@ -392,12 +492,7 @@ def execute_publish_job(
     )
     cancel_check()
 
-    if context["schedule_enabled"] and not str(workflow.get("scheduled_at") or ""):
-        scheduled_at = db.reserve_youtube_publication_slot(workflow_id)
-        workflow = db.get_youtube_publish_workflow(workflow_id)
-        progress("Đã giữ khung giờ đăng YouTube", "slot_reserved", 0)
-    else:
-        scheduled_at = str(workflow.get("scheduled_at") or "")
+    scheduled_at = str(workflow.get("scheduled_at") or "")
 
     def token_provider() -> str:
         latest_channel = db.get_youtube_channel(
@@ -472,7 +567,20 @@ def execute_publish_job(
                 published_title=str(
                     context["metadata"].get("snippet", {}).get("title") or ""
                 ),
-                published_at=scheduled_at,
+                published_at="",
+                privacy_status="private",
+                processing_status=(
+                    "succeeded"
+                    if str((payload.get("status") or {}).get("uploadStatus") or "")
+                    == "processed"
+                    else "processing"
+                ),
+                scheduled_at="",
+                artifact_hash=str(
+                    context["snapshot"].get("artifacts", {})
+                    .get("final_mp4", {})
+                    .get("sha256", "")
+                ),
             )
             db.update_youtube_publish_workflow(
                 workflow_id,
@@ -554,34 +662,95 @@ def execute_publish_job(
         )
         progress("Đã gắn phụ đề tiếng Việt", "caption_done", 100)
 
+    workflow = db.get_youtube_publish_workflow(workflow_id)
+    publication_id = int(workflow.get("publication_id") or 0)
+    if not publication_id:
+        publication = db.get_video_publication_by_youtube_id(youtube_video_id)
+        publication_id = int((publication or {}).get("id") or 0)
+
     if context["schedule_enabled"]:
         cancel_check()
-        db.update_youtube_publish_workflow(workflow_id, stage="processing")
+        db.update_youtube_publish_workflow(
+            workflow_id, stage="processing", status="processing"
+        )
+        if publication_id:
+            db.update_video_publication(
+                publication_id,
+                privacy_status="private",
+                processing_status="processing",
+            )
+        db.update_video_production_state(
+            video_id,
+            publish_status="processing",
+            current_stage="processing",
+            production_progress="Đang chờ YouTube xử lý video",
+            blocking_reason="",
+        )
         progress("Đang chờ YouTube xử lý video", "processing", 100)
-        youtube_publisher.require_processing_succeeded(
+        processing_details = youtube_publisher.require_processing_succeeded(
             token_provider(), youtube_video_id, proxy=context["proxy"]
         )
+        if publication_id:
+            db.update_video_publication(
+                publication_id,
+                privacy_status="private",
+                processing_status="succeeded",
+            )
+        scheduled_at = db.reserve_youtube_publication_slot(workflow_id)
+        progress("Đã giữ khung giờ đăng YouTube", "slot_reserved", 100)
+        cancel_check()
+        scheduled_at = db.reserve_youtube_publication_slot(workflow_id)
+        preserved_status = {
+            **dict(processing_details.get("status") or {}),
+            **dict(context["metadata"].get("status") or {}),
+        }
         youtube_publisher.schedule_video(
             token_provider(),
             youtube_video_id,
             scheduled_at,
+            preserved_status=preserved_status,
             proxy=context["proxy"],
         )
-        db.update_youtube_publish_workflow(workflow_id, stage="scheduled")
+        if not publication_id:
+            raise youtube_publisher.YouTubeUploadReconciliationRequired(
+                "Đã có YouTube Video ID nhưng thiếu publication checkpoint."
+            )
+        try:
+            db.complete_youtube_schedule(
+                workflow_id, publication_id, scheduled_at
+            )
+        except Exception as exc:
+            raise youtube_publisher.YouTubeUploadReconciliationRequired(
+                "YouTube đã nhận lịch nhưng local checkpoint chưa được xác nhận."
+            ) from exc
         progress("Đã đặt lịch đăng YouTube", "scheduled", 100)
-
-    db.update_youtube_publish_workflow(
-        workflow_id,
-        status="completed",
-        stage="completed",
-        upload_session_encrypted="",
-        error="",
-    )
-    final_status = "scheduled" if context["schedule_enabled"] else "uploaded_private"
+        final_status = "scheduled"
+        final_stage = "scheduled"
+    else:
+        if publication_id:
+            publication = db.get_video_publication(publication_id) or {}
+            db.update_video_publication(
+                publication_id,
+                privacy_status="private",
+                processing_status=str(
+                    publication.get("processing_status") or "processing"
+                ),
+                scheduled_at="",
+                published_at="",
+            )
+        db.update_youtube_publish_workflow(
+            workflow_id,
+            status="uploaded_private",
+            stage="uploaded_private",
+            upload_session_encrypted="",
+            error="",
+        )
+        final_status = "uploaded_private"
+        final_stage = "uploaded_private"
     db.update_video_production_state(
         video_id,
         publish_status=final_status,
-        current_stage="completed",
+        current_stage=final_stage,
         production_progress=(
             "Đã đặt lịch đăng YouTube"
             if context["schedule_enabled"]
@@ -593,6 +762,9 @@ def execute_publish_job(
         "workflow_id": workflow_id,
         "youtube_video_id": youtube_video_id,
         "scheduled_at": scheduled_at,
-        "stage": "completed",
+        "stage": final_stage,
+        "publish_stage": final_stage,
         "upload_percent": 100,
+        "ready": True,
+        "missing_configuration": [],
     }

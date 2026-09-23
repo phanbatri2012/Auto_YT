@@ -565,55 +565,50 @@ function Ensure-FrontendEnvironment {
     return $npmCommand.Source
 }
 
-function Start-DetachedProcess {
-    param(
-        [string]$CommandLine,
-        [string]$WorkingDirectory
-    )
-
-    $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{
-        ShowWindow = [uint16]0
-    }
-    $res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-        CommandLine = $CommandLine
-        CurrentDirectory = $WorkingDirectory
-        ProcessStartupInformation = $startup
-    }
-    if ($res.ReturnValue -ne 0) {
-        throw "Failed to create detached process (ReturnValue: $($res.ReturnValue)): $CommandLine"
-    }
-
-    $pidVal = [int]$res.ProcessId
-    return [PSCustomObject]@{
-        Id = $pidVal
-        ProcessId = $pidVal
-        HasExited = $false
-        Refresh = {
-            $p = Get-Process -Id $this.Id -ErrorAction SilentlyContinue
-            $this.HasExited = ($null -eq $p)
-        }
-    }
-}
-
 function Start-Backend {
     New-Item -ItemType Directory -Path $logsRoot -Force | Out-Null
     $srcPath = Join-Path $projectRoot "src"
-    $stdoutLog = Join-Path $logsRoot "backend.stdout.log"
-    $stderrLog = Join-Path $logsRoot "backend.stderr.log"
+    $stdoutLog = Join-Path $logsRoot "backend.current.stdout.log"
+    $stderrLog = Join-Path $logsRoot "backend.current.stderr.log"
     Write-Step "Starting backend on port 8080."
-    $cmdLine = "cmd.exe /c `"set PYTHONPATH=$srcPath&& `"$venvPython`" -m uvicorn auto_yt.main:app --host 127.0.0.1 --port 8080 >> `"$stdoutLog`" 2>> `"$stderrLog`"`""
-    return Start-DetachedProcess -CommandLine $cmdLine -WorkingDirectory $projectRoot
+    $previousPythonPath = $env:PYTHONPATH
+    try {
+        $env:PYTHONPATH = $srcPath
+        $process = Start-Process `
+            -FilePath $venvPython `
+            -ArgumentList @("-m", "uvicorn", "auto_yt.main:app", "--host", "127.0.0.1", "--port", "8080") `
+            -WorkingDirectory $projectRoot `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog `
+            -PassThru
+    }
+    finally {
+        if ($null -eq $previousPythonPath) {
+            Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:PYTHONPATH = $previousPythonPath
+        }
+    }
+    return $process
 }
 
 function Start-Frontend {
     param([string]$NpmPath)
 
     New-Item -ItemType Directory -Path $logsRoot -Force | Out-Null
-    $stdoutLog = Join-Path $logsRoot "frontend.stdout.log"
-    $stderrLog = Join-Path $logsRoot "frontend.stderr.log"
+    $stdoutLog = Join-Path $logsRoot "frontend.current.stdout.log"
+    $stderrLog = Join-Path $logsRoot "frontend.current.stderr.log"
     Write-Step "Starting frontend on port 5173."
-    $cmdLine = "cmd.exe /c `"call `"$NpmPath`" run dev -- --host 127.0.0.1 >> `"$stdoutLog`" 2>> `"$stderrLog`"`""
-    return Start-DetachedProcess -CommandLine $cmdLine -WorkingDirectory $frontendRoot
+    return Start-Process `
+        -FilePath $NpmPath `
+        -ArgumentList @("run", "dev", "--", "--host", "127.0.0.1") `
+        -WorkingDirectory $frontendRoot `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog `
+        -PassThru
 }
 
 $createdNew = $false
@@ -658,7 +653,7 @@ try {
                 catch {
                     $backendProcess.Refresh()
                     if ($backendProcess.HasExited) {
-                        throw "Backend exited during startup. See data/logs/backend.stderr.log."
+                        throw "Backend exited during startup. See data/logs/backend.current.stderr.log."
                     }
                     throw
                 }
@@ -695,7 +690,7 @@ try {
                 catch {
                     $frontendProcess.Refresh()
                     if ($frontendProcess.HasExited) {
-                        $frontendErrLog = Join-Path $logsRoot "frontend.stderr.log"
+                        $frontendErrLog = Join-Path $logsRoot "frontend.current.stderr.log"
                         $errText = if (Test-Path -LiteralPath $frontendErrLog -PathType Leaf) { Get-Content -LiteralPath $frontendErrLog -Raw -ErrorAction SilentlyContinue } else { "" }
                         if ($errText -match "EPERM" -and ($errText -match "\.vite" -or $errText -match "unlink")) {
                             Write-Step "Detected locked or restricted Vite cache. Self-healing by resetting .vite cache..."
@@ -710,7 +705,7 @@ try {
                             $frontendReady = $true
                         }
                         else {
-                            throw "Frontend exited during startup. See data/logs/frontend.stderr.log."
+                            throw "Frontend exited during startup. See data/logs/frontend.current.stderr.log."
                         }
                     }
                     else {

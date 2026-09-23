@@ -1,4 +1,4 @@
-.tts-page { max-width: 1050px; margin: 0 auto; color: #eee; }
+.tts-page { max-width: 1600px; width: 100%; color: #eee; }
 .tts-heading, .tts-card-title, .tts-list-tools, .tts-actions { display: flex; align-items: center; gap: 10px; }
 .tts-heading, .tts-card-title { justify-content: space-between; }
 .tts-heading h1 { margin: 0; font-size: 2.25rem; }

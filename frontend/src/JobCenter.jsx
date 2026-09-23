@@ -48,7 +48,9 @@ const PUBLISH_STAGE_LABELS = {
   thumbnail_done: 'Đã gắn thumbnail',
   caption_done: 'Đã gắn phụ đề',
   processing: 'YouTube đang xử lý',
+  uploaded_private: 'Đã upload Private',
   scheduled: 'Đã đặt lịch',
+  public: 'Đã Public',
   completed: 'Hoàn tất'
 }
 
@@ -56,9 +58,12 @@ const CONFIGURATION_LABELS = {
   default_youtube_channel_id: 'kênh YouTube mặc định',
   youtube_oauth: 'OAuth YouTube',
   gpm_profile_id: 'GPM Profile',
+  gpm_profile_exclusive: 'GPM Profile riêng không dùng chung',
   gpm_proxy_info: 'proxy riêng của GPM Profile',
   publication_timezone: 'múi giờ đăng',
   publication_slots: 'khung giờ đăng',
+  publication_daily_limit: 'giới hạn video mỗi ngày',
+  publication_lead_minutes: 'khoảng an toàn trước giờ đăng',
   publication_paused: 'bỏ tạm dừng lịch đăng',
   public_upload_verified: 'xác minh quyền đặt lịch public',
   made_for_kids: 'lựa chọn dành cho trẻ em',
@@ -438,9 +443,11 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           return next
         })
       }
+      setBulkMessage(`✅ Đã gửi yêu cầu ${BULK_ACTION_META[action]?.pastLabel || action} cho job "${job.title || job.id}"`)
+      setError('')
       await loadJobs()
     } catch (actionError) {
-      setError(actionError.message)
+      setError(`Lỗi ${BULK_ACTION_META[action]?.pastLabel || action} job: ${actionError.message}`)
     } finally {
       setActionId('')
     }
@@ -690,7 +697,12 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                     <div style={{ color: '#666', marginTop: '6px', fontSize: '0.78em' }}>
                       Tạo: {formatDate(job.created_at)}{job.attempt ? ` · Lần chạy ${job.attempt}` : ''}
                     </div>
-                    {job.recovery_count > 0 && (
+                    {job.processing_poll_count > 0 && job.publish_stage === 'processing' && (
+                      <div style={{ color: '#4dd0e1', marginTop: '6px', fontSize: '0.8em' }}>
+                        Đã kiểm tra processing {job.processing_poll_count} lần · timeout an toàn 24 giờ
+                      </div>
+                    )}
+                    {job.recovery_count > 0 && !(job.processing_poll_count > 0 && job.publish_stage === 'processing') && (
                       <div style={{ color: '#4dd0e1', marginTop: '6px', fontSize: '0.8em' }}>
                         Tự phục hồi: {job.recovery_count}/{job.recovery_limit || 3}
                         {job.resume_from_step ? ` · Tiếp tục từ ${job.resume_from_step}` : ''}

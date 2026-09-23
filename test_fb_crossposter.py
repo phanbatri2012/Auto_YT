@@ -1,6 +1,7 @@
 import datetime
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import urllib.parse
@@ -9,6 +10,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from PIL import Image
+import imageio_ffmpeg
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
@@ -105,6 +107,29 @@ class FBCrossPosterUnitTests(unittest.TestCase):
         self.assertNotIn("youtube.com", caption)
         self.assertIn("Nội dung chính.", caption)
 
+    def test_default_tags_are_prioritized_and_deduplicated(self):
+        effective = fb_crossposter_service.get_effective_tags(
+            ["Lịch sử", "Tag nguồn", "Tag cuối"],
+            raw_description="#TagMoTa #LichSuKhac",
+            max_count=5,
+            default_tags=["Thương hiệu", "lịch sử", "#Thương Hiệu"],
+        )
+
+        self.assertEqual(
+            effective,
+            ["Thương hiệu", "lịch sử", "TagMoTa", "LichSuKhac", "Tag nguồn"],
+        )
+
+    def test_manual_caption_only_appends_missing_default_hashtags(self):
+        caption = fb_crossposter_service.append_missing_default_hashtags(
+            "Nội dung chỉnh tay\n\n#ThuongHieu",
+            ["ThuongHieu", "Lịch sử Việt Nam"],
+        )
+
+        self.assertEqual(caption.count("#ThuongHieu"), 1)
+        self.assertIn("#LịchSửViệtNam", caption)
+        self.assertTrue(caption.startswith("Nội dung chỉnh tay"))
+
     def test_manual_caption_is_preserved_when_queue_metadata_is_refreshed(self):
         db.upsert_fb_crossposter_queue_items([{
             "youtube_id": "manual_caption",
@@ -195,6 +220,79 @@ class FBCrossPosterUnitTests(unittest.TestCase):
             self.assertTrue(output.read_bytes().startswith(b"\xff\xd8"))
         mock_build_opener.assert_called_once_with("http://proxy:8080")
 
+    def test_thumbnail_conversion_creates_vertical_blurred_layout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "thumb.jpg"
+            Image.new("RGB", (1600, 900), (230, 20, 20)).save(source, format="JPEG")
+
+            result = fb_crossposter_service.convert_thumbnail_to_vertical(source)
+
+            self.assertEqual(result, source)
+            with Image.open(result) as converted:
+                self.assertEqual(converted.size, (1080, 1920))
+                self.assertEqual(converted.mode, "RGB")
+
+    def test_video_conversion_creates_vertical_mp4_with_audio(self):
+        ffmpeg_executable = (
+            Path(fb_crossposter_service.ensure_ffmpeg_directory()) / "ffmpeg.exe"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.mp4"
+            output = Path(temp_dir) / "vertical.mp4"
+            generated = subprocess.run(
+                [
+                    str(ffmpeg_executable),
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=blue:s=320x180:r=2",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=1000:sample_rate=44100",
+                    "-t",
+                    "0.5",
+                    "-shortest",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+
+            fb_crossposter_service.convert_video_to_vertical(source, output)
+
+            frames = imageio_ffmpeg.read_frames(str(output), pix_fmt="rgb24")
+            metadata = next(frames)
+            frames.close()
+            self.assertEqual(metadata["size"], (1080, 1920))
+            audio_check = subprocess.run(
+                [
+                    str(ffmpeg_executable),
+                    "-v",
+                    "error",
+                    "-i",
+                    str(output),
+                    "-map",
+                    "0:a:0",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(audio_check.returncode, 0, audio_check.stderr)
+
     def test_upsert_queue_and_deduplication(self):
         items = [
             {
@@ -281,6 +379,71 @@ class FBCrossPosterUnitTests(unittest.TestCase):
         self.assertEqual(dt3.date(), day_after)
         self.assertEqual(dt3.strftime("%H:%M"), "11:30")
 
+    def test_recalculate_schedule_collision_prevention(self):
+        """Test that already occupied/published slots are skipped when recalculating schedule."""
+        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+        day_after = tomorrow + datetime.timedelta(days=1)
+
+        t1 = datetime.datetime.combine(tomorrow, datetime.time(11, 30))
+        t2 = datetime.datetime.combine(tomorrow, datetime.time(19, 30))
+
+        # 1. Existing items that are already published to Meta Cloud tomorrow
+        items_existing = [
+            {
+                "youtube_id": "yt_published_1",
+                "original_title": "Published 1",
+                "sort_order": 1,
+            },
+            {
+                "youtube_id": "yt_published_2",
+                "original_title": "Published 2",
+                "sort_order": 2,
+            }
+        ]
+        db.upsert_fb_crossposter_queue_items(items_existing)
+        q1 = db.get_fb_crossposter_queue()
+        id1 = q1["items"][0]["id"]
+        id2 = q1["items"][1]["id"]
+        db.update_fb_crossposter_queue_item(id1, {
+            "status": "published",
+            "fb_post_id": "fb_post_111",
+            "scheduled_publish_time": int(t1.timestamp())
+        })
+        db.update_fb_crossposter_queue_item(id2, {
+            "status": "published",
+            "fb_post_id": "fb_post_222",
+            "scheduled_publish_time": int(t2.timestamp())
+        })
+
+        # 2. Add 2 new pending items
+        items_new = [
+            {"youtube_id": "yt_new_3", "original_title": "New Pending 3", "sort_order": 3},
+            {"youtube_id": "yt_new_4", "original_title": "New Pending 4", "sort_order": 4},
+        ]
+        db.upsert_fb_crossposter_queue_items(items_new)
+
+        # 3. Recalculate schedule starting from tomorrow
+        updated = db.recalculate_fb_queue_schedule(
+            daily_quota=2,
+            times_list=["11:30", "19:30"],
+            start_date=tomorrow
+        )
+        self.assertEqual(updated, 2)
+
+        # Verify new items were skipped to day_after because tomorrow's slots were occupied!
+        q2 = db.get_fb_crossposter_queue(page=1, page_size=10)
+        items_by_id = {it["youtube_id"]: it for it in q2["items"]}
+
+        new3_ts = items_by_id["yt_new_3"]["scheduled_publish_time"]
+        new4_ts = items_by_id["yt_new_4"]["scheduled_publish_time"]
+        dt3 = datetime.datetime.fromtimestamp(new3_ts)
+        dt4 = datetime.datetime.fromtimestamp(new4_ts)
+
+        self.assertEqual(dt3.date(), day_after)
+        self.assertEqual(dt3.strftime("%H:%M"), "11:30")
+        self.assertEqual(dt4.date(), day_after)
+        self.assertEqual(dt4.strftime("%H:%M"), "19:30")
+
     def test_queue_status_actions(self):
         item = {
             "youtube_id": "yt_action_test",
@@ -321,6 +484,8 @@ class FBCrossPosterUnitTests(unittest.TestCase):
             "target_fb_page_name": "Fanpage A Gaming",
             "daily_quota": 2,
             "lead_time_minutes": 60,
+            "convert_to_vertical": True,
+            "default_tags": ["Fanpage A", "#Lịch sử", "fanpage a"],
         }, page_id="page_A")
 
         # Fanpage B
@@ -333,6 +498,8 @@ class FBCrossPosterUnitTests(unittest.TestCase):
             "target_fb_page_name": "Fanpage B Music",
             "daily_quota": 1,
             "lead_time_minutes": 45,
+            "convert_to_vertical": False,
+            "default_tags": ["Fanpage B"],
         }, page_id="page_B")
 
         # Verify campaigns list
@@ -354,10 +521,14 @@ class FBCrossPosterUnitTests(unittest.TestCase):
         set_a = db.get_fb_crossposter_settings("page_A")
         self.assertEqual(set_a["target_fb_page_name"], "Fanpage A Gaming")
         self.assertEqual(set_a["lead_time_minutes"], 60)
+        self.assertTrue(set_a["convert_to_vertical"])
+        self.assertEqual(set_a["default_tags"], ["Fanpage A", "Lịch sử"])
 
         set_b = db.get_fb_crossposter_settings("page_B")
         self.assertEqual(set_b["target_fb_page_name"], "Fanpage B Music")
         self.assertEqual(set_b["lead_time_minutes"], 45)
+        self.assertFalse(set_b["convert_to_vertical"])
+        self.assertEqual(set_b["default_tags"], ["Fanpage B"])
 
     def test_page_access_token_is_encrypted_and_write_only(self):
         token = "EAATestSecretToken1234567890"
@@ -429,7 +600,7 @@ class FBCrossPosterUnitTests(unittest.TestCase):
 
     @patch("urllib.request.build_opener")
     def test_resumable_upload_protocol(self, mock_build_opener):
-        # Mock responses for start, transfer, finish
+        # Mock responses for start, transfer, finish, and separate thumbnail upload
         mock_opener = MagicMock()
         mock_build_opener.return_value = mock_opener
 
@@ -445,7 +616,11 @@ class FBCrossPosterUnitTests(unittest.TestCase):
         resp_finish.read.return_value = b'{"success": true, "id": "vid_999"}'
         resp_finish.__enter__.return_value = resp_finish
 
-        mock_opener.open.side_effect = [resp_start, resp_transfer, resp_finish]
+        resp_thumb = MagicMock()
+        resp_thumb.read.return_value = b'{"success": true}'
+        resp_thumb.__enter__.return_value = resp_thumb
+
+        mock_opener.open.side_effect = [resp_start, resp_transfer, resp_finish, resp_thumb]
 
         with tempfile.TemporaryDirectory() as temp_dir:
             test_video = Path(temp_dir) / "test_dummy_video.mp4"
@@ -463,16 +638,25 @@ class FBCrossPosterUnitTests(unittest.TestCase):
                 chunk_size_bytes=50,
             )
             self.assertEqual(res.get("id"), "vid_999")
-            self.assertEqual(mock_opener.open.call_count, 3)
+            self.assertEqual(mock_opener.open.call_count, 4)
             finish_request = mock_opener.open.call_args_list[2].args[0]
             self.assertTrue(
                 finish_request.full_url.startswith(
                     "https://graph-video.facebook.com/v26.0/"
                 )
             )
-            self.assertIn(b'name="thumb"', finish_request.data)
-            self.assertIn(b'name="content_tags"', finish_request.data)
-            self.assertIn(b'["101", "202"]', finish_request.data)
+            self.assertEqual(
+                finish_request.get_header("Content-type"),
+                "application/x-www-form-urlencoded",
+            )
+            finish_fields = urllib.parse.parse_qs(finish_request.data.decode("utf-8"))
+            self.assertEqual(finish_fields["upload_phase"], ["finish"])
+            self.assertEqual(json.loads(finish_fields["content_tags"][0]), ["101", "202"])
+
+            thumb_request = mock_opener.open.call_args_list[3].args[0]
+            self.assertTrue(thumb_request.full_url.endswith("/vid_999/thumbnails"))
+            self.assertIn(b'name="source"', thumb_request.data)
+            self.assertIn(b'name="is_preferred"', thumb_request.data)
 
     @patch("auto_yt.services.fb_crossposter_service._get_proxy_for_gpm_profile", return_value=None)
     @patch("auto_yt.services.fb_crossposter_service._build_urllib_opener")
@@ -530,6 +714,8 @@ class FBCrossPosterUnitTests(unittest.TestCase):
             "source_gpm_profile_id": "source-profile",
             "target_gpm_profile_id": "target-profile",
             "post_template": "{title}\n\n{clean_description}\n\n{hashtags}",
+            "convert_to_vertical": True,
+            "default_tags": ["Thương hiệu", "lịch sử"],
         }
         source_info = {
             "title": "Tiêu đề",
@@ -558,6 +744,10 @@ class FBCrossPosterUnitTests(unittest.TestCase):
                 output_path.write_bytes(b"thumbnail")
                 return True
 
+            def convert_video(_source_path, output_path):
+                output_path.write_bytes(b"vertical video")
+                return output_path
+
             with (
                 patch.object(fb_crossposter_service, "TEMP_DOWNLOAD_DIR", temp_path),
                 patch.object(fb_crossposter_service, "YoutubeDL", return_value=downloader),
@@ -569,9 +759,19 @@ class FBCrossPosterUnitTests(unittest.TestCase):
                 patch.object(fb_crossposter_service, "download_thumbnail", side_effect=save_thumb),
                 patch.object(
                     fb_crossposter_service,
+                    "convert_video_to_vertical",
+                    side_effect=convert_video,
+                ) as convert_video_mock,
+                patch.object(
+                    fb_crossposter_service,
+                    "convert_thumbnail_to_vertical",
+                    side_effect=lambda path: path,
+                ) as convert_thumbnail_mock,
+                patch.object(
+                    fb_crossposter_service,
                     "resolve_content_tag_ids",
                     return_value=(["101"], ["Việt Nam"]),
-                ),
+                ) as resolve_tags,
                 patch.object(
                     fb_crossposter_service,
                     "upload_video_to_facebook",
@@ -585,9 +785,15 @@ class FBCrossPosterUnitTests(unittest.TestCase):
 
         self.assertEqual(result["fb_post_id"], "fb77")
         upload_kwargs = upload_video.call_args.kwargs
+        self.assertTrue(upload_kwargs["video_path"].name.endswith("_vertical.mp4"))
         self.assertEqual(upload_kwargs["content_tag_ids"], ["101"])
+        self.assertEqual(upload_kwargs["custom_labels"][:2], ["Thương hiệu", "lịch sử"])
         self.assertNotIn("youtube.com", upload_kwargs["description"])
         self.assertEqual(upload_kwargs["description"].count("Tiêu đề"), 1)
+        self.assertIn("#ThươngHiệu", upload_kwargs["description"])
+        convert_video_mock.assert_called_once()
+        convert_thumbnail_mock.assert_called_once()
+        self.assertEqual(resolve_tags.call_args.kwargs["default_tags"], ["Thương hiệu", "lịch sử"])
         metadata_updates = [
             call.args[1]
             for call in update_item.call_args_list
@@ -595,6 +801,81 @@ class FBCrossPosterUnitTests(unittest.TestCase):
         ][0]
         self.assertEqual(metadata_updates["original_tags_json"], '["lịch sử", "Việt Nam"]')
         self.assertEqual(metadata_updates["fb_description_source"], "auto")
+
+    def test_vertical_conversion_failure_blocks_upload_and_cleans_temp_files(self):
+        item = {
+            "id": 78,
+            "target_page_id": "page",
+            "youtube_id": "yt78",
+            "youtube_url": "https://youtube.com/watch?v=yt78",
+            "original_title": "Video lỗi chuyển đổi",
+            "original_description": "",
+            "original_tags": [],
+            "thumbnail_url": "",
+            "fb_title": "Video lỗi chuyển đổi",
+            "fb_description": "",
+            "fb_description_source": "auto",
+            "scheduled_publish_time": 0,
+        }
+        settings = {
+            "target_fb_page_id": "page",
+            "target_access_token": "token",
+            "convert_to_vertical": True,
+            "default_tags": [],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            downloader = MagicMock()
+            downloader.__enter__.return_value = downloader
+
+            def extract_info(_url, download):
+                self.assertTrue(download)
+                (temp_path / "yt78_78.mp4").write_bytes(b"video")
+                return {
+                    "title": item["original_title"],
+                    "description": "Mô tả",
+                    "tags": [],
+                    "thumbnail": "https://i.ytimg.com/yt78.jpg",
+                }
+
+            downloader.extract_info.side_effect = extract_info
+
+            def save_thumb(_url, output_path, source_gpm_profile_id=""):
+                output_path.write_bytes(b"thumbnail")
+                return True
+
+            with (
+                patch.object(fb_crossposter_service, "TEMP_DOWNLOAD_DIR", temp_path),
+                patch.object(fb_crossposter_service, "YoutubeDL", return_value=downloader),
+                patch.object(fb_crossposter_service, "ensure_ffmpeg_directory", return_value=""),
+                patch.object(db, "get_fb_crossposter_queue_item", return_value=dict(item)),
+                patch.object(db, "get_fb_crossposter_runtime_settings", return_value=settings),
+                patch.object(db, "update_fb_crossposter_queue_item") as update_item,
+                patch.object(fb_crossposter_service, "_get_proxy_for_gpm_profile", return_value=None),
+                patch.object(fb_crossposter_service, "download_thumbnail", side_effect=save_thumb),
+                patch.object(
+                    fb_crossposter_service,
+                    "convert_video_to_vertical",
+                    side_effect=RuntimeError("ffmpeg failed"),
+                ),
+                patch.object(fb_crossposter_service, "upload_video_to_facebook") as upload_video,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "ffmpeg failed"):
+                    fb_crossposter_service.process_queue_item_jit(
+                        78,
+                        parent_task_id="batch",
+                    )
+
+            upload_video.assert_not_called()
+            error_updates = [
+                call.args[1]
+                for call in update_item.call_args_list
+                if call.args[1].get("status") == "error"
+            ]
+            self.assertEqual(len(error_updates), 1)
+            self.assertIn("ffmpeg failed", error_updates[0]["error_message"])
+            self.assertEqual(list(temp_path.iterdir()), [])
 
     @patch("auto_yt.services.fb_crossposter_service._get_proxy_for_gpm_profile", return_value=None)
     @patch("auto_yt.services.fb_crossposter_service._build_urllib_opener")
@@ -851,9 +1132,17 @@ Câu chuyện về vị tướng quả cảm.
 
     def test_is_transient_meta_error_detection(self):
         self.assertTrue(fb_crossposter_service.is_transient_meta_error('{"error":{"code":2,"error_subcode":1363047,"is_transient":true}}', 400))
+        self.assertTrue(fb_crossposter_service.is_transient_meta_error('{"error":{"code":4,"message":"Application request limit reached"}}', 400))
+        self.assertTrue(fb_crossposter_service.is_transient_meta_error('{"error":{"code":17,"message":"User request limit reached"}}', 400))
+        self.assertTrue(fb_crossposter_service.is_transient_meta_error('{"error":{"code":341,"message":"Temporarily blocked"}}', 400))
+        self.assertTrue(fb_crossposter_service.is_transient_meta_error('{"error":{"error_subcode":1363030}}', 400))
+        self.assertTrue(fb_crossposter_service.is_transient_meta_error('{"error":{"error_subcode":1363019}}', 400))
         self.assertTrue(fb_crossposter_service.is_transient_meta_error("Service temporarily unavailable", 400))
+        self.assertTrue(fb_crossposter_service.is_transient_meta_error("Request timed out", 400))
         self.assertTrue(fb_crossposter_service.is_transient_meta_error("Internal Server Error", 500))
         self.assertTrue(fb_crossposter_service.is_transient_meta_error("Bad Gateway", 502))
+        self.assertTrue(fb_crossposter_service.is_transient_meta_error("Too Many Requests", 429))
+        self.assertTrue(fb_crossposter_service.is_transient_meta_error("Request Timeout", 408))
         self.assertFalse(fb_crossposter_service.is_transient_meta_error('{"error":{"code":190,"message":"Session has expired"}}', 400))
 
     @patch("time.sleep", return_value=None)
@@ -871,7 +1160,7 @@ Câu chuyện về vị tướng quả cảm.
         transfer_resp.read.return_value = json.dumps({"start_offset": 30 * 1024 * 1024, "end_offset": 30 * 1024 * 1024}).encode("utf-8")
         transfer_resp.__enter__.return_value = transfer_resp
 
-        # Phase 3 attempt 1: Transient 400 error (code 2, subcode 1363047)
+        # Phase 3 attempt 1 & 2: Transient 400 error (code 2, subcode 1363047)
         err_msg = json.dumps({
             "error": {
                 "message": "Service temporarily unavailable",
@@ -881,7 +1170,14 @@ Câu chuyện về vị tướng quả cảm.
                 "error_subcode": 1363047
             }
         }).encode("utf-8")
-        http_err = urllib.error.HTTPError(
+        http_err1 = urllib.error.HTTPError(
+            url="https://graph-video.facebook.com/v26.0/123/videos",
+            code=400,
+            msg="Bad Request",
+            hdrs={},
+            fp=io.BytesIO(err_msg)
+        )
+        http_err2 = urllib.error.HTTPError(
             url="https://graph-video.facebook.com/v26.0/123/videos",
             code=400,
             msg="Bad Request",
@@ -889,7 +1185,7 @@ Câu chuyện về vị tướng quả cảm.
             fp=io.BytesIO(err_msg)
         )
 
-        # Phase 3 attempt 2: Success
+        # Phase 3 attempt 3: Success
         finish_resp = MagicMock()
         finish_resp.read.return_value = json.dumps({"success": True, "id": "vid_123"}).encode("utf-8")
         finish_resp.__enter__.return_value = finish_resp
@@ -897,7 +1193,8 @@ Câu chuyện về vị tướng quả cảm.
         mock_build_opener.return_value.open.side_effect = [
             start_resp,
             transfer_resp,
-            http_err,
+            http_err1,
+            http_err2,
             finish_resp
         ]
 
@@ -916,7 +1213,7 @@ Câu chuyện về vị tướng quả cảm.
             )
 
         self.assertEqual(res.get("id"), "vid_123")
-        self.assertEqual(mock_build_opener.return_value.open.call_count, 4)
+        self.assertEqual(mock_build_opener.return_value.open.call_count, 5)
 
 
 if __name__ == "__main__":

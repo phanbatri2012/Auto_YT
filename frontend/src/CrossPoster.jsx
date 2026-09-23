@@ -8,6 +8,24 @@ import {
 
 const API_BASE = 'http://127.0.0.1:8080'
 const FB_STORAGE_KEY = 'AUTOYT_FACEBOOK_PAGES'
+const META_FAILURE_STATES = new Set(['meta_failed', 'stalled', 'missing'])
+const STATUS_LABELS = {
+  pending: 'Chờ tới lượt',
+  scheduled: 'Lịch chờ upload',
+  downloading: 'Đang tải MP4',
+  uploading: 'Đang upload Meta',
+  verifying: 'Đang xác minh Meta',
+  processing: 'Meta đang xử lý',
+  retryable: 'Meta chờ kiểm tra lại',
+  meta_scheduled: 'Meta đã nhận lịch',
+  schedule_mismatch: 'Lịch Meta khác tool',
+  stalled: 'Upload Meta bị treo',
+  meta_failed: 'Video Meta bị lỗi',
+  missing: 'Không còn trên Meta',
+  published: 'Đã đăng thực tế',
+  skipped: 'Bỏ qua',
+  error: 'Lỗi'
+}
 
 function createDefaultSettings() {
   return {
@@ -114,6 +132,11 @@ export default function CrossPoster() {
     verifying: 0,
     meta_scheduled: 0,
     processing: 0,
+    retryable: 0,
+    schedule_mismatch: 0,
+    stalled: 0,
+    meta_failed: 0,
+    missing: 0,
     published: 0,
     skipped: 0,
     error: 0,
@@ -581,12 +604,12 @@ export default function CrossPoster() {
     }
   }
 
-  const handleReconcileMeta = async () => {
+  const handleReconcileMeta = async (dryRun = false) => {
     setIsReconciling(true)
-    setMessage('Đang đối chiếu trạng thái thực tế với Meta...')
+    setMessage(dryRun ? 'Đang xem trước trạng thái Meta, chưa thay đổi dữ liệu...' : 'Đang đối chiếu trạng thái thực tế với Meta...')
     setMessageType('info')
     try {
-      const params = new URLSearchParams({ limit: '100' })
+      const params = new URLSearchParams({ limit: '100', dry_run: String(dryRun) })
       if (selectedPageId) params.append('page_id', selectedPageId)
       const res = await fetch(`${API_BASE}/api/fb-crossposter/reconcile-meta?${params.toString()}`, {
         method: 'POST'
@@ -594,9 +617,10 @@ export default function CrossPoster() {
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
       const counts = data.counts || {}
-      setMessage(`Đã đối chiếu ${counts.checked || 0} video: ${counts.meta_scheduled || 0} đúng lịch, ${counts.processing || 0} đang xử lý, ${counts.published || 0} đã đăng, ${counts.error || 0} lỗi.`)
-      setMessageType((counts.error || 0) > 0 ? 'info' : 'success')
-      loadQueue(selectedPageId)
+      const needsAction = (counts.schedule_mismatch || 0) + (counts.stalled || 0) + (counts.meta_failed || 0) + (counts.missing || 0)
+      setMessage(`${dryRun ? 'Xem trước' : 'Đã đối chiếu'} ${counts.checked || 0} video: ${counts.meta_scheduled || 0} đúng lịch, ${counts.processing || 0} đang xử lý, ${counts.schedule_mismatch || 0} lệch lịch, ${counts.stalled || 0} bị treo, ${counts.meta_failed || 0} lỗi Meta, ${counts.published || 0} đã đăng.`)
+      setMessageType(needsAction > 0 ? 'info' : 'success')
+      if (!dryRun) loadQueue(selectedPageId)
     } catch (err) {
       setMessage(`Lỗi đồng bộ Meta: ${err.message}`)
       setMessageType('error')
@@ -683,7 +707,7 @@ export default function CrossPoster() {
   }
 
   const handleRepairMeta = async (itemId) => {
-    if (!window.confirm('Tool sẽ thử sửa video hiện có. Nếu Meta không cho sửa, tool chỉ xóa bản lỗi sau khi video thay thế đã được xác minh thành công. Tiếp tục?')) {
+    if (!window.confirm('Tool sẽ giữ chế độ đặt lịch. Nếu lịch đã quá hạn, tool cấp slot tương lai mới và tuyệt đối không tự đăng ngay. Tiếp tục?')) {
       return
     }
     setIsPublishingId(itemId)
@@ -706,6 +730,49 @@ export default function CrossPoster() {
       setIsPublishingId(null)
     }
   }
+
+  const handleMetaItemAction = async (itemId, endpoint, options) => {
+    if (options.confirm && !window.confirm(options.confirm)) return
+    setIsPublishingId(itemId)
+    setMessage(options.progress)
+    setMessageType('info')
+    try {
+      const res = await fetch(`${API_BASE}/api/fb-crossposter/queue/${itemId}/${endpoint}`, {
+        method: 'POST'
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setMessage(data.message || options.success)
+      setMessageType('success')
+      loadQueue(selectedPageId)
+    } catch (err) {
+      setMessage(`${options.error}: ${err.message}`)
+      setMessageType('error')
+      loadQueue(selectedPageId)
+    } finally {
+      setIsPublishingId(null)
+    }
+  }
+
+  const handleSyncMetaItem = (itemId) => handleMetaItemAction(itemId, 'sync-meta', {
+    progress: `Đang đọc lại trạng thái video #${itemId} từ Meta...`,
+    success: 'Đã đồng bộ trạng thái Meta.',
+    error: 'Lỗi đồng bộ Meta'
+  })
+
+  const handleUseMetaSchedule = (itemId) => handleMetaItemAction(itemId, 'use-meta-schedule', {
+    confirm: 'Dùng thời gian đang có trên Meta làm lịch chính thức trong tool?',
+    progress: `Đang đồng bộ lịch thực tế của video #${itemId}...`,
+    success: 'Đã dùng lịch thực tế trên Meta.',
+    error: 'Không thể dùng lịch Meta'
+  })
+
+  const handleCleanupMeta = (itemId) => handleMetaItemAction(itemId, 'cleanup-meta', {
+    confirm: 'Thao tác này sẽ xóa Meta Video ID đã được xác nhận lỗi, kiểm tra việc xóa rồi cấp một slot tương lai mới. Tiếp tục?',
+    progress: `Đang dọn đối tượng Meta lỗi và xếp lịch lại video #${itemId}...`,
+    success: 'Đã xóa đối tượng Meta lỗi và cấp lịch mới.',
+    error: 'Không thể dọn đối tượng Meta lỗi'
+  })
 
   // Skip / Unskip Item
   const handleToggleSkip = async (item) => {
@@ -971,10 +1038,18 @@ export default function CrossPoster() {
             </button>
             <button
               className="fb-btn fb-btn-secondary"
-              onClick={handleReconcileMeta}
+              onClick={() => handleReconcileMeta(false)}
               disabled={isReconciling}
             >
               {isReconciling ? '⏳ Đang đối chiếu...' : '🔄 Đồng Bộ Meta'}
+            </button>
+            <button
+              className="fb-btn fb-btn-secondary"
+              onClick={() => handleReconcileMeta(true)}
+              disabled={isReconciling}
+              title="Chỉ lập báo cáo, không cập nhật trạng thái trong tool"
+            >
+              Xem trước Meta
             </button>
           </div>
         </div>
@@ -1142,7 +1217,11 @@ export default function CrossPoster() {
         </div>
         <div className="fb-stat-card">
           <div className="fb-stat-label">Meta đang xử lý</div>
-          <div className="fb-stat-value pending">{stats.processing + stats.verifying}</div>
+          <div className="fb-stat-value pending">{(stats.processing || 0) + (stats.verifying || 0) + (stats.retryable || 0)}</div>
+        </div>
+        <div className="fb-stat-card">
+          <div className="fb-stat-label">Cần xử lý Meta</div>
+          <div className="fb-stat-value error">{(stats.schedule_mismatch || 0) + (stats.stalled || 0) + (stats.meta_failed || 0) + (stats.missing || 0)}</div>
         </div>
         <div className="fb-stat-card">
           <div className="fb-stat-label">Đang trong hàng đợi</div>
@@ -1546,13 +1625,13 @@ export default function CrossPoster() {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
           <span style={{ fontSize: '0.85rem', color: '#94a3b8', fontWeight: '600' }}>Lọc:</span>
-          {['all', 'pending', 'scheduled', 'meta_scheduled', 'processing', 'published', 'skipped', 'error'].map((st) => (
+          {['all', 'pending', 'scheduled', 'meta_scheduled', 'processing', 'schedule_mismatch', 'meta_failed', 'published', 'skipped', 'error'].map((st) => (
             <button
               key={st}
               className={`fb-btn fb-btn-sm ${statusFilter === st ? 'fb-btn-primary' : 'fb-btn-secondary'}`}
               onClick={() => { setStatusFilter(st); setPage(1) }}
             >
-              {st === 'all' ? 'Tất cả' : st === 'pending' ? 'Chờ đăng' : st === 'scheduled' ? 'Lịch chờ upload' : st === 'meta_scheduled' ? 'Meta đã nhận lịch' : st === 'processing' ? 'Meta đang xử lý' : st === 'published' ? 'Đã đăng thực tế' : st === 'skipped' ? 'Bỏ qua' : 'Lỗi'}
+              {st === 'all' ? 'Tất cả' : (STATUS_LABELS[st] || st)}
             </button>
           ))}
         </div>
@@ -1614,7 +1693,12 @@ export default function CrossPoster() {
                       ID: <a href={item.youtube_url} target="_blank" rel="noreferrer" style={{ color: '#38bdf8' }}>{item.youtube_id}</a>
                       {item.fb_post_id && (
                         <span style={{ marginLeft: '10px', color: '#4ade80' }}>
-                          Post ID: {item.fb_post_id}
+                          Meta Video ID: {item.fb_post_id}
+                        </span>
+                      )}
+                      {!item.fb_post_id && item.upload_video_id && (
+                        <span style={{ marginLeft: '10px', color: '#fbbf24' }}>
+                          Upload Video ID: {item.upload_video_id}
                         </span>
                       )}
                     </div>
@@ -1628,11 +1712,16 @@ export default function CrossPoster() {
                     {formatDate(item.youtube_upload_date)}
                   </td>
                   <td style={{ color: '#38bdf8', fontWeight: '500', whiteSpace: 'nowrap' }}>
-                    {formatTimestamp(item.scheduled_publish_time)}
+                    <div>{formatTimestamp(item.scheduled_publish_time)}</div>
+                    {item.meta_scheduled_publish_time > 0 && item.meta_scheduled_publish_time !== item.scheduled_publish_time && (
+                      <div style={{ color: '#fbbf24', fontSize: '0.72rem', marginTop: '3px' }}>
+                        Meta: {formatTimestamp(item.meta_scheduled_publish_time)}
+                      </div>
+                    )}
                   </td>
                   <td>
                     <span className={`badge-status ${item.status}`}>
-                      {item.status === 'published' ? 'Đã đăng thực tế' : item.status === 'meta_scheduled' ? 'Meta đã nhận lịch' : item.status === 'processing' ? 'Meta đang xử lý' : item.status === 'verifying' ? 'Đang xác minh Meta' : item.status === 'scheduled' ? 'Lịch chờ upload' : item.status === 'downloading' ? 'Đang tải MP4' : item.status === 'uploading' ? 'Đang upload Meta' : item.status === 'pending' ? 'Chờ tới lượt' : item.status === 'skipped' ? 'Bỏ qua' : 'Lỗi'}
+                      {STATUS_LABELS[item.status] || 'Lỗi'}
                     </span>
                   </td>
                   <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
@@ -1647,14 +1736,54 @@ export default function CrossPoster() {
                           {isPublishingId === item.id ? '...' : 'Đăng ngay'}
                         </button>
                       )}
-                      {item.status === 'error' && item.fb_post_id && (
+                      {item.status === 'meta_scheduled' && item.fb_post_id && (
+                        <button
+                          className="fb-btn fb-btn-primary fb-btn-sm"
+                          onClick={() => handlePublishNow(item.id)}
+                          disabled={isPublishingId === item.id}
+                          title="Phát hành ngay đúng video đã được Meta nhận lịch"
+                        >
+                          {isPublishingId === item.id ? '...' : 'Đăng ngay'}
+                        </button>
+                      )}
+                      {item.status === 'schedule_mismatch' && (
+                        <button
+                          className="fb-btn fb-btn-success fb-btn-sm"
+                          onClick={() => handleUseMetaSchedule(item.id)}
+                          disabled={isPublishingId === item.id}
+                          title="Dùng lịch thực tế đang có trên Meta"
+                        >
+                          Dùng lịch Meta
+                        </button>
+                      )}
+                      {item.status === 'schedule_mismatch' && item.fb_post_id && (
                         <button
                           className="fb-btn fb-btn-warning fb-btn-sm"
                           onClick={() => handleRepairMeta(item.id)}
                           disabled={isPublishingId === item.id}
-                          title="Sửa hoặc thay thế an toàn video lỗi trên Meta"
+                          title="Đặt lại video theo slot tương lai an toàn"
                         >
-                          {isPublishingId === item.id ? '...' : 'Sửa Meta'}
+                          {isPublishingId === item.id ? '...' : 'Đặt slot mới'}
+                        </button>
+                      )}
+                      {META_FAILURE_STATES.has(item.status) && (item.fb_post_id || item.upload_video_id) && (
+                        <button
+                          className="fb-btn fb-btn-danger fb-btn-sm"
+                          onClick={() => handleCleanupMeta(item.id)}
+                          disabled={isPublishingId === item.id}
+                          title="Xóa Meta Video ID đã xác nhận lỗi và cấp lịch mới"
+                        >
+                          {isPublishingId === item.id ? '...' : 'Dọn lỗi Meta'}
+                        </button>
+                      )}
+                      {['processing', 'retryable', 'stalled', 'meta_failed', 'missing', 'schedule_mismatch', 'error'].includes(item.status) && (item.fb_post_id || item.upload_video_id) && (
+                        <button
+                          className="fb-btn fb-btn-secondary fb-btn-sm"
+                          onClick={() => handleSyncMetaItem(item.id)}
+                          disabled={isPublishingId === item.id}
+                          title="Chỉ đọc lại trạng thái Meta, không sửa hoặc xóa"
+                        >
+                          Đồng bộ
                         </button>
                       )}
                       <button

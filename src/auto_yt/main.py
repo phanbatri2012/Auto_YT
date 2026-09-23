@@ -9247,18 +9247,29 @@ def fix_fb_crossposter_schedule_collisions(page_id: str = Query(default="")):
 def reconcile_fb_crossposter_meta(
     page_id: str = Query(default=""),
     limit: int = Query(default=100, ge=1, le=500),
+    dry_run: bool = Query(default=False),
 ):
     """Refresh queue truth from Meta for one Fanpage or all campaigns."""
-    result = fb_crossposter_service.reconcile_fb_queue(page_id, limit=limit)
+    result = fb_crossposter_service.reconcile_fb_queue(
+        page_id,
+        limit=limit,
+        dry_run=dry_run,
+    )
     result["stats"] = db.get_fb_crossposter_stats(page_id)
     return result
 
 
 @app.post("/api/fb-crossposter/queue/{item_id}/publish-now")
 def publish_fb_crossposter_item_now(item_id: int):
-    """Trigger immediate JIT download, preparation, and Facebook publishing for one item."""
+    """Publish an existing Meta video or upload a new queue item immediately."""
     try:
-        result = fb_crossposter_service.process_queue_item_jit(item_id, publish_now=True)
+        item = db.get_fb_crossposter_queue_item(item_id)
+        if not item:
+            raise ValueError(f"Không tìm thấy video ID #{item_id} trong hàng đợi")
+        if str(item.get("fb_post_id") or "").strip():
+            result = fb_crossposter_service.publish_existing_meta_video_now(item_id)
+        else:
+            result = fb_crossposter_service.process_queue_item_jit(item_id, publish_now=True)
         item = db.get_fb_crossposter_queue_item(item_id)
         target_page_id = (item and item.get("target_page_id")) or ""
         stats = db.get_fb_crossposter_stats(target_page_id)
@@ -9268,11 +9279,65 @@ def publish_fb_crossposter_item_now(item_id: int):
             "stats": stats,
             "message": (
                 f"Meta đã tiếp nhận video với trạng thái {result.get('status')} "
-                f"(Post ID: {result.get('fb_post_id')})"
+                f"(Meta Video ID: {result.get('fb_post_id') or result.get('video_id')})"
             ),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/fb-crossposter/queue/{item_id}/sync-meta")
+def sync_fb_crossposter_item_meta(item_id: int):
+    """Read and persist the current Meta state for one queue item."""
+    try:
+        result = fb_crossposter_service.reconcile_fb_queue_item(item_id)
+        item = db.get_fb_crossposter_queue_item(item_id)
+        target_page_id = (item and item.get("target_page_id")) or ""
+        return {
+            "success": True,
+            "result": result,
+            "item": item,
+            "stats": db.get_fb_crossposter_stats(target_page_id),
+            "message": f"Đã đồng bộ trạng thái Meta: {result.get('status')}",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/fb-crossposter/queue/{item_id}/use-meta-schedule")
+def use_fb_crossposter_meta_schedule(item_id: int):
+    """Accept a verified future schedule already stored by Meta."""
+    try:
+        result = fb_crossposter_service.adopt_meta_schedule(item_id)
+        item = db.get_fb_crossposter_queue_item(item_id)
+        target_page_id = (item and item.get("target_page_id")) or ""
+        return {
+            "success": True,
+            "result": result,
+            "item": item,
+            "stats": db.get_fb_crossposter_stats(target_page_id),
+            "message": "Đã dùng lịch thực tế đang có trên Meta",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/fb-crossposter/queue/{item_id}/cleanup-meta")
+def cleanup_fb_crossposter_meta(item_id: int):
+    """Delete a confirmed failed Meta object and reserve a safe future slot."""
+    try:
+        result = fb_crossposter_service.cleanup_failed_meta_video_and_reschedule(item_id)
+        item = db.get_fb_crossposter_queue_item(item_id)
+        target_page_id = (item and item.get("target_page_id")) or ""
+        return {
+            "success": True,
+            "result": result,
+            "item": item,
+            "stats": db.get_fb_crossposter_stats(target_page_id),
+            "message": "Đã xóa đối tượng Meta lỗi và cấp lịch tương lai mới",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/fb-crossposter/queue/{item_id}/repair-meta")

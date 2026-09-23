@@ -839,6 +839,17 @@ def init_db():
             meta_scheduled_publish_time INTEGER DEFAULT 0,
             meta_status_json TEXT DEFAULT '{}',
             meta_verified_at TEXT DEFAULT '',
+            meta_state TEXT DEFAULT '',
+            meta_state_since TEXT DEFAULT '',
+            meta_error_message TEXT DEFAULT '',
+            upload_session_id TEXT DEFAULT '',
+            upload_video_id TEXT DEFAULT '',
+            upload_phase TEXT DEFAULT '',
+            upload_retry_count INTEGER DEFAULT 0,
+            upload_next_retry_at TEXT DEFAULT '',
+            previous_fb_post_id TEXT DEFAULT '',
+            cleanup_status TEXT DEFAULT '',
+            repair_history_json TEXT DEFAULT '[]',
             created_at TEXT DEFAULT '',
             updated_at TEXT DEFAULT '',
             UNIQUE(youtube_id, target_page_id)
@@ -1066,6 +1077,17 @@ def _migrate_fb_crossposter_queue_composite_unique(conn: sqlite3.Connection) -> 
                 meta_scheduled_publish_time INTEGER DEFAULT 0,
                 meta_status_json TEXT DEFAULT '{}',
                 meta_verified_at TEXT DEFAULT '',
+                meta_state TEXT DEFAULT '',
+                meta_state_since TEXT DEFAULT '',
+                meta_error_message TEXT DEFAULT '',
+                upload_session_id TEXT DEFAULT '',
+                upload_video_id TEXT DEFAULT '',
+                upload_phase TEXT DEFAULT '',
+                upload_retry_count INTEGER DEFAULT 0,
+                upload_next_retry_at TEXT DEFAULT '',
+                previous_fb_post_id TEXT DEFAULT '',
+                cleanup_status TEXT DEFAULT '',
+                repair_history_json TEXT DEFAULT '[]',
                 created_at TEXT DEFAULT '',
                 updated_at TEXT DEFAULT '',
                 UNIQUE(youtube_id, target_page_id)
@@ -1103,6 +1125,17 @@ def _migrate_fb_crossposter_meta_state(conn: sqlite3.Connection) -> None:
         "meta_scheduled_publish_time INTEGER DEFAULT 0",
         "meta_status_json TEXT DEFAULT '{}'",
         "meta_verified_at TEXT DEFAULT ''",
+        "meta_state TEXT DEFAULT ''",
+        "meta_state_since TEXT DEFAULT ''",
+        "meta_error_message TEXT DEFAULT ''",
+        "upload_session_id TEXT DEFAULT ''",
+        "upload_video_id TEXT DEFAULT ''",
+        "upload_phase TEXT DEFAULT ''",
+        "upload_retry_count INTEGER DEFAULT 0",
+        "upload_next_retry_at TEXT DEFAULT ''",
+        "previous_fb_post_id TEXT DEFAULT ''",
+        "cleanup_status TEXT DEFAULT ''",
+        "repair_history_json TEXT DEFAULT '[]'",
     ):
         try:
             c.execute(f"ALTER TABLE fb_crossposter_queue ADD COLUMN {column_definition}")
@@ -1114,7 +1147,11 @@ def _migrate_fb_crossposter_meta_state(conn: sqlite3.Connection) -> None:
         "downloading",
         "uploading",
         "verifying",
+        "processing",
+        "retryable",
         "meta_scheduled",
+        "schedule_mismatch",
+        "stalled",
     )
     placeholders = ",".join("?" for _ in active_statuses)
     duplicate_groups = c.execute(
@@ -1161,12 +1198,16 @@ def _migrate_fb_crossposter_meta_state(conn: sqlite3.Connection) -> None:
                     (item_id,),
                 )
 
+    c.execute("DROP INDEX IF EXISTS idx_fb_queue_unique_active_slot")
     c.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_fb_queue_unique_active_slot
         ON fb_crossposter_queue(COALESCE(target_page_id, ''), scheduled_publish_time)
         WHERE scheduled_publish_time > 0
-          AND status IN ('scheduled', 'downloading', 'uploading', 'verifying', 'meta_scheduled')
+          AND status IN (
+              'scheduled', 'downloading', 'uploading', 'verifying', 'processing',
+              'retryable', 'meta_scheduled', 'schedule_mismatch', 'stalled'
+          )
         """
     )
 
@@ -4189,6 +4230,10 @@ def update_fb_crossposter_queue_item(item_id: int, fields: dict) -> bool:
             "original_title", "original_description", "original_tags_json", "thumbnail_url",
             "fb_description_source", "meta_published", "meta_video_status",
             "meta_scheduled_publish_time", "meta_status_json", "meta_verified_at",
+            "meta_state", "meta_state_since", "meta_error_message",
+            "upload_session_id", "upload_video_id", "upload_phase",
+            "upload_retry_count", "upload_next_retry_at", "previous_fb_post_id",
+            "cleanup_status", "repair_history_json",
         }
         updates = []
         values = []
@@ -4213,6 +4258,206 @@ def update_fb_crossposter_queue_item(item_id: int, fields: dict) -> bool:
         except sqlite3.IntegrityError as exc:
             conn.rollback()
             raise ValueError("Thời điểm đăng này đã được một video khác giữ trên cùng Fanpage") from exc
+    finally:
+        conn.close()
+
+
+def append_fb_recovery_history(item_id: int, event: str, details: dict | None = None) -> None:
+    """Append a bounded, non-secret recovery audit event to one queue item."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT repair_history_json FROM fb_crossposter_queue WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Không tìm thấy video ID #{item_id} trong hàng đợi")
+        try:
+            history = json.loads(row[0] or "[]")
+        except (TypeError, ValueError):
+            history = []
+        if not isinstance(history, list):
+            history = []
+        history.append({
+            "event": str(event or "unknown"),
+            "at": utc_now(),
+            "details": details or {},
+        })
+        conn.execute(
+            "UPDATE fb_crossposter_queue SET repair_history_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(history[-50:], ensure_ascii=False), datetime.datetime.now().isoformat(), item_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reserve_next_fb_queue_slot(
+    item_id: int,
+    *,
+    minimum_lead_minutes: int = 30,
+    clear_meta_object: bool = False,
+) -> int:
+    """Atomically reserve the next configured free slot for an item on its Fanpage."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        item = conn.execute(
+            "SELECT * FROM fb_crossposter_queue WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if item is None:
+            raise ValueError(f"Không tìm thấy video ID #{item_id} trong hàng đợi")
+        page_id = str(item["target_page_id"] or "").strip()
+        settings = conn.execute(
+            "SELECT * FROM fb_crossposter_settings WHERE target_fb_page_id = ? ORDER BY id LIMIT 1",
+            (page_id,),
+        ).fetchone()
+        try:
+            configured_times = json.loads(
+                (settings["schedule_times_json"] if settings else "") or '["11:30", "19:30"]'
+            )
+        except (TypeError, ValueError):
+            configured_times = ["11:30", "19:30"]
+        valid_times: list[datetime.time] = []
+        for value in configured_times if isinstance(configured_times, list) else []:
+            try:
+                hour, minute = (int(part) for part in str(value).split(":", 1))
+                valid_times.append(datetime.time(hour=hour, minute=minute))
+            except (TypeError, ValueError):
+                continue
+        if not valid_times:
+            raise ValueError("Fanpage chưa có khung giờ đăng hợp lệ")
+        valid_times.sort()
+        daily_quota = max(1, int((settings["daily_quota"] if settings else 0) or len(valid_times)))
+        valid_times = valid_times[:daily_quota]
+        configured_lead = int((settings["lead_time_minutes"] if settings else 0) or 0)
+        lead_minutes = max(30, int(minimum_lead_minutes), configured_lead)
+        now = datetime.datetime.now()
+        earliest_ts = int((now + datetime.timedelta(minutes=lead_minutes)).timestamp())
+
+        occupied_rows = conn.execute(
+            """
+            SELECT scheduled_publish_time, meta_scheduled_publish_time
+            FROM fb_crossposter_queue
+            WHERE id != ? AND COALESCE(target_page_id, '') = ?
+              AND (
+                    status IN (
+                        'scheduled', 'downloading', 'uploading', 'verifying', 'processing',
+                        'retryable', 'meta_scheduled', 'schedule_mismatch', 'stalled'
+                    )
+                    OR COALESCE(fb_post_id, '') != ''
+                  )
+            """,
+            (item_id, page_id),
+        ).fetchall()
+        occupied = {
+            int(value)
+            for row in occupied_rows
+            for value in (row["scheduled_publish_time"], row["meta_scheduled_publish_time"])
+            if int(value or 0) > 0
+        }
+
+        reserved_ts = 0
+        for day_offset in range(367):
+            target_date = now.date() + datetime.timedelta(days=day_offset)
+            for slot_time in valid_times:
+                candidate_ts = int(datetime.datetime.combine(target_date, slot_time).timestamp())
+                if candidate_ts <= earliest_ts:
+                    continue
+                if any(abs(candidate_ts - occupied_ts) < 900 for occupied_ts in occupied):
+                    continue
+                reserved_ts = candidate_ts
+                break
+            if reserved_ts:
+                break
+        if not reserved_ts:
+            raise RuntimeError("Không tìm được slot Facebook trống trong 366 ngày tới")
+
+        previous_video_id = str(item["fb_post_id"] or "")
+        assignments = [
+            "scheduled_publish_time = ?",
+            "status = 'scheduled'",
+            "error_message = ''",
+            "updated_at = ?",
+        ]
+        values: list[object] = [reserved_ts, datetime.datetime.now().isoformat()]
+        if clear_meta_object:
+            assignments.extend([
+                "previous_fb_post_id = ?",
+                "fb_post_id = ''",
+                "meta_published = NULL",
+                "meta_video_status = ''",
+                "meta_scheduled_publish_time = 0",
+                "meta_status_json = '{}'",
+                "meta_verified_at = ''",
+                "meta_state = ''",
+                "meta_state_since = ''",
+                "meta_error_message = ''",
+                "cleanup_status = 'deleted'",
+                "upload_session_id = ''",
+                "upload_video_id = ''",
+                "upload_phase = ''",
+                "upload_retry_count = 0",
+                "upload_next_retry_at = ''",
+            ])
+            values.append(previous_video_id)
+        values.append(item_id)
+        conn.execute(
+            f"UPDATE fb_crossposter_queue SET {', '.join(assignments)} WHERE id = ?",
+            values,
+        )
+        conn.commit()
+        return reserved_ts
+    except sqlite3.IntegrityError as exc:
+        if conn.in_transaction:
+            conn.rollback()
+        raise ValueError("Slot vừa được video khác giữ; vui lòng thử lại") from exc
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def adopt_fb_meta_schedule(item_id: int) -> int:
+    """Make the verified Meta schedule authoritative for one queue item."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT meta_scheduled_publish_time FROM fb_crossposter_queue WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Không tìm thấy video ID #{item_id} trong hàng đợi")
+        meta_schedule = int(row["meta_scheduled_publish_time"] or 0)
+        if meta_schedule <= int(datetime.datetime.now().timestamp()):
+            raise ValueError("Meta không có lịch tương lai hợp lệ để đồng bộ")
+        conn.execute(
+            """
+            UPDATE fb_crossposter_queue
+            SET scheduled_publish_time = ?, status = 'meta_scheduled',
+                meta_state = 'meta_scheduled', meta_error_message = '', error_message = '',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (meta_schedule, datetime.datetime.now().isoformat(), item_id),
+        )
+        conn.commit()
+        return meta_schedule
+    except sqlite3.IntegrityError as exc:
+        if conn.in_transaction:
+            conn.rollback()
+        raise ValueError("Lịch Meta đang trùng slot được video khác giữ") from exc
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -4386,6 +4631,11 @@ def get_fb_crossposter_stats(target_page_id: str = "") -> dict:
             "verifying": 0,
             "meta_scheduled": 0,
             "processing": 0,
+            "retryable": 0,
+            "schedule_mismatch": 0,
+            "stalled": 0,
+            "meta_failed": 0,
+            "missing": 0,
             "published": 0,
             "skipped": 0,
             "error": 0
@@ -5219,9 +5469,12 @@ def get_fb_items_for_meta_reconciliation(
     try:
         now_ts = int(datetime.datetime.now().timestamp())
         where_sql = """
-            WHERE COALESCE(fb_post_id, '') != ''
+            WHERE (COALESCE(fb_post_id, '') != '' OR COALESCE(upload_video_id, '') != '')
               AND (
-                    status IN ('verifying', 'processing', 'meta_scheduled')
+                    status IN (
+                        'verifying', 'processing', 'retryable', 'meta_scheduled',
+                        'schedule_mismatch', 'stalled', 'meta_failed', 'error'
+                    )
                     OR (
                         status = 'published'
                         AND (

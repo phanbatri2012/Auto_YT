@@ -405,7 +405,8 @@
 }
 
 .badge-status.processing,
-.badge-status.verifying {
+.badge-status.verifying,
+.badge-status.retryable {
   background: rgba(245, 158, 11, 0.15);
   color: #fbbf24;
   border: 1px solid rgba(245, 158, 11, 0.35);
@@ -439,6 +440,20 @@
 }
 
 .badge-status.error {
+  background: rgba(248, 113, 113, 0.15);
+  color: #f87171;
+  border: 1px solid rgba(248, 113, 113, 0.3);
+}
+
+.badge-status.schedule_mismatch {
+  background: rgba(249, 115, 22, 0.15);
+  color: #fb923c;
+  border: 1px solid rgba(249, 115, 22, 0.35);
+}
+
+.badge-status.meta_failed,
+.badge-status.stalled,
+.badge-status.missing {
   background: rgba(248, 113, 113, 0.15);
   color: #f87171;
   border: 1px solid rgba(248, 113, 113, 0.3);

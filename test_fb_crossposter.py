@@ -959,7 +959,10 @@ class FBCrossPosterUnitTests(unittest.TestCase):
             "fb_description": "",
             "fb_description_source": "auto",
             "fb_post_id": "old_video",
-            "status": "published",
+            "status": "meta_failed",
+            "scheduled_publish_time": int(
+                (datetime.datetime.now() - datetime.timedelta(hours=1)).timestamp()
+            ),
         }
         settings = {
             "target_access_token": "token",
@@ -979,11 +982,30 @@ class FBCrossPosterUnitTests(unittest.TestCase):
             return True
 
         with (
-            patch.object(db, "get_fb_crossposter_queue_item", side_effect=[dict(item), dict(item)]),
+            patch.object(
+                db,
+                "get_fb_crossposter_queue_item",
+                side_effect=[dict(item), dict(item), dict(item), dict(item)],
+            ),
             patch.object(db, "get_fb_crossposter_runtime_settings", return_value=settings),
             patch.object(db, "update_fb_crossposter_queue_item"),
+            patch.object(
+                db,
+                "reserve_next_fb_queue_slot",
+                return_value=int((datetime.datetime.now() + datetime.timedelta(days=1)).timestamp()),
+            ),
+            patch.object(db, "append_fb_recovery_history"),
             patch.object(fb_crossposter_service, "_fetch_source_metadata", return_value=source_info),
             patch.object(fb_crossposter_service, "download_thumbnail", side_effect=save_thumb),
+            patch.object(
+                fb_crossposter_service,
+                "get_facebook_video_metadata",
+                return_value={
+                    "id": "old_video",
+                    "published": False,
+                    "status": {"video_status": "error"},
+                },
+            ),
             patch.object(
                 fb_crossposter_service,
                 "resolve_content_tag_ids",
@@ -998,13 +1020,112 @@ class FBCrossPosterUnitTests(unittest.TestCase):
                 fb_crossposter_service,
                 "process_queue_item_jit",
                 side_effect=RuntimeError("replacement failed"),
-            ),
+            ) as process_item,
             patch.object(fb_crossposter_service, "delete_facebook_video") as delete_video,
         ):
             with self.assertRaisesRegex(RuntimeError, "replacement failed"):
                 fb_crossposter_service.repair_fb_queue_item(88)
 
         delete_video.assert_not_called()
+        self.assertFalse(process_item.call_args.kwargs["publish_now"])
+
+    def test_verified_replacement_is_kept_when_old_video_cleanup_fails(self):
+        future_schedule = int((datetime.datetime.now() + datetime.timedelta(days=1)).timestamp())
+        item = {
+            "id": 89,
+            "target_page_id": "page",
+            "youtube_id": "yt89",
+            "youtube_url": "https://youtube.com/watch?v=yt89",
+            "original_title": "Title",
+            "original_description": "Description",
+            "original_tags": [],
+            "fb_title": "Title",
+            "fb_description": "Caption",
+            "fb_description_source": "manual",
+            "fb_post_id": "old_video",
+            "status": "schedule_mismatch",
+            "scheduled_publish_time": future_schedule,
+        }
+        settings = {
+            "target_access_token": "token",
+            "source_gpm_profile_id": "source",
+            "target_gpm_profile_id": "target",
+            "post_template": "{title}",
+            "default_tags": [],
+        }
+
+        def save_thumb(_url, output_path, source_gpm_profile_id=""):
+            output_path.write_bytes(b"thumbnail")
+            return True
+
+        with (
+            patch.object(db, "get_fb_crossposter_queue_item", return_value=dict(item)),
+            patch.object(db, "get_fb_crossposter_runtime_settings", return_value=settings),
+            patch.object(db, "update_fb_crossposter_queue_item") as update_item,
+            patch.object(db, "append_fb_recovery_history"),
+            patch.object(
+                fb_crossposter_service,
+                "_fetch_source_metadata",
+                return_value={
+                    "title": "Title",
+                    "description": "Description",
+                    "tags": [],
+                    "thumbnail": "https://i.ytimg.com/yt89.jpg",
+                },
+            ),
+            patch.object(fb_crossposter_service, "download_thumbnail", side_effect=save_thumb),
+            patch.object(fb_crossposter_service, "_caption_is_automatic", return_value=False),
+            patch.object(fb_crossposter_service, "resolve_content_tag_ids", return_value=([], [])),
+            patch.object(
+                fb_crossposter_service,
+                "get_facebook_video_metadata",
+                side_effect=[
+                    {
+                        "id": "old_video",
+                        "published": True,
+                        "status": {
+                            "video_status": "uploading",
+                            "uploading_phase": {"status": "in_progress"},
+                        },
+                    },
+                    {
+                        "id": "new_video",
+                        "description": "Caption",
+                        "content_tags": {"data": []},
+                        "thumbnails": {"data": [{"id": "thumb", "is_preferred": True}]},
+                    },
+                ],
+            ),
+            patch.object(
+                fb_crossposter_service,
+                "update_facebook_video_metadata",
+                side_effect=RuntimeError("update rejected"),
+            ),
+            patch.object(
+                fb_crossposter_service,
+                "process_queue_item_jit",
+                return_value={"status": "meta_scheduled", "fb_post_id": "new_video"},
+            ),
+            patch.object(
+                fb_crossposter_service,
+                "delete_facebook_video",
+                side_effect=RuntimeError("delete temporarily failed"),
+            ) as delete_video,
+        ):
+            result = fb_crossposter_service.repair_fb_queue_item(89)
+
+        self.assertEqual(result["video_id"], "new_video")
+        self.assertEqual(result["cleanup_status"], "old_delete_failed")
+        delete_video.assert_called_once_with(
+            "old_video",
+            "token",
+            target_gpm_profile_id="target",
+        )
+        cleanup_updates = [
+            call.args[1] for call in update_item.call_args_list
+            if call.args[1].get("cleanup_status") == "old_delete_failed"
+        ]
+        self.assertEqual(len(cleanup_updates), 1)
 
     def test_sanitize_description_removes_disclaimer_and_channel_intro(self):
         sample_desc = """
@@ -1265,18 +1386,18 @@ Câu chuyện về vị tướng quả cảm.
         scheduled_time = int(
             (datetime.datetime.now() + datetime.timedelta(days=2)).timestamp()
         )
-        with self.assertRaisesRegex(RuntimeError, "published=true"):
-            fb_crossposter_service.classify_facebook_publication(
-                {
-                    "id": "video_2",
-                    "published": True,
-                    "status": {
-                        "video_status": "uploading",
-                        "uploading_phase": {"status": "in_progress"},
-                    },
+        status, _fields = fb_crossposter_service.classify_facebook_publication(
+            {
+                "id": "video_2",
+                "published": True,
+                "status": {
+                    "video_status": "uploading",
+                    "uploading_phase": {"status": "in_progress"},
                 },
-                scheduled_time,
-            )
+            },
+            scheduled_time,
+        )
+        self.assertEqual(status, "processing")
 
     def test_past_meta_schedule_not_published_is_an_error(self):
         scheduled_time = int(
@@ -1319,6 +1440,119 @@ Câu chuyện về vị tướng quả cảm.
                 items[1]["id"],
                 {"status": "scheduled", "scheduled_publish_time": scheduled_time},
             )
+
+    def test_reserve_next_repair_slot_is_future_and_collision_safe(self):
+        db.save_fb_crossposter_settings(
+            {
+                "target_fb_page_id": "page_repair",
+                "daily_quota": 1,
+                "schedule_times": ["23:59"],
+                "lead_time_minutes": 30,
+            },
+            page_id="page_repair",
+        )
+        db.upsert_fb_crossposter_queue_items(
+            [
+                {"youtube_id": "repair_slot_1", "original_title": "Repair 1"},
+                {"youtube_id": "repair_slot_2", "original_title": "Repair 2"},
+            ],
+            target_page_id="page_repair",
+        )
+        items = db.get_fb_crossposter_queue(
+            target_page_id="page_repair",
+            page_size=10,
+        )["items"]
+
+        first_slot = db.reserve_next_fb_queue_slot(items[0]["id"])
+        second_slot = db.reserve_next_fb_queue_slot(items[1]["id"])
+
+        self.assertGreater(first_slot, int(datetime.datetime.now().timestamp()) + 29 * 60)
+        self.assertGreater(second_slot, first_slot)
+        self.assertNotEqual(first_slot, second_slot)
+
+    def test_inspect_meta_schedule_mismatch_is_actionable_state(self):
+        requested = int((datetime.datetime.now() + datetime.timedelta(days=1)).timestamp())
+        actual = requested + 3600
+        status, fields, message = fb_crossposter_service.inspect_facebook_publication(
+            {
+                "id": "video_mismatch",
+                "published": False,
+                "scheduled_publish_time": actual,
+                "status": {
+                    "video_status": "ready",
+                    "uploading_phase": {"status": "complete"},
+                    "publishing_phase": {"status": "complete"},
+                },
+            },
+            requested,
+        )
+
+        self.assertEqual(status, "schedule_mismatch")
+        self.assertEqual(fields["meta_scheduled_publish_time"], actual)
+        self.assertIn("sai lịch", message)
+
+    def test_cleanup_rejects_valid_meta_schedule(self):
+        item = {
+            "id": 91,
+            "target_page_id": "page",
+            "fb_post_id": "valid_video",
+        }
+        with (
+            patch.object(db, "get_fb_crossposter_queue_item", return_value=item),
+            patch.object(
+                fb_crossposter_service,
+                "reconcile_fb_queue_item",
+                return_value={
+                    "status": "meta_scheduled",
+                    "fb_post_id": "valid_video",
+                },
+            ),
+            patch.object(fb_crossposter_service, "delete_facebook_video") as delete_video,
+        ):
+            with self.assertRaisesRegex(ValueError, "Không được xóa"):
+                fb_crossposter_service.cleanup_failed_meta_video_and_reschedule(91)
+
+        delete_video.assert_not_called()
+
+    def test_publish_existing_meta_video_does_not_upload_duplicate(self):
+        item = {
+            "id": 92,
+            "target_page_id": "page",
+            "fb_post_id": "scheduled_video",
+        }
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"success": true}'
+        response.__exit__.return_value = False
+        opener = MagicMock()
+        opener.open.return_value = response
+        with (
+            patch.object(db, "get_fb_crossposter_queue_item", return_value=item),
+            patch.object(
+                db,
+                "get_fb_crossposter_runtime_settings",
+                return_value={"target_access_token": "token", "target_gpm_profile_id": "profile"},
+            ),
+            patch.object(db, "update_fb_crossposter_queue_item") as update_item,
+            patch.object(db, "append_fb_recovery_history"),
+            patch.object(
+                fb_crossposter_service,
+                "reconcile_fb_queue_item",
+                return_value={"status": "meta_scheduled", "fb_post_id": "scheduled_video"},
+            ),
+            patch.object(fb_crossposter_service, "_get_proxy_for_gpm_profile", return_value=None),
+            patch.object(fb_crossposter_service, "_build_urllib_opener", return_value=opener),
+            patch.object(
+                fb_crossposter_service,
+                "verify_facebook_publication",
+                return_value=("published", {"meta_published": 1}),
+            ),
+            patch.object(fb_crossposter_service, "upload_video_to_facebook") as upload_video,
+        ):
+            result = fb_crossposter_service.publish_existing_meta_video_now(92)
+
+        self.assertEqual(result["status"], "published")
+        upload_video.assert_not_called()
+        self.assertEqual(update_item.call_args.args[1]["scheduled_publish_time"], 0)
 
 
 if __name__ == "__main__":

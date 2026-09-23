@@ -398,6 +398,20 @@
   border: 1px solid rgba(56, 189, 248, 0.3);
 }
 
+.badge-status.meta_scheduled {
+  background: rgba(14, 165, 233, 0.15);
+  color: #7dd3fc;
+  border: 1px solid rgba(14, 165, 233, 0.35);
+}
+
+.badge-status.processing,
+.badge-status.verifying {
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  animation: pulse 1.5s infinite;
+}
+
 .badge-status.downloading {
   background: rgba(168, 85, 247, 0.15);
   color: #c084fc;
@@ -658,4 +672,3 @@
   font-weight: 600;
   margin-left: 8px;
 }
-

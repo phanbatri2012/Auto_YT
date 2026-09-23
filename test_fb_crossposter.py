@@ -706,7 +706,9 @@ class FBCrossPosterUnitTests(unittest.TestCase):
             "fb_title": "Tiêu đề",
             "fb_description": "Caption cũ",
             "fb_description_source": "auto",
-            "scheduled_publish_time": 0,
+            "scheduled_publish_time": int(
+                (datetime.datetime.now() + datetime.timedelta(days=1)).timestamp()
+            ),
         }
         settings = {
             "target_fb_page_id": "page",
@@ -777,6 +779,20 @@ class FBCrossPosterUnitTests(unittest.TestCase):
                     "upload_video_to_facebook",
                     return_value={"id": "fb77"},
                 ) as upload_video,
+                patch.object(
+                    fb_crossposter_service,
+                    "verify_facebook_publication",
+                    return_value=(
+                        "meta_scheduled",
+                        {
+                            "meta_published": 0,
+                            "meta_video_status": "ready",
+                            "meta_scheduled_publish_time": item["scheduled_publish_time"],
+                            "meta_status_json": "{}",
+                            "meta_verified_at": "now",
+                        },
+                    ),
+                ),
             ):
                 result = fb_crossposter_service.process_queue_item_jit(
                     77,
@@ -784,6 +800,7 @@ class FBCrossPosterUnitTests(unittest.TestCase):
                 )
 
         self.assertEqual(result["fb_post_id"], "fb77")
+        self.assertEqual(result["status"], "meta_scheduled")
         upload_kwargs = upload_video.call_args.kwargs
         self.assertTrue(upload_kwargs["video_path"].name.endswith("_vertical.mp4"))
         self.assertEqual(upload_kwargs["content_tag_ids"], ["101"])
@@ -865,6 +882,7 @@ class FBCrossPosterUnitTests(unittest.TestCase):
                     fb_crossposter_service.process_queue_item_jit(
                         78,
                         parent_task_id="batch",
+                        publish_now=True,
                     )
 
             upload_video.assert_not_called()
@@ -1075,6 +1093,15 @@ Câu chuyện về vị tướng quả cảm.
         with (
             patch.object(db, "get_fb_crossposter_queue_item", return_value=item),
             patch.object(db, "get_fb_crossposter_runtime_settings", return_value=settings),
+            patch.object(
+                fb_crossposter_service,
+                "reconcile_fb_queue_item",
+                return_value={
+                    "item_id": 99,
+                    "fb_post_id": "1641229374062033",
+                    "status": "published",
+                },
+            ),
             patch.object(fb_crossposter_service, "upload_video_to_facebook") as upload_mock,
         ):
             res = fb_crossposter_service.process_queue_item_jit(99)
@@ -1214,6 +1241,84 @@ Câu chuyện về vị tướng quả cảm.
 
         self.assertEqual(res.get("id"), "vid_123")
         self.assertEqual(mock_build_opener.return_value.open.call_count, 5)
+
+    def test_meta_schedule_requires_matching_remote_schedule(self):
+        scheduled_time = int(
+            (datetime.datetime.now() + datetime.timedelta(days=2)).timestamp()
+        )
+        status, fields = fb_crossposter_service.classify_facebook_publication(
+            {
+                "id": "video_1",
+                "published": False,
+                "scheduled_publish_time": scheduled_time,
+                "status": {
+                    "video_status": "ready",
+                    "uploading_phase": {"status": "complete"},
+                },
+            },
+            scheduled_time,
+        )
+        self.assertEqual(status, "meta_scheduled")
+        self.assertEqual(fields["meta_scheduled_publish_time"], scheduled_time)
+
+    def test_meta_object_still_uploading_is_not_a_scheduled_success(self):
+        scheduled_time = int(
+            (datetime.datetime.now() + datetime.timedelta(days=2)).timestamp()
+        )
+        with self.assertRaisesRegex(RuntimeError, "published=true"):
+            fb_crossposter_service.classify_facebook_publication(
+                {
+                    "id": "video_2",
+                    "published": True,
+                    "status": {
+                        "video_status": "uploading",
+                        "uploading_phase": {"status": "in_progress"},
+                    },
+                },
+                scheduled_time,
+            )
+
+    def test_past_meta_schedule_not_published_is_an_error(self):
+        scheduled_time = int(
+            (datetime.datetime.now() - datetime.timedelta(hours=1)).timestamp()
+        )
+        with self.assertRaisesRegex(RuntimeError, "đã qua"):
+            fb_crossposter_service.classify_facebook_publication(
+                {
+                    "id": "video_past",
+                    "published": False,
+                    "scheduled_publish_time": scheduled_time,
+                    "status": {
+                        "uploading_phase": {"status": "complete"},
+                        "processing_phase": {"status": "complete"},
+                    },
+                },
+                scheduled_time,
+            )
+
+    def test_active_schedule_slot_is_unique_per_fanpage(self):
+        db.upsert_fb_crossposter_queue_items(
+            [
+                {"youtube_id": "slot_1", "original_title": "Slot 1"},
+                {"youtube_id": "slot_2", "original_title": "Slot 2"},
+            ],
+            target_page_id="page_unique",
+        )
+        items = db.get_fb_crossposter_queue(
+            target_page_id="page_unique", page_size=10
+        )["items"]
+        scheduled_time = int(
+            (datetime.datetime.now() + datetime.timedelta(days=3)).timestamp()
+        )
+        db.update_fb_crossposter_queue_item(
+            items[0]["id"],
+            {"status": "scheduled", "scheduled_publish_time": scheduled_time},
+        )
+        with self.assertRaisesRegex(ValueError, "đã được một video khác giữ"):
+            db.update_fb_crossposter_queue_item(
+                items[1]["id"],
+                {"status": "scheduled", "scheduled_publish_time": scheduled_time},
+            )
 
 
 if __name__ == "__main__":

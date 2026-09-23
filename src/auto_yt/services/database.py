@@ -834,6 +834,11 @@ def init_db():
             error_message TEXT DEFAULT '',
             sort_order INTEGER DEFAULT 0,
             file_size_bytes INTEGER DEFAULT 0,
+            meta_published INTEGER,
+            meta_video_status TEXT DEFAULT '',
+            meta_scheduled_publish_time INTEGER DEFAULT 0,
+            meta_status_json TEXT DEFAULT '{}',
+            meta_verified_at TEXT DEFAULT '',
             created_at TEXT DEFAULT '',
             updated_at TEXT DEFAULT '',
             UNIQUE(youtube_id, target_page_id)
@@ -1026,6 +1031,7 @@ def init_db():
     """)
 
     _migrate_fb_crossposter_queue_composite_unique(conn)
+    _migrate_fb_crossposter_meta_state(conn)
     _remove_orphan_video_dependencies(conn)
     conn.commit()
     conn.close()
@@ -1055,6 +1061,11 @@ def _migrate_fb_crossposter_queue_composite_unique(conn: sqlite3.Connection) -> 
                 error_message TEXT DEFAULT '',
                 sort_order INTEGER DEFAULT 0,
                 file_size_bytes INTEGER DEFAULT 0,
+                meta_published INTEGER,
+                meta_video_status TEXT DEFAULT '',
+                meta_scheduled_publish_time INTEGER DEFAULT 0,
+                meta_status_json TEXT DEFAULT '{}',
+                meta_verified_at TEXT DEFAULT '',
                 created_at TEXT DEFAULT '',
                 updated_at TEXT DEFAULT '',
                 UNIQUE(youtube_id, target_page_id)
@@ -1081,6 +1092,83 @@ def _migrate_fb_crossposter_queue_composite_unique(conn: sqlite3.Connection) -> 
         c.execute("CREATE INDEX IF NOT EXISTS idx_fb_crossposter_queue_status ON fb_crossposter_queue(status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_fb_crossposter_queue_sort ON fb_crossposter_queue(sort_order)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_fb_queue_page_status ON fb_crossposter_queue(target_page_id, status, scheduled_publish_time)")
+
+
+def _migrate_fb_crossposter_meta_state(conn: sqlite3.Connection) -> None:
+    """Add Meta verification fields and enforce one active slot per Fanpage."""
+    c = conn.cursor()
+    for column_definition in (
+        "meta_published INTEGER",
+        "meta_video_status TEXT DEFAULT ''",
+        "meta_scheduled_publish_time INTEGER DEFAULT 0",
+        "meta_status_json TEXT DEFAULT '{}'",
+        "meta_verified_at TEXT DEFAULT ''",
+    ):
+        try:
+            c.execute(f"ALTER TABLE fb_crossposter_queue ADD COLUMN {column_definition}")
+        except sqlite3.OperationalError:
+            pass
+
+    active_statuses = (
+        "scheduled",
+        "downloading",
+        "uploading",
+        "verifying",
+        "meta_scheduled",
+    )
+    placeholders = ",".join("?" for _ in active_statuses)
+    duplicate_groups = c.execute(
+        f"""
+        SELECT COALESCE(target_page_id, '') AS page_id, scheduled_publish_time
+        FROM fb_crossposter_queue
+        WHERE scheduled_publish_time > 0 AND status IN ({placeholders})
+        GROUP BY COALESCE(target_page_id, ''), scheduled_publish_time
+        HAVING COUNT(*) > 1
+        """,
+        active_statuses,
+    ).fetchall()
+    for page_id, scheduled_time in duplicate_groups:
+        duplicate_rows = c.execute(
+            f"""
+            SELECT id, COALESCE(fb_post_id, '')
+            FROM fb_crossposter_queue
+            WHERE COALESCE(target_page_id, '') = ?
+              AND scheduled_publish_time = ?
+              AND status IN ({placeholders})
+            ORDER BY CASE WHEN COALESCE(fb_post_id, '') != '' THEN 0 ELSE 1 END, id
+            """,
+            (page_id, scheduled_time, *active_statuses),
+        ).fetchall()
+        for item_id, fb_post_id in duplicate_rows[1:]:
+            if fb_post_id:
+                c.execute(
+                    """
+                    UPDATE fb_crossposter_queue
+                    SET status = 'error',
+                        error_message = 'Trùng thời điểm đăng; cần đồng bộ lại trạng thái Meta'
+                    WHERE id = ?
+                    """,
+                    (item_id,),
+                )
+            else:
+                c.execute(
+                    """
+                    UPDATE fb_crossposter_queue
+                    SET status = 'pending', scheduled_publish_time = 0,
+                        error_message = 'Đã trả về hàng đợi vì trùng thời điểm đăng'
+                    WHERE id = ?
+                    """,
+                    (item_id,),
+                )
+
+    c.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fb_queue_unique_active_slot
+        ON fb_crossposter_queue(COALESCE(target_page_id, ''), scheduled_publish_time)
+        WHERE scheduled_publish_time > 0
+          AND status IN ('scheduled', 'downloading', 'uploading', 'verifying', 'meta_scheduled')
+        """
+    )
 
 
 def _migrate_fb_crossposter_token_storage(conn: sqlite3.Connection) -> None:
@@ -4099,7 +4187,8 @@ def update_fb_crossposter_queue_item(item_id: int, fields: dict) -> bool:
             "fb_title", "fb_description", "status", "scheduled_publish_time",
             "fb_post_id", "error_message", "sort_order", "file_size_bytes", "target_page_id",
             "original_title", "original_description", "original_tags_json", "thumbnail_url",
-            "fb_description_source",
+            "fb_description_source", "meta_published", "meta_video_status",
+            "meta_scheduled_publish_time", "meta_status_json", "meta_verified_at",
         }
         updates = []
         values = []
@@ -4116,9 +4205,14 @@ def update_fb_crossposter_queue_item(item_id: int, fields: dict) -> bool:
         values.append(item_id)
 
         sql = f"UPDATE fb_crossposter_queue SET {', '.join(updates)} WHERE id = ?"
-        cur = conn.execute(sql, values)
-        conn.commit()
-        return cur.rowcount > 0
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(sql, values)
+            conn.commit()
+            return cur.rowcount > 0
+        except sqlite3.IntegrityError as exc:
+            conn.rollback()
+            raise ValueError("Thời điểm đăng này đã được một video khác giữ trên cùng Fanpage") from exc
     finally:
         conn.close()
 
@@ -4166,6 +4260,7 @@ def recalculate_fb_queue_schedule(
 
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     try:
+        conn.execute("BEGIN IMMEDIATE")
         target_pid = (target_page_id or "").strip()
         where_sql = "WHERE status IN ('pending', 'scheduled') AND (fb_post_id IS NULL OR fb_post_id = '')"
         params = []
@@ -4288,6 +4383,9 @@ def get_fb_crossposter_stats(target_page_id: str = "") -> dict:
             "scheduled": 0,
             "downloading": 0,
             "uploading": 0,
+            "verifying": 0,
+            "meta_scheduled": 0,
+            "processing": 0,
             "published": 0,
             "skipped": 0,
             "error": 0
@@ -4300,7 +4398,7 @@ def get_fb_crossposter_stats(target_page_id: str = "") -> dict:
             counts["total"] += cnt
 
         # Next upcoming scheduled item
-        next_where = "status = 'scheduled' AND scheduled_publish_time > ?"
+        next_where = "status IN ('scheduled', 'meta_scheduled') AND scheduled_publish_time > ?"
         next_params = [int(datetime.datetime.now().timestamp())]
         if target_page_id and target_page_id.strip():
             next_where += " AND target_page_id = ?"
@@ -4352,16 +4450,19 @@ def get_fb_queue_items_for_schedule_ahead(days_ahead: int, target_page_id: str =
 
 
 def reset_fb_crossposter_queue_errors(target_page_id: str = "") -> int:
-    """Reset all error items back to 'scheduled' state and clear error messages."""
+    """Return retryable errors without a Meta object to the unscheduled queue."""
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     try:
-        where_sql = "WHERE status = 'error'"
+        where_sql = "WHERE status = 'error' AND (fb_post_id IS NULL OR fb_post_id = '')"
         params = []
         if target_page_id and target_page_id.strip():
             where_sql += " AND target_page_id = ?"
             params.append(target_page_id.strip())
         
-        cursor = conn.execute(f"UPDATE fb_crossposter_queue SET status = 'scheduled', error_message = '' {where_sql}", params)
+        cursor = conn.execute(
+            f"UPDATE fb_crossposter_queue SET status = 'pending', scheduled_publish_time = 0, error_message = '' {where_sql}",
+            params,
+        )
         conn.commit()
         return cursor.rowcount
     finally:
@@ -5104,6 +5205,48 @@ def reserve_youtube_publication_slot(
         if conn.in_transaction:
             conn.execute("ROLLBACK")
         raise
+    finally:
+        conn.close()
+
+
+def get_fb_items_for_meta_reconciliation(
+    target_page_id: str = "",
+    limit: int = 100,
+) -> list[dict]:
+    """Return Meta-backed items whose remote state can affect local scheduling truth."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        now_ts = int(datetime.datetime.now().timestamp())
+        where_sql = """
+            WHERE COALESCE(fb_post_id, '') != ''
+              AND (
+                    status IN ('verifying', 'processing', 'meta_scheduled')
+                    OR (
+                        status = 'published'
+                        AND (
+                            scheduled_publish_time > ?
+                            OR COALESCE(meta_verified_at, '') = ''
+                        )
+                    )
+                  )
+        """
+        params: list[object] = [now_ts]
+        target_pid = (target_page_id or "").strip()
+        if target_pid:
+            where_sql += " AND target_page_id = ?"
+            params.append(target_pid)
+        params.append(max(1, min(int(limit), 500)))
+        rows = conn.execute(
+            f"""
+            SELECT * FROM fb_crossposter_queue
+            {where_sql}
+            ORDER BY COALESCE(NULLIF(meta_verified_at, ''), created_at) ASC, id ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
     finally:
         conn.close()
 

@@ -1055,7 +1055,11 @@ def upload_large_video_resumable(
         finish_params["custom_labels"] = json.dumps(custom_labels, ensure_ascii=False)
 
     now_ts = int(time.time())
-    if scheduled_publish_time and scheduled_publish_time > now_ts + 600:
+    if scheduled_publish_time:
+        if scheduled_publish_time <= now_ts + 600:
+            raise RuntimeError(
+                "Thời điểm đặt lịch còn dưới 10 phút; cần phân bổ slot mới trước khi hoàn tất upload"
+            )
         finish_params["published"] = "false"
         finish_params["scheduled_publish_time"] = str(scheduled_publish_time)
     else:
@@ -1089,7 +1093,9 @@ def upload_large_video_resumable(
         try:
             with opener.open(finish_req, timeout=60) as resp:
                 finish_data = json.loads(resp.read().decode("utf-8"))
-                fb_id = finish_data.get("id") or video_id or session_id
+                fb_id = finish_data.get("id") or video_id
+                if not fb_id:
+                    raise RuntimeError("Meta không trả về Video ID sau khi hoàn tất upload")
                 finish_data["id"] = fb_id
                 logger.info(
                     "Resumable Facebook Upload Completed Successfully! FB ID: %s (attempt %d/%d)",
@@ -1103,27 +1109,6 @@ def upload_large_video_resumable(
             formatted = format_facebook_api_error(err_msg, err.code)
             last_finish_error = RuntimeError(f"Lỗi hoàn tất upload video: {formatted}")
             is_transient = is_transient_meta_error(err_msg, err.code)
-
-            # Check if Meta backend actually processed the video despite transient response
-            check_id = video_id or session_id
-            if check_id:
-                try:
-                    check_url = f"{GRAPH_API_BASE}/{check_id}?fields=id,status&access_token={clean_token}"
-                    check_req = urllib.request.Request(
-                        check_url,
-                        headers={"User-Agent": "NexusStudio/1.0"},
-                    )
-                    with opener.open(check_req, timeout=15) as c_resp:
-                        c_data = json.loads(c_resp.read().decode("utf-8"))
-                        if c_data.get("id"):
-                            logger.info(
-                                "Video %s verified existing on Meta cluster despite transient finish response!",
-                                c_data["id"],
-                            )
-                            finish_data = {"id": c_data["id"], "success": True}
-                            break
-                except Exception:
-                    pass
 
             if attempt < max_finish_retries and is_transient:
                 delay = finish_delays[min(attempt - 1, len(finish_delays) - 1)]
@@ -1249,7 +1234,11 @@ def upload_video_to_facebook(
         fields["custom_labels"] = json.dumps(custom_labels, ensure_ascii=False)
 
     now_ts = int(time.time())
-    if scheduled_publish_time and scheduled_publish_time > now_ts + 600:
+    if scheduled_publish_time:
+        if scheduled_publish_time <= now_ts + 600:
+            raise RuntimeError(
+                "Thời điểm đặt lịch còn dưới 10 phút; cần phân bổ slot mới trước khi upload"
+            )
         fields["published"] = "false"
         fields["scheduled_publish_time"] = str(scheduled_publish_time)
     else:
@@ -1519,6 +1508,156 @@ def get_facebook_video_metadata(
         raise _facebook_http_error("Không đọc được metadata video Facebook", error) from error
 
 
+def _parse_meta_scheduled_time(value: Any) -> int:
+    if value in (None, ""):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return int(parsed.timestamp())
+    except (TypeError, ValueError):
+        return 0
+
+
+def _meta_verification_fields(metadata: dict[str, Any]) -> dict[str, Any]:
+    status_data = metadata.get("status") if isinstance(metadata.get("status"), dict) else {}
+    published = metadata.get("published")
+    return {
+        "meta_published": 1 if published is True else 0 if published is False else None,
+        "meta_video_status": str(status_data.get("video_status") or ""),
+        "meta_scheduled_publish_time": _parse_meta_scheduled_time(
+            metadata.get("scheduled_publish_time")
+        ),
+        "meta_status_json": json.dumps(status_data, ensure_ascii=False),
+        "meta_verified_at": db.utc_now(),
+    }
+
+
+def classify_facebook_publication(
+    metadata: dict[str, Any],
+    requested_schedule: int | None,
+) -> tuple[str, dict[str, Any]]:
+    """Map Meta metadata to a local state without treating object existence as success."""
+    fields = _meta_verification_fields(metadata)
+    published = metadata.get("published")
+    actual_schedule = int(fields["meta_scheduled_publish_time"] or 0)
+    status_data = metadata.get("status") if isinstance(metadata.get("status"), dict) else {}
+    upload_status = str((status_data.get("uploading_phase") or {}).get("status") or "").lower()
+    publishing_status = str((status_data.get("publishing_phase") or {}).get("status") or "").lower()
+    video_status = str(status_data.get("video_status") or "").lower()
+    now_ts = int(time.time())
+
+    if requested_schedule:
+        schedule_matches = actual_schedule and abs(actual_schedule - int(requested_schedule)) <= 60
+        if published is False and schedule_matches:
+            if requested_schedule < now_ts - 900:
+                raise RuntimeError("Lịch Meta đã qua nhưng video vẫn chưa được phát hành")
+            return "meta_scheduled", fields
+        is_ready = upload_status == "complete" and (
+            publishing_status == "complete" or video_status in {"complete", "published", "ready"}
+        )
+        if published is True and requested_schedule <= now_ts and is_ready:
+            return "published", fields
+        if published is True and requested_schedule > now_ts:
+            raise RuntimeError(
+                "Meta nhận video ở chế độ published=true nhưng không lưu lịch đăng đã yêu cầu"
+            )
+        if actual_schedule and not schedule_matches:
+            raise RuntimeError(
+                f"Meta lưu sai lịch đăng: yêu cầu {requested_schedule}, nhận {actual_schedule}"
+            )
+        raise RuntimeError("Meta chưa xác nhận scheduled_publish_time cho video")
+
+    is_ready = upload_status == "complete" and (
+        publishing_status == "complete" or video_status in {"complete", "published", "ready"}
+    )
+    if published is True and is_ready:
+        return "published", fields
+    if metadata.get("id"):
+        return "processing", fields
+    raise RuntimeError("Meta không trả về trạng thái hợp lệ cho video")
+
+
+def verify_facebook_publication(
+    video_id: str,
+    access_token: str,
+    target_gpm_profile_id: str,
+    requested_schedule: int | None,
+    max_attempts: int = 5,
+) -> tuple[str, dict[str, Any]]:
+    """Poll Meta until scheduling truth is available or fail without a false success."""
+    attempts = max(1, max_attempts)
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        metadata = get_facebook_video_metadata(
+            video_id,
+            access_token,
+            target_gpm_profile_id=target_gpm_profile_id,
+        )
+        try:
+            return classify_facebook_publication(metadata, requested_schedule)
+        except RuntimeError as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                time.sleep(min(2 * (attempt + 1), 10))
+    raise RuntimeError(f"Không xác minh được trạng thái Meta: {last_error}")
+
+
+def reconcile_fb_queue_item(item_id: int) -> dict[str, Any]:
+    """Refresh one queue item from Meta and persist the verified remote state."""
+    item = db.get_fb_crossposter_queue_item(item_id)
+    if not item:
+        raise ValueError(f"Không tìm thấy video ID #{item_id} trong hàng đợi")
+    video_id = str(item.get("fb_post_id") or "").strip()
+    if not video_id:
+        raise ValueError("Queue item chưa có Facebook Video ID để đồng bộ")
+    target_page_id = str(item.get("target_page_id") or "").strip()
+    settings = db.get_fb_crossposter_runtime_settings(target_page_id)
+    access_token = sanitize_fb_token(settings.get("target_access_token"))
+    if not access_token:
+        raise ValueError("Page Access Token Facebook đang trống hoặc không hợp lệ")
+    requested_schedule = int(item.get("scheduled_publish_time") or 0) or None
+    metadata = get_facebook_video_metadata(
+        video_id,
+        access_token,
+        target_gpm_profile_id=str(settings.get("target_gpm_profile_id") or ""),
+    )
+    try:
+        verified_status, fields = classify_facebook_publication(metadata, requested_schedule)
+        fields.update({"status": verified_status, "error_message": ""})
+    except RuntimeError as exc:
+        fields = _meta_verification_fields(metadata)
+        fields.update({"status": "error", "error_message": str(exc)})
+        verified_status = "error"
+    db.update_fb_crossposter_queue_item(item_id, fields)
+    return {
+        "item_id": item_id,
+        "fb_post_id": video_id,
+        "status": verified_status,
+        "metadata": metadata,
+    }
+
+
+def reconcile_fb_queue(target_page_id: str = "", limit: int = 100) -> dict[str, Any]:
+    """Reconcile Meta-backed queue items for one Fanpage or every campaign."""
+    items = db.get_fb_items_for_meta_reconciliation(target_page_id, limit=limit)
+    counts = {"checked": 0, "meta_scheduled": 0, "processing": 0, "published": 0, "error": 0}
+    errors: list[dict[str, Any]] = []
+    for item in items:
+        try:
+            result = reconcile_fb_queue_item(int(item["id"]))
+            status = str(result.get("status") or "error")
+            counts[status] = counts.get(status, 0) + 1
+        except Exception as exc:
+            counts["error"] += 1
+            errors.append({"item_id": item["id"], "error": security_logging.redact_sensitive(exc)})
+        counts["checked"] += 1
+    return {"success": not errors, "counts": counts, "errors": errors}
+
+
 def _content_tag_id_set(value: Any) -> set[str]:
     if isinstance(value, dict):
         value = value.get("data") or []
@@ -1741,6 +1880,9 @@ def repair_fb_queue_item(
         )
     )
     title = str(item.get("fb_title") or source_title)
+    requested_schedule = int(item.get("scheduled_publish_time") or 0)
+    if requested_schedule <= int(time.time()) + 600:
+        requested_schedule = 0
     content_tag_ids, skipped_tags = resolve_content_tag_ids(
         source_tags,
         access_token,
@@ -1789,11 +1931,18 @@ def repair_fb_queue_item(
             custom_labels=custom_labels,
             thumb_path=thumb_path,
             target_gpm_profile_id=target_profile_id,
+            scheduled_publish_time=requested_schedule or None,
         )
-        db.update_fb_crossposter_queue_item(item_id, {"error_message": ""})
+        verified_status, verification_fields = classify_facebook_publication(
+            result.get("verified") or {},
+            requested_schedule or None,
+        )
+        verification_fields.update({"status": verified_status, "error_message": ""})
+        db.update_fb_crossposter_queue_item(item_id, verification_fields)
         return {
             **result,
             "mode": "updated",
+            "status": verified_status,
             "skipped_tags": skipped_tags,
         }
     except Exception as exc:
@@ -1810,10 +1959,18 @@ def repair_fb_queue_item(
 
     old_status = str(item.get("status") or "published")
     try:
-        replacement = process_queue_item_jit(item_id)
+        replacement = process_queue_item_jit(
+            item_id,
+            force=True,
+            publish_now=int(item.get("scheduled_publish_time") or 0) <= int(time.time()),
+        )
         replacement_id = str(replacement.get("fb_post_id") or "").strip()
         if not replacement_id or replacement_id == old_video_id:
             raise RuntimeError("Meta không trả về ID video thay thế hợp lệ")
+        if replacement.get("status") not in {"meta_scheduled", "published"}:
+            raise RuntimeError(
+                f"Video thay thế chưa đạt trạng thái hoàn tất: {replacement.get('status') or 'unknown'}"
+            )
         replacement_metadata = get_facebook_video_metadata(
             replacement_id,
             access_token,
@@ -1884,6 +2041,7 @@ def process_queue_item_jit(
     parent_task_id: str | None = None,
     sys_job_id: str | None = None,
     force: bool = False,
+    publish_now: bool = False,
 ) -> dict[str, Any]:
     """Execute Just-in-Time download, metadata prep, Facebook upload, and cleanup for one queue item."""
     item = db.get_fb_crossposter_queue_item(item_id)
@@ -1904,22 +2062,28 @@ def process_queue_item_jit(
     target_gpm_profile_id = settings.get("target_gpm_profile_id", "")
     default_tags = settings.get("default_tags", [])
 
-    # Idempotency Guard: Do not re-publish videos that have already succeeded unless explicitly forced
+    # Idempotency guard: reconcile existing Meta objects instead of creating duplicates.
     existing_post_id = str(item.get("fb_post_id") or "").strip()
-    if item.get("status") == "published" and existing_post_id and not force:
+    if existing_post_id and not force:
+        reconciled = reconcile_fb_queue_item(item_id)
+        reconciled_status = str(reconciled.get("status") or "error")
+        if reconciled_status == "error":
+            raise RuntimeError(
+                "Video đã có Meta ID nhưng trạng thái không hợp lệ; hãy dùng chức năng sửa/thay thế để tránh đăng trùng"
+            )
         logger.info(
-            "Queue item #%d (%s) already published with Post ID %s on Page %s. Skipping duplicate upload.",
+            "Queue item #%d (%s) already exists on Meta with status %s and ID %s. Skipping duplicate upload.",
             item_id,
             youtube_id,
+            reconciled_status,
             existing_post_id,
-            page_name,
         )
         if sys_job_id:
             try:
                 db.update_system_job(
                     sys_job_id,
                     status="completed",
-                    progress=f"Bỏ qua vì video đã được đăng trước đó lên Fanpage {page_name} (Post ID: {existing_post_id})",
+                    progress=f"Đã đồng bộ video hiện có trên Meta: {reconciled_status} (ID: {existing_post_id})",
                     finished_at=db.utc_now(),
                 )
             except Exception:
@@ -1927,6 +2091,7 @@ def process_queue_item_jit(
         return {
             "success": True,
             "already_published": True,
+            "status": reconciled_status,
             "fb_post_id": existing_post_id,
             "item_id": item_id,
             "title": v_title,
@@ -1963,6 +2128,16 @@ def process_queue_item_jit(
     vertical_video_file = TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}_vertical.mp4"
     thumb_file = TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}.jpg"
     vertical_video_file.unlink(missing_ok=True)
+
+    if publish_now:
+        item["scheduled_publish_time"] = 0
+        db.update_fb_crossposter_queue_item(item_id, {"scheduled_publish_time": 0})
+    else:
+        scheduled_time = int(item.get("scheduled_publish_time") or 0)
+        if not scheduled_time:
+            raise ValueError("Video chưa có thời điểm đặt lịch")
+        if scheduled_time <= int(time.time()) + 600:
+            raise RuntimeError("Thời điểm đặt lịch còn dưới 10 phút; hãy tính lại lịch trước khi upload")
 
     # Step 1: Set status to downloading
     db.update_fb_crossposter_queue_item(item_id, {"status": "downloading", "error_message": ""})
@@ -2086,7 +2261,7 @@ def process_queue_item_jit(
         if not auto_caption:
             caption = append_missing_default_hashtags(caption, default_tags)
         title = item.get("fb_title") or item.get("original_title", "")
-        scheduled_time = item.get("scheduled_publish_time")
+        scheduled_time = None if publish_now else int(item.get("scheduled_publish_time") or 0)
         content_tag_ids, skipped_tags = resolve_content_tag_ids(
             item.get("original_tags", []),
             access_token,
@@ -2120,20 +2295,33 @@ def process_queue_item_jit(
         )
 
         fb_post_id = upload_result.get("id") or ""
+        if not fb_post_id:
+            raise RuntimeError("Meta không trả về Video ID sau khi upload")
 
-        # Step 3: Success -> Update DB
+        # Step 3: Persist the Meta object, then verify scheduling truth before success.
         db.update_fb_crossposter_queue_item(item_id, {
-            "status": "published",
+            "status": "verifying",
             "fb_post_id": str(fb_post_id),
             "error_message": "",
         })
+        verified_status, verification_fields = verify_facebook_publication(
+            str(fb_post_id),
+            access_token,
+            str(target_gpm_profile_id or ""),
+            scheduled_time,
+        )
+        verification_fields.update({
+            "status": verified_status,
+            "error_message": "",
+        })
+        db.update_fb_crossposter_queue_item(item_id, verification_fields)
         if sys_job_id:
             try:
                 db.update_system_job(
                     sys_job_id,
                     status="completed",
                     progress=(
-                        f"Đăng thành công lên Fanpage (Post ID: {fb_post_id}; "
+                        f"Meta đã xác nhận trạng thái {verified_status} (Post ID: {fb_post_id}; "
                         f"thẻ Meta: {len(content_tag_ids)}/"
                         f"{len(_unique_tag_keywords(source_tags, default_tags=default_tags))})"
                     ),
@@ -2144,6 +2332,7 @@ def process_queue_item_jit(
 
         return {
             "success": True,
+            "status": verified_status,
             "fb_post_id": str(fb_post_id),
             "item_id": item_id,
             "title": title,
@@ -2323,7 +2512,11 @@ def _run_schedule_ahead_worker(
             try:
                 with _schedule_ahead_lock:
                     _schedule_ahead_tasks[task_id]["phase"] = "uploading"
-                process_queue_item_jit(item["id"], parent_task_id=task_id)
+                result = process_queue_item_jit(item["id"], parent_task_id=task_id)
+                if result.get("status") not in {"meta_scheduled", "published"}:
+                    raise RuntimeError(
+                        f"Meta chưa xác nhận lịch đăng (trạng thái: {result.get('status') or 'unknown'})"
+                    )
                 completed_count += 1
             except Exception as v_err:
                 last_error = str(v_err)
@@ -2483,6 +2676,7 @@ class FbCrossPosterScheduler:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._last_sync_checks: dict[str, float] = {}
+        self._last_reconcile_checks: dict[str, float] = {}
 
     def start(self):
         if self._running:
@@ -2526,6 +2720,21 @@ class FbCrossPosterScheduler:
         for camp in campaigns:
             page_id = camp.get("page_id", "")
             settings = db.get_fb_crossposter_settings(page_id)
+
+            last_reconcile_ts = self._last_reconcile_checks.get(page_id, 0.0)
+            if now_ts - last_reconcile_ts >= 300:
+                self._last_reconcile_checks[page_id] = now_ts
+                try:
+                    result = reconcile_fb_queue(page_id, limit=10)
+                    if result["counts"]["checked"]:
+                        logger.info(
+                            "Reconciled %d Facebook queue items for Page %s: %s",
+                            result["counts"]["checked"],
+                            page_id or "Default",
+                            result["counts"],
+                        )
+                except Exception as reconcile_exc:
+                    logger.error("Meta reconciliation failed for Page %s: %s", page_id, reconcile_exc)
 
             # 1. Auto-Sync Check
             if settings.get("auto_sync_enabled") and settings.get("source_channel_id"):

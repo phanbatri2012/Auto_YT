@@ -9243,11 +9243,22 @@ def fix_fb_crossposter_schedule_collisions(page_id: str = Query(default="")):
     }
 
 
+@app.post("/api/fb-crossposter/reconcile-meta")
+def reconcile_fb_crossposter_meta(
+    page_id: str = Query(default=""),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """Refresh queue truth from Meta for one Fanpage or all campaigns."""
+    result = fb_crossposter_service.reconcile_fb_queue(page_id, limit=limit)
+    result["stats"] = db.get_fb_crossposter_stats(page_id)
+    return result
+
+
 @app.post("/api/fb-crossposter/queue/{item_id}/publish-now")
 def publish_fb_crossposter_item_now(item_id: int):
     """Trigger immediate JIT download, preparation, and Facebook publishing for one item."""
     try:
-        result = fb_crossposter_service.process_queue_item_jit(item_id)
+        result = fb_crossposter_service.process_queue_item_jit(item_id, publish_now=True)
         item = db.get_fb_crossposter_queue_item(item_id)
         target_page_id = (item and item.get("target_page_id")) or ""
         stats = db.get_fb_crossposter_stats(target_page_id)
@@ -9255,10 +9266,31 @@ def publish_fb_crossposter_item_now(item_id: int):
             "success": True,
             "result": result,
             "stats": stats,
-            "message": f"Đã đăng thành công video lên Facebook (Post ID: {result.get('fb_post_id')})",
+            "message": (
+                f"Meta đã tiếp nhận video với trạng thái {result.get('status')} "
+                f"(Post ID: {result.get('fb_post_id')})"
+            ),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/fb-crossposter/queue/{item_id}/repair-meta")
+def repair_fb_crossposter_item(item_id: int):
+    """Repair or safely replace a Meta video whose remote state failed verification."""
+    try:
+        result = fb_crossposter_service.repair_fb_queue_item(item_id)
+        item = db.get_fb_crossposter_queue_item(item_id)
+        target_page_id = (item and item.get("target_page_id")) or ""
+        return {
+            "success": True,
+            "result": result,
+            "item": item,
+            "stats": db.get_fb_crossposter_stats(target_page_id),
+            "message": "Đã sửa và xác minh lại video trên Meta",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/fb-crossposter/queue/{item_id}/skip")
@@ -9289,6 +9321,13 @@ def unskip_fb_crossposter_item(item_id: int):
 def reset_fb_crossposter_errors(page_id: str = Query(default="")):
     """Reset all error items back to 'scheduled' state."""
     count = db.reset_fb_crossposter_queue_errors(page_id)
+    if count:
+        settings = db.get_fb_crossposter_settings(page_id)
+        db.recalculate_fb_queue_schedule(
+            settings.get("daily_quota", 2),
+            settings.get("schedule_times", ["11:30", "19:30"]),
+            target_page_id=page_id,
+        )
     stats = db.get_fb_crossposter_stats(page_id)
     return {
         "success": True,
@@ -9304,7 +9343,10 @@ def update_fb_crossposter_item(item_id: int, payload: FBCrossPosterItemUpdatePay
     fields = {k: v for k, v in payload.model_dump().items() if v is not None}
     if payload.fb_description is not None:
         fields["fb_description_source"] = "manual"
-    success = db.update_fb_crossposter_queue_item(item_id, fields)
+    try:
+        success = db.update_fb_crossposter_queue_item(item_id, fields)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not success:
         raise HTTPException(status_code=404, detail="Không tìm thấy video hoặc không có trường nào cập nhật")
     item = db.get_fb_crossposter_queue_item(item_id)

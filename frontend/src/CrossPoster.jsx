@@ -1,8 +1,39 @@
 import { useEffect, useState, useMemo, useCallback, useRef } from 'react'
 import './CrossPoster.css'
+import {
+  normalizeYoutubeChannel,
+  resolveFacebookPageSelection,
+  resolveYoutubeChannelSelection
+} from './crossPosterCampaign'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const FB_STORAGE_KEY = 'AUTOYT_FACEBOOK_PAGES'
+
+function createDefaultSettings() {
+  return {
+    source_channel_id: '',
+    source_channel_title: '',
+    source_gpm_profile_id: '',
+    target_fb_page_id: '',
+    target_fb_page_name: '',
+    target_gpm_profile_id: '',
+    target_access_token: '',
+    target_access_token_configured: false,
+    daily_quota: 2,
+    schedule_times: ['11:30', '19:30'],
+    lead_time_minutes: 60,
+    post_template: '{title}\n\n{clean_description}\n\n---\n📌 Like & Follow để xem thêm nhiều video hấp dẫn nhé!\n{hashtags}',
+    sort_order_mode: 'oldest_first',
+    auto_sync_enabled: false,
+    auto_sync_type: 'interval',
+    auto_sync_interval_hours: 6,
+    auto_sync_fixed_times: ['06:00', '18:00'],
+    auto_publish_enabled: false,
+    convert_to_vertical: false,
+    default_tags: [],
+    last_synced_at: ''
+  }
+}
 
 function withoutFacebookSecrets(page) {
   const { access_token: legacyToken, ...safePage } = page || {}
@@ -69,30 +100,10 @@ export default function CrossPoster() {
   const [selectedPageId, setSelectedPageId] = useState('')
 
   // Settings & Hub States
-  const [settings, setSettings] = useState({
-    source_channel_id: '',
-    source_channel_title: '',
-    source_gpm_profile_id: '',
-    target_fb_page_id: '',
-    target_fb_page_name: '',
-    target_gpm_profile_id: '',
-    target_access_token: '',
-    target_access_token_configured: false,
-    daily_quota: 2,
-    schedule_times: ['11:30', '19:30'],
-    lead_time_minutes: 60,
-    post_template: '{title}\n\n{clean_description}\n\n---\n📌 Like & Follow để xem thêm nhiều video hấp dẫn nhé!\n{hashtags}',
-    sort_order_mode: 'oldest_first',
-    auto_sync_enabled: false,
-    auto_sync_type: 'interval',
-    auto_sync_interval_hours: 6,
-    auto_sync_fixed_times: ['06:00', '18:00'],
-    auto_publish_enabled: false,
-    convert_to_vertical: false,
-    default_tags: [],
-    last_synced_at: ''
-  })
+  const [settings, setSettings] = useState(createDefaultSettings)
   const [defaultTagsDraft, setDefaultTagsDraft] = useState('')
+  const settingsRequestId = useRef(0)
+  const queueRequestId = useRef(0)
 
   const [stats, setStats] = useState({
     total: 0,
@@ -167,7 +178,8 @@ export default function CrossPoster() {
   })
 
   // Load Settings & Hub Data for active Fanpage
-  const loadSettingsAndHub = useCallback(async (pageId = selectedPageId) => {
+  const loadSettingsAndHub = useCallback(async (pageId = '') => {
+    const requestId = ++settingsRequestId.current
     try {
       // Load Facebook Pages saved from Channel Hub localStorage
       try {
@@ -211,9 +223,14 @@ export default function CrossPoster() {
       const res = await fetch(`${API_BASE}/api/fb-crossposter/settings?${params.toString()}`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
+      if (requestId !== settingsRequestId.current) return
 
       if (data.settings) {
-        setSettings(prev => ({ ...prev, ...data.settings, target_access_token: '' }))
+        setSettings({
+          ...createDefaultSettings(),
+          ...data.settings,
+          target_access_token: ''
+        })
         setDefaultTagsDraft(
           Array.isArray(data.settings.default_tags)
             ? data.settings.default_tags.join(', ')
@@ -235,7 +252,7 @@ export default function CrossPoster() {
         const ytList = Array.isArray(data.youtube_channels) 
           ? data.youtube_channels 
           : (Array.isArray(data.youtube_channels.items) ? data.youtube_channels.items : [])
-        setYoutubeChannels(ytList)
+        setYoutubeChannels(ytList.map(normalizeYoutubeChannel))
       }
       if (data.gpm_profiles) {
         const gpmList = Array.isArray(data.gpm_profiles) 
@@ -244,12 +261,14 @@ export default function CrossPoster() {
         setGpmProfiles(gpmList)
       }
     } catch (err) {
+      if (requestId !== settingsRequestId.current) return
       console.error('Failed to load Cross-Poster settings:', err)
     }
-  }, [selectedPageId])
+  }, [])
 
   // Load Queue List for active Fanpage
   const loadQueue = useCallback(async (pageId = selectedPageId) => {
+    const requestId = ++queueRequestId.current
     try {
       const params = new URLSearchParams({
         page: String(page),
@@ -266,12 +285,14 @@ export default function CrossPoster() {
       const res = await fetch(`${API_BASE}/api/fb-crossposter/queue?${params.toString()}`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
+      if (requestId !== queueRequestId.current) return
 
       setQueueItems(data.items || [])
       setQueueTotal(data.total || 0)
       setTotalPages(data.total_pages || 1)
       if (data.stats) setStats(data.stats)
     } catch (err) {
+      if (requestId !== queueRequestId.current) return
       console.error('Failed to load queue:', err)
     }
   }, [selectedPageId, page, pageSize, statusFilter, searchQuery])
@@ -296,8 +317,8 @@ export default function CrossPoster() {
   }, [selectedPageId, loadQueue])
 
   useEffect(() => {
-    loadSettingsAndHub()
-  }, [loadSettingsAndHub])
+    loadSettingsAndHub(selectedPageId)
+  }, [selectedPageId, loadSettingsAndHub])
 
   useEffect(() => {
     loadQueue()
@@ -321,8 +342,6 @@ export default function CrossPoster() {
   const handleSelectTab = (pageId) => {
     setSelectedPageId(pageId)
     setPage(1)
-    loadSettingsAndHub(pageId)
-    loadQueue(pageId)
   }
 
   // Delete Fanpage Campaign
@@ -386,7 +405,11 @@ export default function CrossPoster() {
       }
       const data = await res.json()
       if (data.settings) {
-        setSettings(prev => ({ ...prev, ...data.settings, target_access_token: '' }))
+        setSettings({
+          ...createDefaultSettings(),
+          ...data.settings,
+          target_access_token: ''
+        })
         setDefaultTagsDraft(
           Array.isArray(data.settings.default_tags)
             ? data.settings.default_tags.join(', ')
@@ -779,7 +802,7 @@ export default function CrossPoster() {
       setSettings(prev => ({
         ...prev,
         source_channel_id: found.channel_id ? `https://www.youtube.com/channel/${found.channel_id}` : prev.source_channel_id,
-        source_channel_title: found.channel_title || found.name || '',
+        source_channel_title: found.channel_title || '',
         source_gpm_profile_id: found.gpm_profile_id || ''
       }))
     }
@@ -797,10 +820,17 @@ export default function CrossPoster() {
         target_access_token_configured: Boolean(found.token_configured),
         target_gpm_profile_id: found.gpm_profile_id || ''
       }))
-      loadSettingsAndHub(found.page_id)
-      loadQueue(found.page_id)
     }
   }
+
+  const selectedYoutubeChannelId = useMemo(
+    () => resolveYoutubeChannelSelection(youtubeChannels, settings),
+    [youtubeChannels, settings]
+  )
+  const selectedFacebookPageId = useMemo(
+    () => resolveFacebookPageSelection(facebookPages, settings, selectedPageId),
+    [facebookPages, settings, selectedPageId]
+  )
 
   return (
     <div className="fb-crossposter-container">
@@ -909,12 +939,12 @@ export default function CrossPoster() {
               <select
                 className="fb-select"
                 onChange={(e) => handleSelectYoutubeChannel(e.target.value)}
-                defaultValue=""
+                value={selectedYoutubeChannelId}
               >
                 <option value="" disabled>-- Chọn kênh đã kết nối từ Channel Hub --</option>
                 {youtubeChannels.map((c) => (
                   <option key={c.id || c.channel_id} value={c.channel_id || c.id}>
-                    {c.channel_title || c.name || c.channel_id} {c.gpm_profile_id ? `[GPM: ${c.gpm_profile_id}]` : ''}
+                    {c.channel_title || c.channel_id} {c.gpm_profile_id ? `[GPM: ${c.gpm_profile_id}]` : ''}
                   </option>
                 ))}
               </select>
@@ -962,7 +992,7 @@ export default function CrossPoster() {
               <select
                 className="fb-select"
                 onChange={(e) => handleSelectFacebookPage(e.target.value)}
-                defaultValue=""
+                value={selectedFacebookPageId}
               >
                 <option value="" disabled>-- Chọn Fanpage đã kết nối từ Channel Hub --</option>
                 {facebookPages.map((p) => (

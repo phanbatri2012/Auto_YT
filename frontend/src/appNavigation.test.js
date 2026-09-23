@@ -155,5 +155,7 @@ test('wires Cross-Poster into navigation and view rendering', async () => {
   assert.match(crossPosterSource, /default_tags/)
   assert.match(crossPosterSource, /Chuyển video & thumbnail sang 9:16/)
   assert.match(crossPosterSource, /Tag mặc định của Fanpage/)
+  assert.match(crossPosterSource, /value=\{selectedYoutubeChannelId\}/)
+  assert.match(crossPosterSource, /value=\{selectedFacebookPageId\}/)
 })
 

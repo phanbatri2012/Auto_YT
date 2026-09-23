@@ -163,3 +163,18 @@ test('wires Cross-Poster into navigation and view rendering', async () => {
   assert.match(crossPosterSource, /value=\{selectedFacebookPageId\}/)
 })
 
+test('wires Universal Router engine into App and sub-components for persistent URL routing', async () => {
+  const appSource = await readFile(new URL('./App.jsx', import.meta.url), 'utf8')
+  const channelSource = await readFile(new URL('./ChannelManager.jsx', import.meta.url), 'utf8')
+  const crossSource = await readFile(new URL('./CrossPoster.jsx', import.meta.url), 'utf8')
+
+  assert.match(appSource, /import\s*\{\s*useAppRouter\s*\}\s*from\s*['"]\.\/router\.js['"]/)
+  assert.match(appSource, /const router = useAppRouter\(\)/)
+  assert.match(appSource, /const activeView = router\.activeView/)
+  assert.match(appSource, /const setActiveView = \(view,\s*subPath\s*=\s*['"]['"]\)\s*=>\s*router\.navigate\(view,\s*subPath\)/)
+  assert.match(channelSource, /import\s*\{\s*useSubRoute\s*\}\s*from\s*['"]\.\/router\.js['"]/)
+  assert.match(channelSource, /useSubRoute\(['"]channels['"],\s*['"]youtube['"]\)/)
+  assert.match(crossSource, /import\s*\{\s*useAppRouter\s*\}\s*from\s*['"]\.\/router\.js['"]/)
+  assert.match(crossSource, /export default function CrossPoster/)
+})
+

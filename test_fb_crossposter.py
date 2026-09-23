@@ -1554,6 +1554,91 @@ Câu chuyện về vị tướng quả cảm.
         upload_video.assert_not_called()
         self.assertEqual(update_item.call_args.args[1]["scheduled_publish_time"], 0)
 
+    def test_format_facebook_api_error_missing_object_vs_permissions(self):
+        # Error when object does not exist (contains the phrase 'missing permissions')
+        missing_err = (
+            '{"error":{"message":"Unsupported get request. Object with ID \'2516067995540325\' does not exist, '
+            'cannot be loaded due to missing permissions, or does not support this operation.",'
+            '"type":"GraphMethodException","code":100,"error_subcode":33}}'
+        )
+        formatted_missing = fb_crossposter_service.format_facebook_api_error(missing_err, 400)
+        self.assertIn("không tồn tại hoặc đã bị xóa", formatted_missing)
+        self.assertNotIn("thiếu quyền đăng bài", formatted_missing)
+
+        # Genuine permission error
+        perm_err = '{"error":{"message":"(#200) Requires pages_manage_posts permission","code":200}}'
+        formatted_perm = fb_crossposter_service.format_facebook_api_error(perm_err, 400)
+        self.assertIn("thiếu quyền đăng bài", formatted_perm)
+
+    def test_inspect_facebook_publication_stalled_from_remote_timestamp(self):
+        # Video created 5 hours ago, still in uploading_phase: in_progress
+        five_hours_ago = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=5)
+        metadata = {
+            "id": "1400610205380249",
+            "created_time": five_hours_ago.strftime("%Y-%m-%dT%H:%M:%S+0000"),
+            "updated_time": five_hours_ago.strftime("%Y-%m-%dT%H:%M:%S+0000"),
+            "published": True,
+            "status": {
+                "video_status": "uploading",
+                "uploading_phase": {"status": "in_progress"},
+                "processing_phase": {"status": "not_started"},
+                "publishing_phase": {"status": "not_started"},
+            },
+        }
+        status, fields, msg = fb_crossposter_service.inspect_facebook_publication(metadata, 1790308800)
+        self.assertEqual(status, "stalled")
+        self.assertIn("quá 2 giờ", msg)
+
+    def test_delete_facebook_video_already_deleted_returns_success(self):
+        http_error = urllib.error.HTTPError(
+            url="https://graph.facebook.com/v20.0/2516067995540325",
+            code=400,
+            msg="Bad Request",
+            hdrs={},
+            fp=io.BytesIO(
+                b'{"error":{"message":"Unsupported delete request. Object does not exist","type":"GraphMethodException","code":100,"error_subcode":33}}'
+            ),
+        )
+        opener = MagicMock()
+        opener.open.side_effect = http_error
+        with (
+            patch.object(fb_crossposter_service, "_get_proxy_for_gpm_profile", return_value=None),
+            patch.object(fb_crossposter_service, "_build_urllib_opener", return_value=opener),
+        ):
+            res = fb_crossposter_service.delete_facebook_video("2516067995540325", "EAAToken")
+            self.assertTrue(res.get("success"))
+            self.assertTrue(res.get("already_deleted"))
+
+    def test_cleanup_failed_meta_video_when_already_missing_on_meta(self):
+        item = {
+            "id": 93,
+            "target_page_id": "page93",
+            "fb_post_id": "missing_vid",
+            "upload_video_id": "",
+            "scheduled_publish_time": 0,
+            "status": "meta_failed",
+        }
+        with (
+            patch.object(db, "get_fb_crossposter_queue_item", return_value=item),
+            patch.object(
+                db,
+                "get_fb_crossposter_runtime_settings",
+                return_value={"target_access_token": "token", "target_gpm_profile_id": ""},
+            ),
+            patch.object(
+                fb_crossposter_service,
+                "reconcile_fb_queue_item",
+                return_value={"status": "missing", "fb_post_id": "missing_vid"},
+            ),
+            patch.object(db, "reserve_next_fb_queue_slot", return_value=1799999999) as reserve_slot,
+            patch.object(db, "append_fb_recovery_history"),
+        ):
+            result = fb_crossposter_service.cleanup_failed_meta_video_and_reschedule(93)
+            self.assertTrue(result["success"])
+            self.assertEqual(result["status"], "scheduled")
+            self.assertEqual(result["scheduled_publish_time"], 1799999999)
+            reserve_slot.assert_called_once_with(93, minimum_lead_minutes=30, clear_meta_object=True)
+
 
 if __name__ == "__main__":
     unittest.main()

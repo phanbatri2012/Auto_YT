@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import './App.css'
+import BackgroundCanvas, { BACKGROUND_MODES } from './BackgroundCanvas'
+import { useAppRouter } from './router.js'
 import AutoLogin from './AutoLogin'
 import GoogleFlowLogin from './GoogleFlowLogin'
 import AudioReviewPanel from './AudioReviewPanel'
@@ -145,7 +147,24 @@ function AudioDurationBadge({ videoId, audioUrl, savedDurationSeconds, audioRevi
 }
 
 function App() {
-  const [activeView, setActiveView] = useState('dashboard') // 'fetcher' or 'dashboard'
+  const router = useAppRouter()
+  const activeView = router.activeView
+  const setActiveView = (view, subPath = '') => router.navigate(view, subPath)
+  const [bgMode, setBgMode] = useState(() => {
+    try {
+      return localStorage.getItem('nexus_bg_mode') || 'particles'
+    } catch {
+      return 'particles'
+    }
+  })
+
+  const handleBgModeChange = (newMode) => {
+    setBgMode(newMode)
+    try {
+      localStorage.setItem('nexus_bg_mode', newMode)
+    } catch {}
+  }
+
   const [url, setUrl] = useState('')
   const [isFetching, setIsFetching] = useState(false)
   const [showResult, setShowResult] = useState(false)
@@ -169,6 +188,21 @@ function App() {
   const [queueRefreshKey, setQueueRefreshKey] = useState(0)
   const [currentVideoId, setCurrentVideoId] = useState(null)
   const currentVideoIdRef = useRef(null)
+
+  // Auto-load video on deep link / direct F5
+  useEffect(() => {
+    if (router.activeView === 'fetcher' && router.subPath) {
+      const videoId = router.subPath.split('/')[0];
+      if (videoId && (!currentVideoIdRef.current || String(currentVideoIdRef.current) !== String(videoId))) {
+        viewSavedVideo(videoId);
+      }
+    } else if (router.activeView === 'dashboard' && router.subPath.startsWith('video/')) {
+      const videoId = router.subPath.replace(/^video\//, '').split('/')[0];
+      if (videoId && (!currentVideoIdRef.current || String(currentVideoIdRef.current) !== String(videoId))) {
+        viewSavedVideo(videoId);
+      }
+    }
+  }, [router.activeView, router.subPath]);
   const [videoTitle, setVideoTitle] = useState('')
   const [currentVideoPromptVersion, setCurrentVideoPromptVersion] = useState('')
   const [currentVideoStatus, setCurrentVideoStatus] = useState('active')
@@ -711,7 +745,7 @@ function App() {
       setAudioTaskProviderId(data.tts_provider_id || 'genmax');
       setRegenerateVoiceId(data.voice_id || selectedVoiceId);
       setShowResult(true);
-      setActiveView('fetcher');
+      setActiveView('fetcher', String(id));
       setCurrentVideoId(id);  // track which video is loaded
       setAudioReview(null);
       setIsCurrentVideoPublished(Boolean(data.is_published));
@@ -1434,6 +1468,8 @@ function App() {
 
   return (
     <div className="app-container">
+      <BackgroundCanvas mode={bgMode} />
+
       {/* Sidebar */}
       <aside className="sidebar">
         <div className="brand">
@@ -1444,32 +1480,37 @@ function App() {
           </div>
         </div>
         <ul className="nav-menu">
-          <li className={`nav-item ${activeView === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveView('dashboard')}>Dashboard</li>
-          <li className={`nav-item ${activeView === 'jobs' ? 'active' : ''}`} onClick={() => setActiveView('jobs')}>Trung tâm Job</li>
-          <li className={`nav-item ${activeView === 'comments' ? 'active' : ''}`} onClick={() => setActiveView('comments')}>Bình luận YouTube</li>
-          <li className={`nav-item ${activeView === 'channels' ? 'active' : ''}`} onClick={() => setActiveView('channels')}>Channel Hub</li>
-          <li className={`nav-item ${activeView === 'crossposter' ? 'active' : ''}`} onClick={() => setActiveView('crossposter')}>Cross-Poster</li>
-          <li className={`nav-item ${activeView === 'fetcher' ? 'active' : ''}`} onClick={() => setActiveView('fetcher')}>Video Fetcher</li>
+          <li className={`nav-item ${activeView === 'dashboard' ? 'active' : ''}`} data-view="dashboard" onClick={() => setActiveView('dashboard')}>Dashboard</li>
+          <li className={`nav-item ${activeView === 'jobs' ? 'active' : ''}`} data-view="jobs" onClick={() => setActiveView('jobs')}>Trung tâm Job</li>
+          <li className={`nav-item ${activeView === 'comments' ? 'active' : ''}`} data-view="comments" onClick={() => setActiveView('comments')}>Bình luận YouTube</li>
+          <li className={`nav-item ${activeView === 'channels' ? 'active' : ''}`} data-view="channels" onClick={() => setActiveView('channels')}>Channel Hub</li>
+          <li className={`nav-item ${activeView === 'crossposter' ? 'active' : ''}`} data-view="crossposter" onClick={() => setActiveView('crossposter')}>Cross-Poster</li>
+          <li className={`nav-item ${activeView === 'fetcher' ? 'active' : ''}`} data-view="fetcher" onClick={() => setActiveView('fetcher')}>Video Fetcher</li>
           <li
             className={`nav-item ${activeView === 'downloader' ? 'active' : ''}`}
+            data-view="downloader"
             onClick={() => setActiveView('downloader')}
           >YouTube Downloader</li>
           <li
             className={`nav-item ${activeView === 'autologin' ? 'active' : ''}`}
+            data-view="autologin"
             aria-disabled={chatGptControlsDisabled}
             onClick={() => !chatGptControlsDisabled && setActiveView('autologin')}
             style={chatGptControlsDisabled ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}
           >Auto Login</li>
           <li
             className={`nav-item ${activeView === 'flowlogin' ? 'active' : ''}`}
+            data-view="flowlogin"
             onClick={() => setActiveView('flowlogin')}
           >Google Flow</li>
           <li
             className={`nav-item ${activeView === 'tts' ? 'active' : ''}`}
+            data-view="tts"
             onClick={() => setActiveView('tts')}
           >Giọng đọc &amp; TTS</li>
           <li
             className={`nav-item ${activeView === 'settings' ? 'active' : ''}`}
+            data-view="settings"
             onClick={() => setActiveView('settings')}
           >Settings</li>
         </ul>
@@ -1478,6 +1519,20 @@ function App() {
       {/* Main Content Area */}
       <main className="main-content">
         <header className="header">
+          <div className="bg-switcher-container" title="Chọn hiệu ứng hình nền động">
+            {BACKGROUND_MODES.map((mode) => (
+              <button
+                key={mode.id}
+                type="button"
+                className={`bg-mode-btn ${bgMode === mode.id ? 'active' : ''}`}
+                onClick={() => handleBgModeChange(mode.id)}
+              >
+                <span className="bg-mode-icon">{mode.icon}</span>
+                <span className="bg-mode-label">{mode.label}</span>
+              </button>
+            ))}
+          </div>
+
           <div className="status-badge">
             <span className="status-dot"></span>
             Ready
@@ -2317,7 +2372,16 @@ function App() {
                                 gap: '10px', flexWrap: 'wrap'
                               }}>
                                 <div>
-                                  <h4 style={{ color: 'var(--accent)', margin: 0 }}>🎬 Video MP4 (Google Flow & Subtitles):</h4>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                    <h4 style={{ color: 'var(--accent)', margin: 0 }}>🎬 Video MP4 (Google Flow & Subtitles):</h4>
+                                    {renderInfo?.has_mp4 && (
+                                      <div className="media-badge-group">
+                                        <span className="media-pill-badge">1080p FHD</span>
+                                        <span className="media-pill-badge">30 FPS</span>
+                                        <span className="media-pill-badge">16:9</span>
+                                      </div>
+                                    )}
+                                  </div>
                                   <div style={{
                                     color: renderInfo?.has_mp4 ? '#2ecc71' : isRendering ? '#f5b041' : (renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed' || renderInfo?.job?.status === 'canceled') ? '#e74c3c' : '#aaa',
                                     fontSize: '0.82em',
@@ -2475,17 +2539,13 @@ function App() {
                                 </div>
                               </div>
                               {renderInfo?.has_mp4 && (
-                                <video
-                                  controls
-                                  src={`http://127.0.0.1:8080/api/videos/${currentVideoId}/download-mp4`}
-                                  style={{
-                                    width: '100%',
-                                    maxHeight: '420px',
-                                    borderRadius: '6px',
-                                    background: '#000',
-                                    marginTop: '8px'
-                                  }}
-                                />
+                                <div className="video-player-wrapper">
+                                  <video
+                                    controls
+                                    className="video-player-element"
+                                    src={`http://127.0.0.1:8080/api/videos/${currentVideoId}/download-mp4`}
+                                  />
+                                </div>
                               )}
                             </div>
                           </div>

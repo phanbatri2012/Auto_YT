@@ -4091,6 +4091,8 @@ def resume_background_jobs() -> None:
         "visual_scene_plan",
         "youtube_upload",
         "youtube_publish",
+        "fb_crosspost",
+        "fb_crosspost_sync",
     ):
         db.recover_interrupted_system_jobs(prod_job)
     _reconcile_active_comment_draft_job_duplicates()

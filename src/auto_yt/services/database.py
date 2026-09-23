@@ -3141,8 +3141,10 @@ def create_system_job(
     tts_provider_id: str = "genmax",
     voice_revision: int = 1,
     voice_snapshot_json: str = "{}",
+    status: str = "queued",
 ) -> dict:
     now = utc_now()
+    initial_progress = "Đang chạy" if status == "running" else "Đang chờ trong hàng đợi"
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     c = conn.cursor()
     c.execute(
@@ -3152,13 +3154,14 @@ def create_system_job(
             result_json, error, prompt_version, voice_id, voice_name,
             tts_provider_id, voice_revision, voice_snapshot_json,
             created_at, updated_at
-        ) VALUES (?, ?, 'queued', ?, ?, ?, '{}', '', ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, '{}', '', ?, ?, ?, ?, ?, ?, ?, ?)
         ''',
         (
             job_id,
             job_type,
+            status,
             title,
-            "Đang chờ trong hàng đợi",
+            initial_progress,
             json.dumps(payload, ensure_ascii=False),
             prompt_version,
             voice_id,
@@ -4524,6 +4527,14 @@ def recalculate_fb_queue_schedule(
         if not rows:
             return 0
 
+        # Phase 1: Reset scheduled_publish_time to 0 for items being recalculated
+        # to prevent intermediate UNIQUE constraint collisions on idx_fb_queue_unique_active_slot
+        placeholders = ",".join("?" for _ in rows)
+        conn.execute(
+            f"UPDATE fb_crossposter_queue SET scheduled_publish_time = 0 WHERE id IN ({placeholders})",
+            [r[0] for r in rows],
+        )
+
         now = datetime.datetime.now()
         now_ts = int(now.timestamp())
         current_date = start_date or now.date()
@@ -4531,9 +4542,13 @@ def recalculate_fb_queue_schedule(
         slot_count = len(time_slots)
         effective_slots_per_day = min(daily_quota, slot_count)
 
-        # 1. Collect all occupied slots (published or already uploaded to Meta Cloud with future publish time)
+        # 1. Collect all occupied slots (published, in-flight, or already uploaded to Meta Cloud with future publish time, excluding rows to be rescheduled)
+        row_ids = [r[0] for r in rows]
         occ_params = [now_ts]
-        occ_where = "WHERE scheduled_publish_time > ? AND ((fb_post_id IS NOT NULL AND fb_post_id != '') OR status = 'published')"
+        id_exclusion_sql = f"AND id NOT IN ({placeholders})"
+        occ_params.extend(row_ids)
+
+        occ_where = f"WHERE scheduled_publish_time > ? {id_exclusion_sql} AND ((fb_post_id IS NOT NULL AND fb_post_id != '') OR status IN ('scheduled', 'downloading', 'uploading', 'verifying', 'processing', 'retryable', 'meta_scheduled', 'schedule_mismatch', 'stalled', 'published'))"
         if target_pid:
             occ_where += " AND target_page_id = ?"
             occ_params.append(target_pid)

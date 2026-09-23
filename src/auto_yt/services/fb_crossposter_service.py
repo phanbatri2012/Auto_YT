@@ -163,10 +163,23 @@ def format_facebook_api_error(err_body: str, code: int = 400) -> str:
     """Format Facebook Graph API error into user-friendly Vietnamese explanation."""
     err_body_clean = str(err_body or "").strip()
     if (
+        "Unsupported get request" in err_body_clean
+        or "Unsupported delete request" in err_body_clean
+        or "does not exist" in err_body_clean
+        or '"error_subcode":33' in err_body_clean
+        or '"error_subcode": 33' in err_body_clean
+        or "GraphMethodException" in err_body_clean
+    ):
+        return (
+            f"Đối tượng Meta (Video ID) không tồn tại hoặc đã bị xóa trên Meta: "
+            f"{security_logging.redact_sensitive(err_body_clean)}"
+        )
+    if (
         "Session has expired" in err_body_clean
         or "Error validating access token" in err_body_clean
         or '"code":190' in err_body_clean
         or '"code": 190' in err_body_clean
+        or "The access token could not be decrypted" in err_body_clean
     ):
         return (
             "Token Facebook của Fanpage đã hết hạn hoặc phiên đăng nhập đã kết thúc. "
@@ -175,7 +188,13 @@ def format_facebook_api_error(err_body: str, code: int = 400) -> str:
     if (
         "No permission to publish" in err_body_clean
         or "pages_manage_posts" in err_body_clean
-        or "permission" in err_body_clean.lower()
+        or "pages_read_engagement" in err_body_clean
+        or '"code":200' in err_body_clean
+        or '"code": 200' in err_body_clean
+        or '"code":10,' in err_body_clean
+        or '"code": 10,' in err_body_clean
+        or '"Permissions error"' in err_body_clean
+        or "not have permission" in err_body_clean.lower()
     ):
         return (
             "Token Fanpage thiếu quyền đăng bài ('pages_manage_posts' hoặc 'pages_read_engagement'). "
@@ -676,6 +695,15 @@ def sync_channel_public_videos(
     with _sync_lock:
         if sync_key in _active_sync_targets:
             logger.info("Channel sync already running for %s, skipping concurrent request.", sync_key)
+            if sys_job_id:
+                try:
+                    db.update_system_job(
+                        sys_job_id,
+                        status="completed",
+                        progress="Bỏ qua vì tiến trình đồng bộ đang chạy song song",
+                    )
+                except Exception:
+                    pass
             return {"inserted": 0, "existing": 0, "total_found": 0, "skipped": True}
         _active_sync_targets.add(sync_key)
 
@@ -691,14 +719,15 @@ def sync_channel_public_videos(
                 job_type="fb_crosspost_sync",
                 title=f"Đồng bộ Kênh YouTube -> FB ({channel_display})",
                 payload={"channel_url": clean_url, "target_page_id": target_page_id, "gpm_profile_id": gpm_profile_id},
+                status="running",
             )
         except Exception as sys_exc:
             logger.warning("Could not register fb_crosspost_sync system_job: %s", sys_exc)
-
-    try:
-        db.update_system_job(sys_job_id, status="running", progress="Đang quét video từ YouTube qua GPM Proxy...")
-    except Exception:
-        pass
+    else:
+        try:
+            db.update_system_job(sys_job_id, status="running", progress="Đang quét video từ YouTube qua GPM Proxy...")
+        except Exception:
+            pass
 
     try:
         ydl_opts: dict[str, Any] = {
@@ -724,17 +753,14 @@ def sync_channel_public_videos(
                 result = ydl.extract_info(clean_url, download=False)
         except Exception as exc:
             logger.error("Failed to extract YouTube channel info: %s", exc)
-            try:
-                db.update_system_job(sys_job_id, status="failed", progress=f"Lỗi quét kênh: {str(exc)[:100]}")
-            except Exception:
-                pass
             raise RuntimeError(f"Không thể quét kênh YouTube: {exc}") from exc
 
         if not result:
-            try:
-                db.update_system_job(sys_job_id, status="completed", progress="Quét xong: không tìm thấy video nào.")
-            except Exception:
-                pass
+            if sys_job_id:
+                try:
+                    db.update_system_job(sys_job_id, status="completed", progress="Quét xong: không tìm thấy video nào.")
+                except Exception:
+                    pass
             return {"inserted": 0, "existing": 0, "total_found": 0}
 
         entries = result.get("entries") or []
@@ -815,20 +841,34 @@ def sync_channel_public_videos(
             "last_synced_at": datetime.datetime.now().isoformat(),
         }, page_id=target_page_id)
 
-        try:
-            db.update_system_job(
-                sys_job_id,
-                status="completed",
-                progress=f"Đã quét xong: tìm thấy {len(valid_entries)} video, thêm {upsert_res['inserted']} video mới",
-            )
-        except Exception:
-            pass
+        if sys_job_id:
+            try:
+                db.update_system_job(
+                    sys_job_id,
+                    status="completed",
+                    progress=f"Đã quét xong: tìm thấy {len(valid_entries)} video, thêm {upsert_res['inserted']} video mới",
+                )
+            except Exception:
+                pass
 
         return {
             "inserted": upsert_res["inserted"],
             "existing": upsert_res["existing"],
             "total_found": len(valid_entries),
         }
+    except Exception as exc:
+        logger.error("Failed during channel sync: %s", exc, exc_info=True)
+        if sys_job_id:
+            try:
+                db.update_system_job(
+                    sys_job_id,
+                    status="failed",
+                    progress=f"Lỗi đồng bộ kênh: {str(exc)[:100]}",
+                    error=str(exc),
+                )
+            except Exception:
+                pass
+        raise RuntimeError(f"Không thể quét/đồng bộ kênh YouTube: {exc}") from exc
     finally:
         with _sync_lock:
             _active_sync_targets.discard(sync_key)
@@ -1543,6 +1583,7 @@ def get_facebook_video_metadata(
     query = urllib.parse.urlencode({
         "fields": (
             "id,title,description,content_tags,custom_labels,scheduled_publish_time,published,status,"
+            "created_time,updated_time,"
             "thumbnails.limit(100){id,is_preferred,uri}"
         ),
     })
@@ -1559,21 +1600,36 @@ def get_facebook_video_metadata(
         with opener.open(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
-        raise _facebook_http_error("Không đọc được metadata video Facebook", error) from error
+        err_body = error.read().decode("utf-8", errors="ignore")
+        if (
+            "Unsupported get request" in err_body
+            or "does not exist" in err_body
+            or '"error_subcode":33' in err_body
+            or '"error_subcode": 33' in err_body
+        ):
+            raise RuntimeError(
+                f"Meta Video ID không tồn tại hoặc đã bị xóa trên Meta (Unsupported get request / does not exist): {security_logging.redact_sensitive(err_body)}"
+            ) from error
+        formatted = format_facebook_api_error(err_body, error.code)
+        raise RuntimeError(f"Không đọc được metadata video Facebook: {formatted}") from error
 
 
-def _parse_meta_scheduled_time(value: Any) -> int:
+def _parse_meta_iso_timestamp(value: Any) -> int:
     if value in (None, ""):
         return 0
     try:
-        return int(value)
-    except (TypeError, ValueError):
-        pass
-    try:
+        if isinstance(value, (int, float)):
+            return int(value)
         parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
         return int(parsed.timestamp())
     except (TypeError, ValueError):
         return 0
+
+
+def _parse_meta_scheduled_time(value: Any) -> int:
+    return _parse_meta_iso_timestamp(value)
 
 
 def _meta_verification_fields(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -1615,6 +1671,22 @@ def inspect_facebook_publication(
         message = "Meta xác nhận video hoặc một pha xử lý đã lỗi"
         return "meta_failed", fields, message
 
+    # Check remote age on Meta to detect stale uploads
+    remote_created_ts = _parse_meta_iso_timestamp(metadata.get("created_time"))
+    remote_updated_ts = _parse_meta_iso_timestamp(metadata.get("updated_time"))
+    remote_age_seconds = 0
+    if remote_updated_ts > 0:
+        remote_age_seconds = max(0, now_ts - remote_updated_ts)
+    elif remote_created_ts > 0:
+        remote_age_seconds = max(0, now_ts - remote_created_ts)
+
+    is_in_processing_phase = (
+        upload_status in {"in_progress", "pending", "processing"}
+        or video_status in {"uploading", "processing", "pending"}
+    )
+    if is_in_processing_phase and remote_age_seconds >= META_PROCESSING_STALE_SECONDS:
+        return "stalled", fields, "Meta đã xử lý/tải lên video quá 2 giờ nhưng chưa tạo lịch/bài hợp lệ"
+
     if requested_schedule:
         schedule_matches = bool(actual_schedule) and abs(actual_schedule - int(requested_schedule)) <= 60
         if published is False and schedule_matches:
@@ -1629,9 +1701,7 @@ def inspect_facebook_publication(
                 fields,
                 f"Meta lưu sai lịch đăng: yêu cầu {requested_schedule}, nhận {actual_schedule}",
             )
-        if upload_status in {"in_progress", "pending", "processing"} or video_status in {
-            "uploading", "processing", "pending"
-        }:
+        if is_in_processing_phase:
             return "processing", fields, "Meta vẫn đang tiếp nhận hoặc xử lý video"
         if published is True and requested_schedule > now_ts:
             return (
@@ -1645,6 +1715,8 @@ def inspect_facebook_publication(
 
     if published is True and is_ready:
         return "published", fields, ""
+    if is_in_processing_phase:
+        return "processing", fields, "Meta đang xử lý video chưa có lịch"
     if metadata.get("id"):
         return "processing", fields, "Meta đang xử lý video chưa có lịch"
     return "missing", fields, "Meta không trả về trạng thái hợp lệ cho video"
@@ -1691,9 +1763,28 @@ def verify_facebook_publication(
     raise RuntimeError(f"Không xác minh được trạng thái Meta: {last_error}")
 
 
-def _meta_state_is_stale(item: dict[str, Any], state: str) -> bool:
+def _meta_state_is_stale(
+    item: dict[str, Any],
+    state: str,
+    metadata: dict[str, Any] | None = None,
+) -> bool:
+    if state != "processing":
+        return False
+
+    now_ts = int(time.time())
+    if metadata:
+        remote_created_ts = _parse_meta_iso_timestamp(metadata.get("created_time"))
+        remote_updated_ts = _parse_meta_iso_timestamp(metadata.get("updated_time"))
+        remote_age = 0
+        if remote_updated_ts > 0:
+            remote_age = max(0, now_ts - remote_updated_ts)
+        elif remote_created_ts > 0:
+            remote_age = max(0, now_ts - remote_created_ts)
+        if remote_age >= META_PROCESSING_STALE_SECONDS:
+            return True
+
     previous_state = str(item.get("meta_state") or "")
-    if state != "processing" or (previous_state and previous_state != state):
+    if previous_state and previous_state != state:
         return False
     raw_since = str(item.get("meta_state_since") or item.get("meta_verified_at") or "").strip()
     if not raw_since:
@@ -1733,7 +1824,13 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
         )
     except Exception as exc:
         safe_error = security_logging.redact_sensitive(exc)
-        if "Unsupported get request" in safe_error or "does not exist" in safe_error:
+        if (
+            "Unsupported get request" in safe_error
+            or "does not exist" in safe_error
+            or "không tồn tại hoặc đã bị xóa" in safe_error
+            or "GraphMethodException" in safe_error
+            or "error_subcode" in safe_error
+        ):
             metadata = {"id": video_id}
             verified_status = "missing"
             fields = _meta_verification_fields(metadata)
@@ -1741,7 +1838,7 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
         else:
             raise
 
-    if _meta_state_is_stale(item, verified_status):
+    if _meta_state_is_stale(item, verified_status, metadata=metadata):
         verified_status = "stalled"
         state_message = "Meta đã xử lý video quá 2 giờ nhưng chưa tạo lịch/bài hợp lệ"
     previous_state = str(item.get("meta_state") or "")
@@ -2000,6 +2097,16 @@ def delete_facebook_video(
         with opener.open(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
+        err_body = error.read().decode("utf-8", errors="ignore")
+        if (
+            "Unsupported delete request" in err_body
+            or "Unsupported get request" in err_body
+            or "does not exist" in err_body
+            or '"error_subcode":33' in err_body
+            or '"error_subcode": 33' in err_body
+            or "GraphMethodException" in err_body
+        ):
+            return {"success": True, "already_deleted": True}
         raise _facebook_http_error("Không xóa được video Facebook cũ", error) from error
 
 
@@ -2063,7 +2170,12 @@ def cleanup_failed_meta_video_and_reschedule(item_id: int) -> dict[str, Any]:
             )
         except Exception as exc:
             safe_error = security_logging.redact_sensitive(exc)
-            if "Unsupported get request" in safe_error or "does not exist" in safe_error:
+            if (
+                "Unsupported get request" in safe_error
+                or "does not exist" in safe_error
+                or "không tồn tại hoặc đã bị xóa" in safe_error
+                or "GraphMethodException" in safe_error
+            ):
                 candidate_state = "missing"
             else:
                 raise
@@ -2090,7 +2202,12 @@ def cleanup_failed_meta_video_and_reschedule(item_id: int) -> dict[str, Any]:
                 )
             except Exception as exc:
                 safe_error = security_logging.redact_sensitive(exc)
-                if "Unsupported get request" in safe_error or "does not exist" in safe_error:
+                if (
+                    "Unsupported get request" in safe_error
+                    or "does not exist" in safe_error
+                    or "không tồn tại hoặc đã bị xóa" in safe_error
+                    or "GraphMethodException" in safe_error
+                ):
                     removed = True
                     break
                 raise
@@ -3151,6 +3268,7 @@ class FbCrossPosterScheduler:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._last_sync_checks: dict[str, float] = {}
+        self._last_sync_failures: dict[str, float] = {}
         self._last_reconcile_checks: dict[str, float] = {}
 
     def start(self):
@@ -3222,8 +3340,12 @@ class FbCrossPosterScheduler:
                 if sync_type == "interval":
                     interval_hours = max(1, settings.get("auto_sync_interval_hours", 6))
                     last_synced_str = settings.get("last_synced_at") or ""
+                    last_fail_ts = self._last_sync_failures.get(page_id, 0.0)
+                    # Failure backoff: wait at least 15 minutes after a failure before retrying
+                    if (now_ts - last_fail_ts) < 900:
+                        should_sync = False
                     # Cooldown guard: never re-trigger within 5 minutes of previous check
-                    if (now_ts - last_check_ts) >= 300:
+                    elif (now_ts - last_check_ts) >= 300:
                         if not last_synced_str:
                             should_sync = True
                         else:
@@ -3250,7 +3372,9 @@ class FbCrossPosterScheduler:
                             sort_order_mode=settings.get("sort_order_mode", "oldest_first"),
                             target_page_id=page_id,
                         )
+                        self._last_sync_failures.pop(page_id, None)
                     except Exception as sync_exc:
+                        self._last_sync_failures[page_id] = now_ts
                         logger.error("Auto-sync failed for Page %s: %s", page_id, sync_exc)
 
             # 2. Auto-Publish Check with Lead-Time Buffer

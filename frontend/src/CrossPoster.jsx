@@ -1,5 +1,6 @@
 import { useEffect, useState, useMemo, useCallback, useRef } from 'react'
 import './CrossPoster.css'
+import { useAppRouter } from './router.js'
 import {
   normalizeYoutubeChannel,
   resolveFacebookPageSelection,
@@ -112,7 +113,10 @@ function normalizeDefaultTags(value) {
     })
 }
 
-export default function CrossPoster() {
+export default function CrossPoster({ subPath = '', segments = [] } = {}) {
+  const router = useAppRouter()
+  const _effectiveSubPath = subPath || (router.activeView === 'crossposter' ? router.subPath : '')
+  const _effectiveSegments = (segments && segments.length > 0) ? segments : (router.activeView === 'crossposter' ? router.segments : [])
   // Campaigns & Active Page Tab
   const [campaigns, setCampaigns] = useState([])
   const [selectedPageId, setSelectedPageId] = useState('')
@@ -954,23 +958,31 @@ export default function CrossPoster() {
 
   return (
     <div className="fb-crossposter-container">
-      {/* Alert Notification Message */}
+      {/* Sticky Alert Notification Toast */}
       {message && (
         <div style={{
-          padding: '12px 18px',
+          position: 'sticky',
+          top: '12px',
+          zIndex: 1000,
+          margin: '0 0 16px 0',
+          padding: '12px 20px',
           borderRadius: '8px',
-          background: messageType === 'error' ? 'rgba(239, 68, 68, 0.15)' : messageType === 'success' ? 'rgba(16, 185, 129, 0.15)' : 'rgba(56, 189, 248, 0.15)',
-          border: `1px solid ${messageType === 'error' ? 'rgba(239, 68, 68, 0.4)' : messageType === 'success' ? 'rgba(16, 185, 129, 0.4)' : 'rgba(56, 189, 248, 0.4)'}`,
-          color: messageType === 'error' ? '#fca5a5' : messageType === 'success' ? '#6ee7b7' : '#7dd3fc',
-          fontSize: '0.9rem',
+          background: messageType === 'error' ? 'rgba(153, 27, 27, 0.95)' : messageType === 'success' ? 'rgba(6, 95, 70, 0.95)' : 'rgba(15, 76, 129, 0.95)',
+          border: `1px solid ${messageType === 'error' ? '#ef4444' : messageType === 'success' ? '#10b981' : '#38bdf8'}`,
+          color: '#ffffff',
+          boxShadow: '0 6px 20px rgba(0, 0, 0, 0.45)',
+          backdropFilter: 'blur(8px)',
+          fontSize: '0.92rem',
+          fontWeight: '500',
           display: 'flex',
           justifyContent: 'space-between',
-          alignItems: 'center'
+          alignItems: 'center',
+          transition: 'all 0.2s ease-in-out'
         }}>
           <span>{message}</span>
           <button
             onClick={() => setMessage('')}
-            style={{ background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', fontSize: '1.1rem' }}
+            style={{ background: 'none', border: 'none', color: '#ffffff', cursor: 'pointer', fontSize: '1.2rem', marginLeft: '12px', lineHeight: 1 }}
           >✕</button>
         </div>
       )}

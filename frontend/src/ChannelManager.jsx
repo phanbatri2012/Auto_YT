@@ -1,11 +1,13 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, useMemo } from 'react'
 import './ChannelManager.css'
+import { useSubRoute } from './router.js'
 import './Settings.css'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const WEEKDAYS = ['Thứ Hai', 'Thứ Ba', 'Thứ Tư', 'Thứ Năm', 'Thứ Sáu', 'Thứ Bảy', 'Chủ Nhật']
 const FB_STORAGE_KEY = 'AUTOYT_FACEBOOK_PAGES'
 const TT_STORAGE_KEY = 'AUTOYT_TIKTOK_ACCOUNTS'
+const VALID_TABS = ['youtube', 'facebook', 'tiktok', 'gpm']
 
 function withoutFacebookSecrets(page) {
   const { access_token: legacyToken, ...safePage } = page || {}
@@ -34,7 +36,20 @@ export default function ChannelManager({
   promptVersions = {},
   activePromptVersion = ''
 }) {
-  const [activeTab, setActiveTab] = useState('youtube') // 'youtube' | 'facebook' | 'tiktok' | 'gpm'
+  const [subRoute, setSubRoute] = useSubRoute('channels', 'youtube')
+  const initialTab = VALID_TABS.includes(subRoute) ? subRoute : 'youtube'
+  const [activeTab, setActiveTabState] = useState(initialTab)
+
+  useEffect(() => {
+    if (subRoute && VALID_TABS.includes(subRoute) && subRoute !== activeTab) {
+      setActiveTabState(subRoute)
+    }
+  }, [subRoute, activeTab])
+
+  const setActiveTab = (tab) => {
+    setActiveTabState(tab)
+    setSubRoute(tab)
+  }
 
   // YouTube States
   const [config, setConfig] = useState({

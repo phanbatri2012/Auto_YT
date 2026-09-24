@@ -4181,7 +4181,11 @@ def get_fb_crossposter_queue(
         rows = conn.execute(f"""
             SELECT * FROM fb_crossposter_queue
             {where_sql}
-            ORDER BY sort_order ASC, id ASC
+            ORDER BY 
+                CASE WHEN scheduled_publish_time > 0 THEN 0 ELSE 1 END,
+                CASE WHEN scheduled_publish_time > 0 THEN scheduled_publish_time ELSE 9999999999 END ASC,
+                sort_order ASC,
+                id ASC
             LIMIT ? OFFSET ?
         """, query_params).fetchall()
 

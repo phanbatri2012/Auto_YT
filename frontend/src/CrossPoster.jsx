@@ -1684,7 +1684,7 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
               queueItems.map((item, idx) => (
                 <tr key={item.id}>
                   <td style={{ color: '#94a3b8', fontWeight: '600' }}>
-                    {item.sort_order || ((page - 1) * pageSize + idx + 1)}
+                    {(page - 1) * pageSize + idx + 1}
                   </td>
                   <td>
                     <img

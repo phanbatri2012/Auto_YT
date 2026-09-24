@@ -69,7 +69,7 @@ export default function YouTubeChannelSettings({
     return []
   }, [gpmConfig.api_url])
 
-  const loadGpm = useCallback(async () => {
+  const loadGpm = useCallback(async (isFocus = false) => {
     try {
       const [configRes, statusRes] = await Promise.all([
         fetch(`${API_BASE}/api/gpm/config`),
@@ -77,7 +77,9 @@ export default function YouTubeChannelSettings({
       ])
       const configData = await configRes.json()
       const statusData = await statusRes.json()
-      setGpmConfig(configData)
+      if (!isFocus) {
+        setGpmConfig(configData)
+      }
       setGpmStatus(statusData)
 
       if (statusData.online) {
@@ -88,7 +90,7 @@ export default function YouTubeChannelSettings({
     }
   }, [loadGpmProfilesList])
 
-  const load = useCallback(async () => {
+  const load = useCallback(async ({ isFocus = false } = {}) => {
     try {
       const [configResponse, channelsResponse] = await Promise.all([
         fetch(`${API_BASE}/api/youtube-comments/oauth/config`),
@@ -96,11 +98,22 @@ export default function YouTubeChannelSettings({
       ])
       const configData = await configResponse.json()
       const channelData = await channelsResponse.json()
-      setConfig(previous => ({
-        ...previous,
-        ...configData,
-        client_secret: ''
-      }))
+      if (!isFocus) {
+        setConfig(previous => ({
+          ...previous,
+          ...configData,
+          client_secret: ''
+        }))
+      } else {
+        setConfig(previous => ({
+          ...previous,
+          redirect_uri: configData.redirect_uri || previous.redirect_uri,
+          client_id: previous.client_id || configData.client_id || '',
+          client_name: previous.client_name || configData.client_name || '',
+          client_secret: previous.client_secret,
+          client_secret_configured: configData.client_secret_configured ?? previous.client_secret_configured
+        }))
+      }
       setOauthConfigs(Array.isArray(configData.items) ? configData.items : [])
       const items = Array.isArray(channelData.items) ? channelData.items : []
       const defaultClientId = configData.client_id || (Array.isArray(configData.items) && configData.items[0]?.client_id) || ''
@@ -109,15 +122,17 @@ export default function YouTubeChannelSettings({
         oauth_client_choice: channel.oauth_client_id || defaultClientId
       })))
       onChannelsChange?.(items)
-      await loadGpm()
+      await loadGpm(isFocus)
     } catch (error) {
-      setMessage(`❌ Không thể đọc cấu hình YouTube: ${error.message}`)
+      if (!isFocus) {
+        setMessage(`❌ Không thể đọc cấu hình YouTube: ${error.message}`)
+      }
     }
   }, [onChannelsChange, loadGpm])
 
   useEffect(() => {
     load()
-    const onFocus = () => load()
+    const onFocus = () => load({ isFocus: true })
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
   }, [load])

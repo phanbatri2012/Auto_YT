@@ -43,3 +43,21 @@ test('ChannelManager renders Unified Profile options grouping Local (Cốc Cốc
   assert.match(channelManagerSource, /Trình duyệt Cốc Cốc \/ Local/)
   assert.match(channelManagerSource, /Profiles GPM-Login/)
 })
+
+test('ChannelManager and YouTubeChannelSettings preserve unsaved form inputs on window focus', () => {
+  const ytSettingsSource = readFileSync(
+    new URL('./YouTubeChannelSettings.jsx', import.meta.url),
+    'utf8'
+  )
+
+  // Verify ChannelManager protects in-progress typing
+  assert.match(channelManagerSource, /onFocus = \(\) => load\(\{ isFocus: true \}\)/)
+  assert.match(channelManagerSource, /client_secret: previous\.client_secret/)
+  assert.match(channelManagerSource, /if \(!isFocus\)\s*\{\s*setGpmConfig\(configData\)/)
+
+  // Verify YouTubeChannelSettings protects in-progress typing
+  assert.match(ytSettingsSource, /onFocus = \(\) => load\(\{ isFocus: true \}\)/)
+  assert.match(ytSettingsSource, /client_secret: previous\.client_secret/)
+  assert.match(ytSettingsSource, /if \(!isFocus\)\s*\{\s*setGpmConfig\(configData\)/)
+})
+

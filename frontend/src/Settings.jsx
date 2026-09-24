@@ -94,7 +94,7 @@ const PUBLISH_CONFIGURATION_LABELS = {
 
 function pipelineDependencies(thumbnailVariant) {
   return {
-    video_render: ['audio', 'chapters'],
+    video_render: ['audio'],
     youtube_upload: [
       'video_render',
       'metadata',

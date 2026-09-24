@@ -505,7 +505,7 @@ class PromptSettingsTests(unittest.TestCase):
         self.assertTrue(resolved["youtube_upload"])
         self.assertTrue(resolved["video_render"])
         self.assertTrue(resolved["metadata"])
-        self.assertTrue(resolved["chapters"])
+        self.assertFalse(resolved["chapters"])
         self.assertTrue(resolved["audio"])
         self.assertTrue(resolved["thumbnail_without_text"])
         self.assertEqual(len(auto_enabled), len(set(auto_enabled)))

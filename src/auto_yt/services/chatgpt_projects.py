@@ -50,7 +50,7 @@ def _pipeline_dependencies(thumbnail_variant: str) -> dict[str, tuple[str, ...]]
         else "thumbnail_without_text"
     )
     return {
-        "video_render": ("audio", "chapters"),
+        "video_render": ("audio",),
         "youtube_upload": ("video_render", "metadata", thumbnail_step),
         "youtube_schedule": ("youtube_upload",),
     }

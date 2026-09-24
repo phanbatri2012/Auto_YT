@@ -1475,6 +1475,7 @@ def save_video(
     tts_provider_id: str = 'genmax',
     voice_revision: int = 1,
     voice_snapshot_json: str = '{}',
+    production_snapshot_json: str = '{}',
 ) -> int:
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
@@ -1483,9 +1484,10 @@ def save_video(
         INSERT INTO videos (
             url, title, transcript, generated_script, created_at, chat_url,
             prompt_version, generated_title, search_text, voice_id, voice_name,
-            tts_provider_id, voice_revision, voice_snapshot_json
+            tts_provider_id, voice_revision, voice_snapshot_json,
+            production_snapshot_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         url,
         title,
@@ -1501,6 +1503,7 @@ def save_video(
         tts_provider_id,
         max(1, int(voice_revision or 1)),
         voice_snapshot_json or '{}',
+        production_snapshot_json or '{}',
     ))
     video_id = c.lastrowid
     conn.commit()

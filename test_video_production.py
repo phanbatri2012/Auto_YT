@@ -213,6 +213,33 @@ class VideoProductionServiceTests(unittest.TestCase):
         )
         self.assertEqual(database.list_system_jobs(limit=None), [])
 
+    def test_save_video_persists_production_snapshot_json(self):
+        snapshot_payload = {
+            "prompt_version": "v_test",
+            "image_generation_settings": {"provider": "google_flow"},
+        }
+        video_id = database.save_video(
+            url="https://www.youtube.com/watch?v=new_snapshot_123",
+            title="Snapshot Title",
+            transcript="Transcript text",
+            generated_script="Generated script content",
+            prompt_version="v_test",
+            voice_id="voice_123",
+            voice_name="test_voice",
+            tts_provider_id="omnivoice",
+            voice_revision=2,
+            voice_snapshot_json='{"voice_id": "voice_123"}',
+            production_snapshot_json=json.dumps(snapshot_payload),
+        )
+
+        video = database.get_video(video_id)
+        self.assertEqual(
+            json.loads(video["production_snapshot_json"]),
+            snapshot_payload,
+        )
+        self.assertEqual(video["tts_provider_id"], "omnivoice")
+        self.assertEqual(video["voice_revision"], 2)
+
     def test_forbidden_privacy_setting_is_classified_as_audit_restriction(self):
         payload = {
             "error": {

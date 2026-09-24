@@ -966,10 +966,12 @@ def _segment_filter(
     x_expression = "iw/2-(iw/zoom/2)" if direction > 0 else "0"
     fade_duration = min(0.35, max(0.1, duration / 4))
     fade_out_start = max(0.0, duration - fade_duration)
+    max_zoom = 1.065
+    zoom_step = (max_zoom - 1.0) / max(1, frames)
     filters = [
         f"[0:v]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase,"
         f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},"
-        f"zoompan=z='min(zoom+0.00015,1.06)':x='{x_expression}':y='ih/2-(ih/zoom/2)':d={frames}:"
+        f"zoompan=z='min(zoom+{zoom_step:.7f},{max_zoom:.3f})':x='{x_expression}':y='ih/2-(ih/zoom/2)':d={frames}:"
         f"s={TARGET_WIDTH}x{TARGET_HEIGHT}:fps={TARGET_FPS},"
         f"trim=duration={duration:.3f},setpts=PTS-STARTPTS,"
         f"fade=t=in:st=0:d={fade_duration:.3f},"

@@ -666,6 +666,31 @@ class VideoProductionServiceTests(unittest.TestCase):
             self.assertTrue(kwargs.get("force_new_project"))
 
 
+    def test_segment_filter_zoompan_adaptive_speed(self):
+        # 1. Test 30s scene (900 frames at 30 FPS)
+        scene_30s = {"duration": 30.0, "start": 0.0, "end": 30.0}
+        filter_graph_30s, label_30s = video_production._segment_filter(
+            scene=scene_30s,
+            scene_index=0,
+            subtitle_path=None,
+        )
+        self.assertEqual(label_30s, "current")
+        self.assertIn("d=900", filter_graph_30s)
+        self.assertIn("zoompan=z='min(zoom+0.0000722,1.065)'", filter_graph_30s)
+        self.assertIn("x='iw/2-(iw/zoom/2)'", filter_graph_30s)
+
+        # 2. Test 10s scene (300 frames at 30 FPS) with scene_index=1 (direction drift)
+        scene_10s = {"duration": 10.0, "start": 30.0, "end": 40.0}
+        filter_graph_10s, label_10s = video_production._segment_filter(
+            scene=scene_10s,
+            scene_index=1,
+            subtitle_path=None,
+        )
+        self.assertIn("d=300", filter_graph_10s)
+        self.assertIn("zoompan=z='min(zoom+0.0002167,1.065)'", filter_graph_10s)
+        self.assertIn("x='0'", filter_graph_10s)
+
+
 if __name__ == "__main__":
     unittest.main()
 

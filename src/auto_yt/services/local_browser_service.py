@@ -420,7 +420,7 @@ async def local_browser_session(
     playwright = await playwright_cm.start()
     browser = None
     try:
-        browser = await playwright.chromium.connect_over_cdp(endpoint_url)
+        browser = await playwright.chromium.connect_over_cdp(endpoint_url, timeout=10000)
         contexts = browser.contexts
         context = contexts[0] if contexts else await browser.new_context()
         yield context, browser

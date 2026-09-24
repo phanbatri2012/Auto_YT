@@ -295,18 +295,23 @@ export default function ChannelManager({
     }
     setGpmBusy(true)
     setMessage(`⏳ Đang mở trình duyệt cho ${platform.toUpperCase()}...`)
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 20000)
     try {
       const res = await fetch(`${API_BASE}/api/channels/open-browser`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile_id: profileId, platform })
+        body: JSON.stringify({ profile_id: profileId, platform }),
+        signal: controller.signal
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
       setMessage(`🚀 ${data.message || 'Đã mở trình duyệt thành công. Bạn hãy đăng nhập nếu cần rồi bấm Quét kênh.'}`)
     } catch (error) {
-      setMessage(`❌ Lỗi khi mở trình duyệt: ${error.message}`)
+      const errMsg = error.name === 'AbortError' ? 'Hết thời gian chờ mở trình duyệt (Timeout 20s)' : error.message
+      setMessage(`❌ Lỗi khi mở trình duyệt: ${errMsg}`)
     } finally {
+      clearTimeout(timeoutId)
       setGpmBusy(false)
     }
   }
@@ -318,11 +323,14 @@ export default function ChannelManager({
     }
     setScanningPlatform('youtube')
     setMessage('⏳ Đang kết nối CDP và quét thông tin kênh YouTube Studio...')
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 25000)
     try {
       const res = await fetch(`${API_BASE}/api/channels/scan/youtube`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile_id: profileId, auto_save: true })
+        body: JSON.stringify({ profile_id: profileId, auto_save: true }),
+        signal: controller.signal
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
@@ -334,8 +342,10 @@ export default function ChannelManager({
         setMessage(`⚠️ ${data.message || 'Không thể nhận diện kênh YouTube. Hãy mở trình duyệt và đăng nhập trước.'}`)
       }
     } catch (error) {
-      setMessage(`❌ Lỗi quét YouTube: ${error.message}`)
+      const errMsg = error.name === 'AbortError' ? 'Hết thời gian quét kênh (Timeout 25s). Vui lòng đảm bảo đã bấm Bước 2 để mở trình duyệt.' : error.message
+      setMessage(`❌ Lỗi quét YouTube: ${errMsg}`)
     } finally {
+      clearTimeout(timeoutId)
       setScanningPlatform(null)
     }
   }
@@ -347,11 +357,14 @@ export default function ChannelManager({
     }
     setScanningPlatform('facebook')
     setMessage('⏳ Đang kết nối CDP và quét danh sách Fanpage Facebook...')
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 25000)
     try {
       const res = await fetch(`${API_BASE}/api/channels/scan/facebook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile_id: profileId })
+        body: JSON.stringify({ profile_id: profileId }),
+        signal: controller.signal
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
@@ -364,8 +377,10 @@ export default function ChannelManager({
         setMessage(`⚠️ ${data.message || 'Chưa đăng nhập Facebook trong trình duyệt.'}`)
       }
     } catch (error) {
-      setMessage(`❌ Lỗi quét Facebook: ${error.message}`)
+      const errMsg = error.name === 'AbortError' ? 'Hết thời gian quét Fanpage (Timeout 25s)' : error.message
+      setMessage(`❌ Lỗi quét Facebook: ${errMsg}`)
     } finally {
+      clearTimeout(timeoutId)
       setScanningPlatform(null)
     }
   }
@@ -387,11 +402,14 @@ export default function ChannelManager({
     }
     setScanningPlatform('tiktok')
     setMessage('⏳ Đang kết nối CDP và quét Kênh TikTok...')
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 25000)
     try {
       const res = await fetch(`${API_BASE}/api/channels/scan/tiktok`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile_id: profileId })
+        body: JSON.stringify({ profile_id: profileId }),
+        signal: controller.signal
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
@@ -402,8 +420,10 @@ export default function ChannelManager({
         setMessage(`⚠️ ${data.message || 'Chưa đăng nhập TikTok trong trình duyệt.'}`)
       }
     } catch (error) {
-      setMessage(`❌ Lỗi quét TikTok: ${error.message}`)
+      const errMsg = error.name === 'AbortError' ? 'Hết thời gian quét TikTok (Timeout 25s)' : error.message
+      setMessage(`❌ Lỗi quét TikTok: ${errMsg}`)
     } finally {
+      clearTimeout(timeoutId)
       setScanningPlatform(null)
     }
   }

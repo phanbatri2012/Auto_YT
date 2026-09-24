@@ -299,7 +299,12 @@ def find_running_gpm_profile_coordinates(
 
     if sys.platform == "win32":
         try:
-            ps_cmd = "$ErrorActionPreference='SilentlyContinue'; Get-CimInstance Win32_Process -Filter \"Name = 'chrome.exe'\" | Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"
+            ps_cmd = (
+                "$ErrorActionPreference='SilentlyContinue'; "
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.Name -like '*chrome*' -or $_.Name -like '*gpm*' -or $_.Name -like '*msedge*' -or $_.Name -like '*coccoc*' } | "
+                "Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"
+            )
             res = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
                 capture_output=True,
@@ -617,13 +622,18 @@ async def gpm_browser_session(
 
     ws_url = str(launch_info.get("websocket_debugging_url") or "").strip()
     remote_port = launch_info.get("remote_debugging_port")
+    if not remote_port and not ws_url:
+        raise GpmProfileLaunchError(
+            f"Không tìm thấy cổng kết nối CDP cho Profile GPM '{profile_id}'. "
+            "Hãy đảm bảo Profile đã được bật hoặc khởi chạy qua hệ thống."
+        )
     endpoint_url = ws_url if ws_url else f"http://127.0.0.1:{remote_port}"
 
     playwright_cm = async_playwright()
     playwright = await playwright_cm.start()
     browser = None
     try:
-        browser = await playwright.chromium.connect_over_cdp(endpoint_url)
+        browser = await playwright.chromium.connect_over_cdp(endpoint_url, timeout=10000)
         contexts = browser.contexts
         if contexts:
             context = contexts[0]

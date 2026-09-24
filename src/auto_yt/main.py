@@ -265,7 +265,12 @@ class ChatGPTBrowserServiceStatus(BaseModel):
     message: str = ""
 
 class PromptPipelineData(BaseModel):
-    metadata: bool = True
+    title: bool = True
+    slug: bool = True
+    description: bool = True
+    tags: bool = True
+    pinned_comment: bool = True
+    quiz: bool = True
     chapters: bool = True
     thumbnail_with_text: bool = True
     thumbnail_without_text: bool = True
@@ -273,6 +278,7 @@ class PromptPipelineData(BaseModel):
     video_render: bool = False
     youtube_upload: bool = False
     youtube_schedule: bool = False
+    metadata: Optional[bool] = None
 
     model_config = ConfigDict(extra="allow")
 
@@ -302,6 +308,9 @@ class PromptPublishingData(BaseModel):
     made_for_kids: Optional[bool] = None
     notify_subscribers: bool = True
     contains_synthetic_media: bool = True
+    description_template: str = Field(
+        default="{description}\n\n{chapters}\n\n{tags}", max_length=5000
+    )
 
     model_config = ConfigDict(extra="allow")
 
@@ -6488,8 +6497,24 @@ class GenerateChaptersRequest(BaseModel):
     video_id: int
 
 
+class GenerateComponentRequest(BaseModel):
+    video_id: int
+
+
 class GenerateMetadataRequest(BaseModel):
     video_id: int
+
+
+def replace_script_section(script: str, section_tag: str, new_content: str) -> str:
+    pattern = rf"### \[{re.escape(section_tag)}\]\n(.*?)(?=\n### \[|\Z)"
+    new_section = f"### [{section_tag}]\n{new_content.strip()}"
+    if re.search(pattern, script, flags=re.DOTALL):
+        return re.sub(pattern, new_section, script, flags=re.DOTALL)
+    insert_before_match = re.search(r"\n### \[(?:CHAPTERS|THUMBNAIL)", script)
+    if insert_before_match:
+        pos = insert_before_match.start()
+        return f"{script[:pos].rstrip()}\n\n{new_section}\n\n{script[pos:].lstrip()}"
+    return f"{script.rstrip()}\n\n{new_section}"
 
 
 def replace_metadata_section(
@@ -6502,7 +6527,7 @@ def replace_metadata_section(
         flags=re.DOTALL,
     )
     if not metadata_match:
-        raise RuntimeError("Video script does not contain METADATA & QUIZ.")
+        return replace_script_section(script, "METADATA & QUIZ", metadata)
 
     return (
         script[:metadata_match.start(1)]
@@ -6510,6 +6535,167 @@ def replace_metadata_section(
         + "\n"
         + script[metadata_match.end(1):]
     )
+
+
+@app.post("/api/generate-title")
+async def generate_title_endpoint(req: GenerateComponentRequest):
+    from auto_yt.services.chatgpt_worker import generate_title_only
+    video = _require_actionable_video(req.video_id)
+    if not _try_start_chatgpt_operation("title", video.get("prompt_version", ""), req.video_id):
+        return {"success": False, "error": CHATGPT_BUSY_ERROR}
+    try:
+        loop = asyncio.get_event_loop()
+        title = await loop.run_in_executor(
+            None,
+            lambda: generate_title_only(video.get("chat_url", ""), video.get("prompt_version", ""))
+        )
+        latest_video = _require_actionable_video(req.video_id)
+        updated_script = replace_script_section(latest_video["generated_script"], "TIÊU ĐỀ", title)
+        if not db.update_script(req.video_id, updated_script):
+            raise RuntimeError("Video not found")
+        return {"success": True, "video_id": req.video_id, "title": title, "script": updated_script}
+    except Exception as exc:
+        print(f"Error in generate_title_endpoint: {exc}", file=sys.stderr)
+        return {"success": False, "error": security_logging.redact_sensitive(exc)}
+    finally:
+        _finish_chatgpt_operation()
+
+
+@app.post("/api/generate-slug")
+async def generate_slug_endpoint(req: GenerateComponentRequest):
+    from auto_yt.services.chatgpt_worker import generate_slug_only
+    video = _require_actionable_video(req.video_id)
+    if not _try_start_chatgpt_operation("slug", video.get("prompt_version", ""), req.video_id):
+        return {"success": False, "error": CHATGPT_BUSY_ERROR}
+    try:
+        loop = asyncio.get_event_loop()
+        slug = await loop.run_in_executor(
+            None,
+            lambda: generate_slug_only(video.get("chat_url", ""), video.get("prompt_version", ""))
+        )
+        latest_video = _require_actionable_video(req.video_id)
+        updated_script = replace_script_section(latest_video["generated_script"], "SLUG", slug)
+        if not db.update_script(req.video_id, updated_script):
+            raise RuntimeError("Video not found")
+        return {"success": True, "video_id": req.video_id, "slug": slug, "script": updated_script}
+    except Exception as exc:
+        print(f"Error in generate_slug_endpoint: {exc}", file=sys.stderr)
+        return {"success": False, "error": security_logging.redact_sensitive(exc)}
+    finally:
+        _finish_chatgpt_operation()
+
+
+@app.post("/api/generate-description")
+async def generate_description_endpoint(req: GenerateComponentRequest):
+    from auto_yt.services.chatgpt_worker import generate_description_only
+    video = _require_actionable_video(req.video_id)
+    if not _try_start_chatgpt_operation("description", video.get("prompt_version", ""), req.video_id):
+        return {"success": False, "error": CHATGPT_BUSY_ERROR}
+    try:
+        loop = asyncio.get_event_loop()
+        description = await loop.run_in_executor(
+            None,
+            lambda: generate_description_only(video.get("chat_url", ""), video.get("prompt_version", ""))
+        )
+        latest_video = _require_actionable_video(req.video_id)
+        updated_script = replace_script_section(latest_video["generated_script"], "MÔ TẢ", description)
+        if not db.update_script(req.video_id, updated_script):
+            raise RuntimeError("Video not found")
+        return {"success": True, "video_id": req.video_id, "description": description, "script": updated_script}
+    except Exception as exc:
+        print(f"Error in generate_description_endpoint: {exc}", file=sys.stderr)
+        return {"success": False, "error": security_logging.redact_sensitive(exc)}
+    finally:
+        _finish_chatgpt_operation()
+
+
+@app.post("/api/generate-tags")
+async def generate_tags_endpoint(req: GenerateComponentRequest):
+    from auto_yt.services.chatgpt_worker import generate_tags_only
+    video = _require_actionable_video(req.video_id)
+    if not _try_start_chatgpt_operation("tags", video.get("prompt_version", ""), req.video_id):
+        return {"success": False, "error": CHATGPT_BUSY_ERROR}
+    try:
+        loop = asyncio.get_event_loop()
+        tags = await loop.run_in_executor(
+            None,
+            lambda: generate_tags_only(video.get("chat_url", ""), video.get("prompt_version", ""))
+        )
+        latest_video = _require_actionable_video(req.video_id)
+        updated_script = replace_script_section(latest_video["generated_script"], "TAGS", tags)
+        if not db.update_script(req.video_id, updated_script):
+            raise RuntimeError("Video not found")
+        return {"success": True, "video_id": req.video_id, "tags": tags, "script": updated_script}
+    except Exception as exc:
+        print(f"Error in generate_tags_endpoint: {exc}", file=sys.stderr)
+        return {"success": False, "error": security_logging.redact_sensitive(exc)}
+    finally:
+        _finish_chatgpt_operation()
+
+
+@app.post("/api/generate-pinned-comment")
+async def generate_pinned_comment_endpoint(req: GenerateComponentRequest):
+    from auto_yt.services.chatgpt_worker import generate_pinned_comment_only
+    video = _require_actionable_video(req.video_id)
+    if not _try_start_chatgpt_operation("pinned_comment", video.get("prompt_version", ""), req.video_id):
+        return {"success": False, "error": CHATGPT_BUSY_ERROR}
+    try:
+        loop = asyncio.get_event_loop()
+        pinned = await loop.run_in_executor(
+            None,
+            lambda: generate_pinned_comment_only(video.get("chat_url", ""), video.get("prompt_version", ""))
+        )
+        latest_video = _require_actionable_video(req.video_id)
+        updated_script = replace_script_section(latest_video["generated_script"], "BÌNH LUẬN GHIM", pinned)
+        if not db.update_script(req.video_id, updated_script):
+            raise RuntimeError("Video not found")
+        return {"success": True, "video_id": req.video_id, "pinned_comment": pinned, "script": updated_script}
+    except Exception as exc:
+        print(f"Error in generate_pinned_comment_endpoint: {exc}", file=sys.stderr)
+        return {"success": False, "error": security_logging.redact_sensitive(exc)}
+    finally:
+        _finish_chatgpt_operation()
+
+
+@app.post("/api/generate-quiz")
+async def generate_quiz_endpoint(req: GenerateComponentRequest):
+    from auto_yt.services.chatgpt_worker import generate_quiz_only
+    video = _require_actionable_video(req.video_id)
+    if not _try_start_chatgpt_operation("quiz", video.get("prompt_version", ""), req.video_id):
+        return {"success": False, "error": CHATGPT_BUSY_ERROR}
+    try:
+        loop = asyncio.get_event_loop()
+        quiz = await loop.run_in_executor(
+            None,
+            lambda: generate_quiz_only(video.get("chat_url", ""), video.get("prompt_version", ""))
+        )
+        latest_video = _require_actionable_video(req.video_id)
+        updated_script = replace_script_section(latest_video["generated_script"], "QUIZ", quiz)
+        if not db.update_script(req.video_id, updated_script):
+            raise RuntimeError("Video not found")
+        return {"success": True, "video_id": req.video_id, "quiz": quiz, "script": updated_script}
+    except Exception as exc:
+        print(f"Error in generate_quiz_endpoint: {exc}", file=sys.stderr)
+        return {"success": False, "error": security_logging.redact_sensitive(exc)}
+    finally:
+        _finish_chatgpt_operation()
+
+
+@app.get("/api/videos/{video_id}/youtube-description-preview")
+async def preview_youtube_description_endpoint(video_id: int):
+    from auto_yt.services.youtube_publisher import build_actual_youtube_description
+    video = _require_actionable_video(video_id)
+    prompt_version = video.get("prompt_version", "") or "default"
+    prompts_data = _read_prompts_config()
+    version_config = prompts_data.get("versions", {}).get(prompt_version, {})
+    publishing_settings = version_config.get("publishing_settings", {})
+    actual_description = build_actual_youtube_description(video, publishing_settings)
+    return {
+        "success": True,
+        "video_id": video_id,
+        "actual_description": actual_description,
+        "template": publishing_settings.get("description_template", "{description}\n\n{chapters}\n\n{tags}")
+    }
 
 
 @app.post("/api/generate-metadata")
@@ -8433,7 +8619,7 @@ def save_prompt_pipeline(version_id: str, payload: PromptPipelineData):
         thumbnail_variant = chatgpt_projects.normalize_image_generation_settings(
             version.get("image_generation_settings")
         )["thumbnail_variant"]
-        requested_pipeline = payload.model_dump()
+        requested_pipeline = payload.model_dump(exclude_none=True)
         validated_pipeline = chatgpt_projects.validate_prompt_pipeline(
             requested_pipeline,
             thumbnail_variant,

@@ -370,7 +370,12 @@ class PromptSettingsTests(unittest.TestCase):
     def test_pipeline_save_only_changes_selected_prompt_version(self):
         before = main._read_prompts_config()
         pipeline = {
-            "metadata": True,
+            "title": True,
+            "slug": True,
+            "description": True,
+            "tags": True,
+            "pinned_comment": True,
+            "quiz": True,
             "chapters": False,
             "thumbnail_with_text": True,
             "thumbnail_without_text": False,
@@ -493,7 +498,12 @@ class PromptSettingsTests(unittest.TestCase):
         resolved, auto_enabled = chatgpt_projects.resolve_prompt_pipeline_dependencies(
             {
                 **chatgpt_projects.DEFAULT_PROMPT_PIPELINE,
-                "metadata": False,
+                "title": False,
+                "slug": False,
+                "description": False,
+                "tags": False,
+                "pinned_comment": False,
+                "quiz": False,
                 "chapters": False,
                 "thumbnail_without_text": False,
                 "audio": False,
@@ -504,7 +514,9 @@ class PromptSettingsTests(unittest.TestCase):
 
         self.assertTrue(resolved["youtube_upload"])
         self.assertTrue(resolved["video_render"])
-        self.assertTrue(resolved["metadata"])
+        self.assertTrue(resolved["title"])
+        self.assertTrue(resolved["description"])
+        self.assertTrue(resolved["tags"])
         self.assertFalse(resolved["chapters"])
         self.assertTrue(resolved["audio"])
         self.assertTrue(resolved["thumbnail_without_text"])

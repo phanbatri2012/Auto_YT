@@ -2,7 +2,12 @@ import { useState, useEffect } from 'react';
 import './Settings.css';
 
 const DEFAULT_PIPELINE = {
-  metadata: true,
+  title: true,
+  slug: true,
+  description: true,
+  tags: true,
+  pinned_comment: true,
+  quiz: true,
   chapters: true,
   thumbnail_with_text: true,
   thumbnail_without_text: true,
@@ -27,14 +32,40 @@ const DEFAULT_PUBLISHING_SETTINGS = {
   language: 'vi',
   made_for_kids: null,
   notify_subscribers: true,
-  contains_synthetic_media: true
+  contains_synthetic_media: true,
+  description_template: ''
 };
 
 const PIPELINE_STEPS = [
   {
-    key: 'metadata',
-    label: 'Metadata & Quiz',
-    description: 'Tự động tạo tiêu đề, slug, mô tả, hashtag, bình luận ghim và quiz.'
+    key: 'title',
+    label: 'Tiêu đề (Title)',
+    description: 'Tự động tạo các phương án tiêu đề hấp dẫn.'
+  },
+  {
+    key: 'slug',
+    label: 'URL Slug',
+    description: 'Tự động tạo slug để đặt tên file MP4 khi render.'
+  },
+  {
+    key: 'description',
+    label: 'Mô tả tóm tắt (Description)',
+    description: 'Tự động tạo đoạn mô tả video chuẩn SEO.'
+  },
+  {
+    key: 'tags',
+    label: 'Tags & Hashtags',
+    description: 'Tự động tạo tags và hashtags liên quan.'
+  },
+  {
+    key: 'pinned_comment',
+    label: 'Bình luận ghim',
+    description: 'Tự động tạo nội dung bình luận ghim tương tác.'
+  },
+  {
+    key: 'quiz',
+    label: 'Quiz tương tác',
+    description: 'Tự động tạo câu hỏi trắc nghiệm tương tác cho khán giả.'
   },
   {
     key: 'chapters',
@@ -59,7 +90,7 @@ const PIPELINE_STEPS = [
   {
     key: 'video_render',
     label: 'Dựng MP4',
-    description: 'Lập cảnh theo SRT, tạo ảnh RealVisXL/IP-Adapter và dựng MP4 1080p.'
+    description: 'Lập cảnh theo SRT, tạo ảnh Google Flow và dựng MP4 1080p.'
   },
   {
     key: 'youtube_upload',
@@ -97,7 +128,9 @@ function pipelineDependencies(thumbnailVariant) {
     video_render: ['audio'],
     youtube_upload: [
       'video_render',
-      'metadata',
+      'title',
+      'description',
+      'tags',
       thumbnailVariant === 'with_text'
         ? 'thumbnail_with_text'
         : 'thumbnail_without_text'
@@ -978,10 +1011,15 @@ export default function Settings({
     { key: 'intro', label: '2. Mở đầu (Intro)' },
     { key: 'body', label: '3. Nội dung chính (Body)', help: 'Biến có sẵn: {part}' },
     { key: 'outro', label: '4. Kết thúc (Outro)' },
-    { key: 'metadata', label: '5. Tiêu đề, Mô tả & Quiz (Metadata)' },
-    { key: 'chapters', label: '6. Phân đoạn (Chapters)' },
-    { key: 'thumb_text', label: '7. Thumbnail (Có chữ)' },
-    { key: 'thumb_notext', label: '8. Thumbnail (Không chữ)' },
+    { key: 'title', label: '5. Tiêu đề (Title)' },
+    { key: 'slug', label: '6. URL Slug (Dùng đặt tên file render MP4)' },
+    { key: 'description', label: '7. Mô tả video (Description)' },
+    { key: 'tags', label: '8. Tags & Hashtags' },
+    { key: 'pinned_comment', label: '9. Bình luận ghim' },
+    { key: 'quiz', label: '10. Quiz tương tác' },
+    { key: 'chapters', label: '11. Phân đoạn (Chapters)' },
+    { key: 'thumb_text', label: '12. Thumbnail (Có chữ)' },
+    { key: 'thumb_notext', label: '13. Thumbnail (Không chữ)' },
   ];
 
 
@@ -1746,6 +1784,53 @@ export default function Settings({
               /> Thông báo người đăng ký khi video được công khai
             </label>
             <span style={{ color: '#4dd0e1' }}>✓ Luôn khai báo nội dung tổng hợp bằng AI</span>
+          </div>
+          <div style={{ marginTop: 16, paddingTop: 14, borderTop: '1px solid rgba(255, 255, 255, 0.1)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, flexWrap: 'wrap', gap: 8 }}>
+              <label style={{ fontWeight: 600, color: '#fff', margin: 0 }}>
+                📝 Mẫu mô tả YouTube thực tế (Description Template)
+              </label>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                {[
+                  { tag: '{title}', label: '+ Tiêu đề' },
+                  { tag: '{slug}', label: '+ Slug' },
+                  { tag: '{description}', label: '+ Mô tả' },
+                  { tag: '{tags}', label: '+ Tags' },
+                  { tag: '{pinned_comment}', label: '+ Ghim' },
+                  { tag: '{quiz}', label: '+ Quiz' },
+                  { tag: '{chapters}', label: '+ Chapters' }
+                ].map(item => (
+                  <button
+                    key={item.tag}
+                    type="button"
+                    className="btn-secondary"
+                    style={{ padding: '2px 8px', fontSize: '0.75rem', borderRadius: '4px' }}
+                    onClick={() => {
+                      const currentTpl = currentPublishing.description_template || '';
+                      const nextTpl = currentTpl ? `${currentTpl}\n\n${item.tag}` : item.tag;
+                      handlePromptSettingChange('publishing_settings', 'description_template', nextTpl);
+                    }}
+                    disabled={activeVersionLocked}
+                    title={`Chèn biến ${item.tag}`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="help-text" style={{ marginBottom: 8 }}>
+              Tùy biến nội dung mô tả sẽ được dùng khi upload lên YouTube. Nhấp các nút trên để chèn nhanh biến động. Nếu để trống, hệ thống sẽ tự động ghép theo thứ tự mặc định: Mô tả → Chapters → Tags.
+            </div>
+            <textarea
+              className="prompt-textarea"
+              rows={6}
+              value={currentPublishing.description_template || ''}
+              onChange={event => handlePromptSettingChange(
+                'publishing_settings', 'description_template', event.target.value
+              )}
+              placeholder="Ví dụ:\n{description}\n\n--- DANH SÁCH PHÂN ĐOẠN ---\n{chapters}\n\n--- TƯƠNG TÁC CÙNG KÊNH ---\n{pinned_comment}\n\n{quiz}\n\n{tags}"
+              disabled={activeVersionLocked}
+            />
           </div>
           {currentPipeline.youtube_schedule && (
             <div className="help-text" style={{ marginTop: 10, color: '#f5b041' }}>

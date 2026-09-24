@@ -37,7 +37,35 @@ METADATA_FIELD_LABELS = GENERATED_TITLE_LABELS | GENERATED_DESCRIPTION_LABELS | 
     "CHAPTERS",
 }
 METADATA_SECTION_PATTERN = re.compile(
-    r"### \[METADATA & QUIZ\]\n(.*?)(?=\n### \[|\Z)",
+    r"### \[(?:METADATA & QUIZ|METADATA)\]\n(.*?)(?=\n### \[|\Z)",
+    flags=re.DOTALL,
+)
+TITLE_SECTION_PATTERN = re.compile(
+    r"### \[(?:TIÊU ĐỀ|TITLE|TIÊU ĐỀ VIDEO)\]\n(.*?)(?=\n### \[|\Z)",
+    flags=re.DOTALL,
+)
+SLUG_SECTION_PATTERN = re.compile(
+    r"### \[(?:SLUG|URL SLUG)\]\n(.*?)(?=\n### \[|\Z)",
+    flags=re.DOTALL,
+)
+DESCRIPTION_SECTION_PATTERN = re.compile(
+    r"### \[(?:MÔ TẢ|DESCRIPTION|MÔ TẢ VIDEO)\]\n(.*?)(?=\n### \[|\Z)",
+    flags=re.DOTALL,
+)
+TAGS_SECTION_PATTERN = re.compile(
+    r"### \[(?:TAGS|HASHTAG|HASHTAGS|TAG)\]\n(.*?)(?=\n### \[|\Z)",
+    flags=re.DOTALL,
+)
+PINNED_COMMENT_SECTION_PATTERN = re.compile(
+    r"### \[(?:BÌNH LUẬN GHIM|PINNED COMMENT|PINNED_COMMENT)\]\n(.*?)(?=\n### \[|\Z)",
+    flags=re.DOTALL,
+)
+QUIZ_SECTION_PATTERN = re.compile(
+    r"### \[(?:QUIZ|QUIZ TƯƠNG TÁC)\]\n(.*?)(?=\n### \[|\Z)",
+    flags=re.DOTALL,
+)
+CHAPTERS_SECTION_PATTERN = re.compile(
+    r"### \[(?:CHAPTERS|PHÂN ĐOẠN|CHAPTER)\]\n(.*?)(?=\n### \[|\Z)",
     flags=re.DOTALL,
 )
 
@@ -63,6 +91,21 @@ def _clean_generated_title(value: str) -> str:
 def extract_generated_video_title(generated_script: str) -> str:
     if not generated_script:
         return ""
+
+    title_match = TITLE_SECTION_PATTERN.search(generated_script)
+    if title_match:
+        content = title_match.group(1).strip()
+        lines = [l.strip() for l in content.splitlines() if l.strip()]
+        for line in lines:
+            line_clean = line.strip("#*` ")
+            label, separator, inline_value = line_clean.partition(":")
+            if separator and _normalize_metadata_label(label) in GENERATED_TITLE_LABELS:
+                title = _clean_generated_title(inline_value)
+                if title:
+                    return title
+            cleaned = _clean_generated_title(line_clean)
+            if cleaned:
+                return cleaned
 
     metadata_match = METADATA_SECTION_PATTERN.search(generated_script)
     metadata = metadata_match.group(1) if metadata_match else generated_script
@@ -98,6 +141,23 @@ def extract_generated_video_description(generated_script: str) -> str:
     if not generated_script:
         return ""
 
+    desc_match = DESCRIPTION_SECTION_PATTERN.search(generated_script)
+    if desc_match:
+        content = desc_match.group(1).strip()
+        lines = [l.strip() for l in content.splitlines() if l.strip()]
+        desc_lines = []
+        for line in lines:
+            line_clean = line.strip("#*` ")
+            label, separator, inline_value = line_clean.partition(":")
+            if separator and _normalize_metadata_label(label) in GENERATED_DESCRIPTION_LABELS:
+                if inline_value.strip():
+                    desc_lines.append(inline_value.strip())
+            else:
+                desc_lines.append(line)
+        result = "\n".join(desc_lines).strip()
+        if result:
+            return result
+
     metadata_match = METADATA_SECTION_PATTERN.search(generated_script)
     metadata = metadata_match.group(1) if metadata_match else generated_script
     lines = metadata.splitlines()
@@ -129,6 +189,175 @@ def extract_generated_video_description(generated_script: str) -> str:
 
         return re.sub(r"\s+", " ", " ".join(description_lines)).strip()
     return ""
+
+
+def extract_generated_video_tags(generated_script: str) -> str:
+    if not generated_script:
+        return ""
+    tags_match = TAGS_SECTION_PATTERN.search(generated_script)
+    if tags_match:
+        return tags_match.group(1).strip()
+    metadata_match = METADATA_SECTION_PATTERN.search(generated_script)
+    if metadata_match:
+        lines = metadata_match.group(1).splitlines()
+        for line in lines:
+            line_clean = line.strip().strip("#*` ")
+            label, separator, inline_value = line_clean.partition(":")
+            if separator and _normalize_metadata_label(label) in {"TAG", "TAGS", "HASHTAG", "HASHTAGS"}:
+                return inline_value.strip()
+            if "#" in line and not line.startswith("###"):
+                return line.strip()
+    return ""
+
+
+def extract_generated_video_pinned_comment(generated_script: str) -> str:
+    if not generated_script:
+        return ""
+    pinned_match = PINNED_COMMENT_SECTION_PATTERN.search(generated_script)
+    if pinned_match:
+        return pinned_match.group(1).strip()
+    metadata_match = METADATA_SECTION_PATTERN.search(generated_script)
+    if metadata_match:
+        lines = metadata_match.group(1).splitlines()
+        for idx, line in enumerate(lines):
+            line_clean = line.strip().strip("#*` ")
+            label, separator, inline_value = line_clean.partition(":")
+            if separator and _normalize_metadata_label(label) in {"BINH LUAN GHIM", "PINNED COMMENT"}:
+                pinned_lines = [inline_value.strip()] if inline_value.strip() else []
+                for follow in lines[idx + 1:]:
+                    f_clean = follow.strip()
+                    if not f_clean:
+                        continue
+                    if f_clean.partition(":")[1] and _normalize_metadata_label(f_clean.partition(":")[0]) in METADATA_FIELD_LABELS:
+                        break
+                    pinned_lines.append(f_clean)
+                return "\n".join(pinned_lines).strip()
+    return ""
+
+
+def extract_generated_video_quiz(generated_script: str) -> str:
+    if not generated_script:
+        return ""
+    quiz_match = QUIZ_SECTION_PATTERN.search(generated_script)
+    if quiz_match:
+        return quiz_match.group(1).strip()
+    metadata_match = METADATA_SECTION_PATTERN.search(generated_script)
+    if metadata_match:
+        lines = metadata_match.group(1).splitlines()
+        for idx, line in enumerate(lines):
+            line_clean = line.strip().strip("#*` ")
+            label, separator, inline_value = line_clean.partition(":")
+            if separator and _normalize_metadata_label(label) in {"QUIZ", "CAU HOI", "CAU HOI KHAN GIA", "TRAC NGHIEM"}:
+                quiz_lines = [inline_value.strip()] if inline_value.strip() else [line_clean]
+                for follow in lines[idx + 1:]:
+                    f_clean = follow.strip()
+                    if not f_clean:
+                        continue
+                    if f_clean.partition(":")[1] and _normalize_metadata_label(f_clean.partition(":")[0]) in {"BINH LUAN GHIM", "CHAPTERS", "THUMBNAIL"}:
+                        break
+                    quiz_lines.append(f_clean)
+                return "\n".join(quiz_lines).strip()
+    return ""
+
+
+def extract_generated_video_chapters(generated_script: str) -> str:
+    if not generated_script:
+        return ""
+    ch_match = CHAPTERS_SECTION_PATTERN.search(generated_script)
+    if ch_match:
+        return ch_match.group(1).strip()
+    return ""
+
+
+def _slugify(text: str) -> str:
+    normalized = unicodedata.normalize("NFD", text.replace("Đ", "D").replace("đ", "d"))
+    without_accents = "".join(
+        c for c in normalized if unicodedata.category(c) != "Mn"
+    )
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", without_accents.lower()).strip("-")
+    return re.sub(r"-+", "-", cleaned)
+
+
+def extract_generated_video_slug(text: str, default_title: str = "") -> str:
+    if not text:
+        return _slugify(default_title) if default_title else ""
+
+    slug_match = SLUG_SECTION_PATTERN.search(text)
+    if slug_match:
+        val = slug_match.group(1).strip()
+        lines = [l.strip() for l in val.splitlines() if l.strip()]
+        for line in lines:
+            line_clean = line.strip("#*` ")
+            label, separator, inline_value = line_clean.partition(":")
+            if separator and _normalize_metadata_label(label) in {"SLUG", "URL SLUG"}:
+                val_clean = inline_value.strip().strip('"“”\'` ')
+                while ":" in val_clean:
+                    val_clean = val_clean.partition(":")[2].strip().strip('"“”\'` ')
+                s = _slugify(val_clean)
+                if s:
+                    return s
+            s = _slugify(line_clean)
+            if s:
+                return s
+
+    metadata_match = METADATA_SECTION_PATTERN.search(text)
+    section = metadata_match.group(1) if metadata_match else text
+    lines = section.splitlines()
+    for raw_line in lines:
+        line = raw_line.strip().strip("#*` ")
+        label, separator, inline_value = line.partition(":")
+        norm_label = _normalize_metadata_label(label)
+        if norm_label in {"SLUG", "URL SLUG"}:
+            val = inline_value.strip().strip('"“”\'` ')
+            while ":" in val:
+                val = val.partition(":")[2].strip().strip('"“”\'` ')
+            slug = _slugify(val)
+            if slug:
+                return slug
+    title = extract_generated_video_title(text) or default_title
+    if not title:
+        title = text.strip()
+    return _slugify(title)
+
+
+def resolve_render_filename(
+    video_id: int,
+    base_slug: str,
+    renders_dir: Path | str | None = None,
+) -> str:
+    target_dir = Path(renders_dir) if renders_dir else Path("renders")
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        own_artifact = conn.execute(
+            "SELECT path FROM video_artifacts WHERE video_id = ? AND artifact_type = 'final_mp4' ORDER BY id DESC LIMIT 1",
+            (video_id,),
+        ).fetchone()
+        if own_artifact:
+            own_stem = Path(own_artifact["path"]).stem
+            if own_stem == base_slug or own_stem.startswith(f"{base_slug}-"):
+                return own_stem
+
+        other_artifacts = conn.execute(
+            "SELECT video_id, path FROM video_artifacts WHERE video_id != ? AND artifact_type = 'final_mp4'",
+            (video_id,),
+        ).fetchall()
+        used_stems = {Path(row["path"]).stem for row in other_artifacts}
+
+        candidate = base_slug
+        candidate_file = target_dir / f"{candidate}.mp4"
+        if candidate not in used_stems and not candidate_file.exists():
+            return candidate
+
+        index = 1
+        while True:
+            candidate = f"{base_slug}-{index}"
+            candidate_file = target_dir / f"{candidate}.mp4"
+            if candidate not in used_stems and not candidate_file.exists():
+                return candidate
+            index += 1
+    finally:
+        conn.close()
 
 
 def normalize_search_text(value: str) -> str:
@@ -4805,37 +5034,7 @@ def delete_fb_crossposter_campaign(page_id: str) -> bool:
 # Helper & Slugs
 # ==============================================================================
 
-def _slugify(text: str) -> str:
-    normalized = unicodedata.normalize("NFD", text.replace("Đ", "D").replace("đ", "d"))
-    without_accents = "".join(
-        c for c in normalized if unicodedata.category(c) != "Mn"
-    )
-    cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", without_accents.lower()).strip("-")
-    return re.sub(r"-+", "-", cleaned)
-
-
-def extract_generated_video_slug(text: str) -> str:
-    if not text:
-        return ""
-    metadata_match = METADATA_SECTION_PATTERN.search(text)
-    section = metadata_match.group(1) if metadata_match else text
-    lines = section.splitlines()
-    for raw_line in lines:
-        line = raw_line.strip().strip("#*` ")
-        label, separator, inline_value = line.partition(":")
-        norm_label = _normalize_metadata_label(label)
-        if norm_label in {"SLUG", "URL SLUG"}:
-            val = inline_value.strip().strip('"“”\'` ')
-            while ":" in val:
-                val = val.partition(":")[2].strip().strip('"“”\'` ')
-            slug = _slugify(val)
-            if slug:
-                return slug
-    title = extract_generated_video_title(text)
-    if not title:
-        title = text.strip()
-    return _slugify(title)
-
+# Helpers and extract_generated_video_slug are defined at top of file
 
 def resolve_render_filename(
     video_id: int,

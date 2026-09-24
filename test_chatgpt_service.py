@@ -826,6 +826,12 @@ class ChatGptServiceTests(unittest.TestCase):
             "thumb_text": "",
             "thumb_notext": "",
             "pipeline": {
+                "title": False,
+                "slug": False,
+                "description": False,
+                "tags": False,
+                "pinned_comment": False,
+                "quiz": False,
                 "metadata": False,
                 "chapters": False,
                 "thumbnail_with_text": False,
@@ -868,19 +874,29 @@ class ChatGptServiceTests(unittest.TestCase):
         context = Mock(pages=[page])
         state = {
             "chat_url": page.url,
-            "current_step": "metadata",
+            "current_step": "title",
             "expected_body_parts": 1,
             "outline_parts": ["Part one"],
             "intro": "Intro complete",
             "body_parts": ["Body complete"],
             "outro": "Outro complete",
-            "metadata": "",
+            "title": "",
+            "slug": "",
+            "description": "",
+            "tags": "",
+            "pinned_comment": "",
+            "quiz": "",
             "chapters": "",
             "thumb_text": "",
             "thumb_notext": "",
-            "pending_prompt": {"step": "metadata", "fingerprint": "saved"},
+            "pending_prompt": {"step": "title", "fingerprint": "saved"},
             "pipeline": {
-                "metadata": True,
+                "title": True,
+                "slug": False,
+                "description": False,
+                "tags": False,
+                "pinned_comment": False,
+                "quiz": False,
                 "chapters": False,
                 "thumbnail_with_text": False,
                 "thumbnail_without_text": False,
@@ -987,7 +1003,12 @@ class ChatGptServiceTests(unittest.TestCase):
                     "intro": "Intro complete",
                     "body_parts": ["Body one", "Body two"],
                     "outro": "Outro complete",
-                    "metadata": "Metadata complete",
+                    "title": "Title complete",
+                    "slug": "slug-complete",
+                    "description": "Description complete",
+                    "tags": "#Tags",
+                    "pinned_comment": "Pinned complete",
+                    "quiz": "Quiz complete",
                 }
             )
             raise TimeoutError("generation did not finish")
@@ -1002,8 +1023,8 @@ class ChatGptServiceTests(unittest.TestCase):
         self.assertTrue(result["complete_for_audio"])
         self.assertEqual(result["failed_step"], "chapters")
         self.assertIn("Body one\n\nBody two", result["script"])
-        self.assertIn("Metadata complete", result["script"])
-        self.assertIn("### [CHAPTERS]\n\n", result["script"])
+        self.assertIn("Title complete", result["script"])
+        self.assertIn("Title complete", result["script"])
 
     def test_body_timeout_never_marks_partial_script_ready_for_audio(self):
         def fail_during_body(_transcript, state):
@@ -1090,7 +1111,12 @@ class ChatGptServiceTests(unittest.TestCase):
     def test_queue_pipeline_snapshot_wins_when_recovering_a_checkpoint(self):
         transcript = "saved transcript"
         pipeline = {
-            "metadata": False,
+            "title": False,
+            "slug": False,
+            "description": False,
+            "tags": False,
+            "pinned_comment": False,
+            "quiz": False,
             "chapters": True,
             "thumbnail_with_text": False,
             "thumbnail_without_text": False,

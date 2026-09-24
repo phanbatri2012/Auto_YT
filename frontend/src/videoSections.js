@@ -175,21 +175,42 @@ export function parseVideoSections(text) {
   const parts = text.split(/###\s*\[([^\]]+)\]/g)
   const mainScriptParts = []
   const otherSections = []
-  let metadata = null
+  let metadata = {
+    title: '',
+    slug: '',
+    description: '',
+    tags: '',
+    quiz: '',
+    pinnedComment: ''
+  }
   let chaptersContent = ''
 
   for (let index = 1; index < parts.length; index += 2) {
-    const tag = parts[index].trim().toUpperCase()
+    const rawTag = parts[index].trim()
+    const tag = rawTag.toUpperCase()
     const content = parts[index + 1]?.trim() || ''
 
     if (MAIN_SCRIPT_TAGS.has(tag)) {
       if (content) mainScriptParts.push(content)
     } else if (tag === 'METADATA & QUIZ') {
-      metadata = parseMetadataContent(content)
-    } else if (tag === 'CHAPTERS') {
+      const parsed = parseMetadataContent(content)
+      metadata = { ...metadata, ...parsed }
+    } else if (tag === 'TIÊU ĐỀ' || tag === 'TIEU DE' || tag === 'TITLE') {
+      metadata.title = content.replace(/^[-*\s]+(?:tiêu\s+đề(?:\s+video)?|title):\s*/i, '').trim()
+    } else if (tag === 'SLUG' || tag === 'URL SLUG') {
+      metadata.slug = content.replace(/^[-*\s]+(?:url\s+)?slug:\s*/i, '').trim()
+    } else if (tag === 'MÔ TẢ' || tag === 'MO TA' || tag === 'DESCRIPTION') {
+      metadata.description = content.replace(/^[-*\s]+(?:mô\s+tả(?:\s+video)?|description):\s*/i, '').trim()
+    } else if (tag === 'TAGS' || tag === 'TAG' || tag === 'HASHTAGS' || tag === 'HASHTAG') {
+      metadata.tags = content.replace(/^[-*\s]+(?:tags?|hashtags?):\s*/i, '').trim()
+    } else if (tag === 'BÌNH LUẬN GHIM' || tag === 'BINH LUAN GHIM' || tag === 'PINNED COMMENT') {
+      metadata.pinnedComment = content.replace(/^[-*\s]+(?:bình\s+luận\s+ghim|pinned\s+comment):\s*/i, '').trim()
+    } else if (tag === 'QUIZ' || tag === 'QUIZ TƯƠNG TÁC' || tag === 'QUIZ TUONG TAC') {
+      metadata.quiz = content
+    } else if (tag === 'CHAPTERS' || tag === 'PHÂN ĐOẠN' || tag === 'PHAN DOAN') {
       chaptersContent = content
     } else if (!IGNORED_TAGS.has(tag)) {
-      otherSections.push({ title: tag, content })
+      otherSections.push({ title: rawTag, content })
     }
   }
 
@@ -201,20 +222,20 @@ export function parseVideoSections(text) {
     })
   }
 
-  if (metadata?.title) {
+  if (metadata.title) {
     sections.push({ title: 'TIÊU ĐỀ VIDEO', content: metadata.title })
   }
-  if (metadata?.slug) {
+  if (metadata.slug) {
     sections.push({ title: 'URL SLUG', content: metadata.slug })
   }
 
-  const descriptionSection = buildDescriptionSection(metadata || {}, chaptersContent)
+  const descriptionSection = buildDescriptionSection(metadata, chaptersContent)
   if (descriptionSection) sections.push(descriptionSection)
 
-  if (metadata?.quiz) {
+  if (metadata.quiz) {
     sections.push({ title: 'QUIZ', content: metadata.quiz })
   }
-  if (metadata?.pinnedComment) {
+  if (metadata.pinnedComment) {
     sections.push({ title: 'BÌNH LUẬN GHIM', content: metadata.pinnedComment })
   }
 

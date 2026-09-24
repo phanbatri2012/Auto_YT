@@ -178,6 +178,16 @@ function App() {
   const [generatingThumbnailType, setGeneratingThumbnailType] = useState(null)
   const [isGeneratingChapters, setIsGeneratingChapters] = useState(false)
   const [isGeneratingMetadata, setIsGeneratingMetadata] = useState(false)
+  const [isGeneratingTitle, setIsGeneratingTitle] = useState(false)
+  const [isGeneratingSlug, setIsGeneratingSlug] = useState(false)
+  const [isGeneratingDescription, setIsGeneratingDescription] = useState(false)
+  const [isGeneratingTags, setIsGeneratingTags] = useState(false)
+  const [isGeneratingPinnedComment, setIsGeneratingPinnedComment] = useState(false)
+  const [isGeneratingQuiz, setIsGeneratingQuiz] = useState(false)
+  const [previewDescription, setPreviewDescription] = useState('')
+  const [isLoadingPreviewDescription, setIsLoadingPreviewDescription] = useState(false)
+  const [showPreviewModal, setShowPreviewModal] = useState(false)
+  const [copiedPreview, setCopiedPreview] = useState(false)
   const [isGenAudio, setIsGenAudio] = useState(false)
   const [audioStatus, setAudioStatus] = useState('not_started')
   const [audioMissingSegments, setAudioMissingSegments] = useState(0)
@@ -242,7 +252,13 @@ function App() {
     chatGptStatus.busy ||
     generatingThumbnailType !== null ||
     isGeneratingChapters ||
-    isGeneratingMetadata
+    isGeneratingMetadata ||
+    isGeneratingTitle ||
+    isGeneratingSlug ||
+    isGeneratingDescription ||
+    isGeneratingTags ||
+    isGeneratingPinnedComment ||
+    isGeneratingQuiz
   const currentVideoIsError = currentVideoStatus === 'error'
   const chatGptControlsDisabled = chatGptProfileBusy || currentVideoIsError
   const getPromptVersionName = (versionKey) =>
@@ -1059,6 +1075,55 @@ function App() {
     }
   };
 
+  const handleGenerateItem = async (endpoint, label, setLocalLoading) => {
+    if (!currentVideoId || chatGptControlsDisabled) return;
+    const requestedVideoId = currentVideoId;
+    setLocalLoading(true);
+    try {
+      const response = await fetch(`http://127.0.0.1:8080/api/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ video_id: requestedVideoId })
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || `Không thể tạo lại ${label}.`);
+      }
+      if (data.video_id !== requestedVideoId) {
+        throw new Error('Backend trả về sai video. Giao diện chưa được cập nhật.');
+      }
+
+      const refreshedResponse = await fetch(
+        `http://127.0.0.1:8080/api/videos/${requestedVideoId}?_=${Date.now()}`,
+        { cache: 'no-store' }
+      );
+      if (!refreshedResponse.ok) {
+        throw new Error('Không thể tải nội dung mới từ database.');
+      }
+      const refreshedVideo = await refreshedResponse.json();
+      if (currentVideoIdRef.current === requestedVideoId) {
+        setResultText(refreshedVideo.generated_script);
+        if (refreshedVideo.title) {
+          setVideoTitle(refreshedVideo.title);
+        }
+      } else {
+        alert(`${label} đã được cập nhật. Hãy mở lại đúng video để xem kết quả.`);
+      }
+      await fetchSavedVideos(currentPage, publishFilter);
+    } catch (error) {
+      alert(`Lỗi tạo ${label}: ` + error.message);
+    } finally {
+      setLocalLoading(false);
+    }
+  };
+
+  const handleGenerateTitle = () => handleGenerateItem('generate-title', 'tiêu đề', setIsGeneratingTitle);
+  const handleGenerateSlug = () => handleGenerateItem('generate-slug', 'URL slug', setIsGeneratingSlug);
+  const handleGenerateDescription = () => handleGenerateItem('generate-description', 'mô tả', setIsGeneratingDescription);
+  const handleGenerateTags = () => handleGenerateItem('generate-tags', 'tags & hashtags', setIsGeneratingTags);
+  const handleGeneratePinnedComment = () => handleGenerateItem('generate-pinned-comment', 'bình luận ghim', setIsGeneratingPinnedComment);
+  const handleGenerateQuiz = () => handleGenerateItem('generate-quiz', 'quiz', setIsGeneratingQuiz);
+
   const handleGenerateMetadata = async () => {
     if (!currentVideoId || chatGptControlsDisabled) return;
     const requestedVideoId = currentVideoId;
@@ -1095,6 +1160,28 @@ function App() {
       alert('Lỗi tạo metadata: ' + error.message);
     } finally {
       setIsGeneratingMetadata(false);
+    }
+  };
+
+  const handleFetchDescriptionPreview = async () => {
+    if (!currentVideoId) return;
+    setIsLoadingPreviewDescription(true);
+    setShowPreviewModal(true);
+    setCopiedPreview(false);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/youtube-description-preview?_=${Date.now()}`
+      );
+      const data = await response.json();
+      if (response.ok && data.success) {
+        setPreviewDescription(data.preview_description || '');
+      } else {
+        setPreviewDescription(data.detail || data.error || 'Không thể tải bản xem trước mô tả.');
+      }
+    } catch (error) {
+      setPreviewDescription('Lỗi kết nối khi tải bản xem trước: ' + error.message);
+    } finally {
+      setIsLoadingPreviewDescription(false);
     }
   };
 
@@ -2100,35 +2187,127 @@ function App() {
                         >
                           {generatingThumbnailType === 'both' ? '⏳ Đang tạo cả 2...' : '🎨 Tạo lại cả 2 thumbnail'}
                         </button>
-                        <button
-                          onClick={handleGenerateChapters}
-                          disabled={chatGptControlsDisabled}
-                          style={{
-                            padding: '4px 14px', borderRadius: '4px',
-                            cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
-                            border: '1px solid #16a085',
-                            background: chatGptControlsDisabled ? '#333' : 'rgba(22,160,133,0.2)',
-                            color: chatGptControlsDisabled ? '#888' : '#48c9b0',
-                            fontWeight: 'bold'
-                          }}
-                        >
-                          {isGeneratingChapters ? '⏳ Đang tạo chapter...' : '🕒 Tạo lại chapter'}
-                        </button>
-                        <button
-                          onClick={handleGenerateMetadata}
-                          disabled={chatGptControlsDisabled}
-                          title="Tạo lại mục 5: Tiêu đề, URL slug, mô tả và quiz trong cùng chat của video"
-                          style={{
-                            padding: '4px 14px', borderRadius: '4px',
-                            cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
-                            border: '1px solid #d4ac0d',
-                            background: chatGptControlsDisabled ? '#333' : 'rgba(212,172,13,0.2)',
-                            color: chatGptControlsDisabled ? '#888' : '#f7dc6f',
-                            fontWeight: 'bold'
-                          }}
-                        >
-                          {isGeneratingMetadata ? '⏳ Đang tạo metadata...' : '✍️ Tạo lại TIÊU ĐỀ'}
-                        </button>
+                        <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                          <button
+                            onClick={handleGenerateTitle}
+                            disabled={chatGptControlsDisabled}
+                            title="Tạo lại Tiêu đề chuẩn SEO"
+                            style={{
+                              padding: '4px 10px', borderRadius: '4px',
+                              cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
+                              border: '1px solid #f39c12',
+                              background: chatGptControlsDisabled ? '#333' : 'rgba(243,156,18,0.15)',
+                              color: chatGptControlsDisabled ? '#888' : '#f39c12',
+                              fontWeight: '600', fontSize: '0.82em'
+                            }}
+                          >
+                            {isGeneratingTitle ? '⏳ Đang tạo...' : '🏷️ Tiêu đề'}
+                          </button>
+                          <button
+                            onClick={handleGenerateSlug}
+                            disabled={chatGptControlsDisabled}
+                            title="Tạo lại URL Slug để đặt tên file render MP4"
+                            style={{
+                              padding: '4px 10px', borderRadius: '4px',
+                              cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
+                              border: '1px solid #3498db',
+                              background: chatGptControlsDisabled ? '#333' : 'rgba(52,152,219,0.15)',
+                              color: chatGptControlsDisabled ? '#888' : '#3498db',
+                              fontWeight: '600', fontSize: '0.82em'
+                            }}
+                          >
+                            {isGeneratingSlug ? '⏳ Đang tạo...' : '🔗 Slug'}
+                          </button>
+                          <button
+                            onClick={handleGenerateDescription}
+                            disabled={chatGptControlsDisabled}
+                            title="Tạo lại đoạn Mô tả video"
+                            style={{
+                              padding: '4px 10px', borderRadius: '4px',
+                              cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
+                              border: '1px solid #9b59b6',
+                              background: chatGptControlsDisabled ? '#333' : 'rgba(155,89,182,0.15)',
+                              color: chatGptControlsDisabled ? '#888' : '#bb86fc',
+                              fontWeight: '600', fontSize: '0.82em'
+                            }}
+                          >
+                            {isGeneratingDescription ? '⏳ Đang tạo...' : '📝 Mô tả'}
+                          </button>
+                          <button
+                            onClick={handleGenerateTags}
+                            disabled={chatGptControlsDisabled}
+                            title="Tạo lại Tags & Hashtags"
+                            style={{
+                              padding: '4px 10px', borderRadius: '4px',
+                              cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
+                              border: '1px solid #1abc9c',
+                              background: chatGptControlsDisabled ? '#333' : 'rgba(26,188,156,0.15)',
+                              color: chatGptControlsDisabled ? '#888' : '#1abc9c',
+                              fontWeight: '600', fontSize: '0.82em'
+                            }}
+                          >
+                            {isGeneratingTags ? '⏳ Đang tạo...' : '🔖 Tags'}
+                          </button>
+                          <button
+                            onClick={handleGeneratePinnedComment}
+                            disabled={chatGptControlsDisabled}
+                            title="Tạo lại Bình luận ghim kêu gọi tương tác"
+                            style={{
+                              padding: '4px 10px', borderRadius: '4px',
+                              cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
+                              border: '1px solid #e67e22',
+                              background: chatGptControlsDisabled ? '#333' : 'rgba(230,126,34,0.15)',
+                              color: chatGptControlsDisabled ? '#888' : '#e67e22',
+                              fontWeight: '600', fontSize: '0.82em'
+                            }}
+                          >
+                            {isGeneratingPinnedComment ? '⏳ Đang tạo...' : '📌 Ghim'}
+                          </button>
+                          <button
+                            onClick={handleGenerateQuiz}
+                            disabled={chatGptControlsDisabled}
+                            title="Tạo lại Quiz tương tác trắc nghiệm"
+                            style={{
+                              padding: '4px 10px', borderRadius: '4px',
+                              cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
+                              border: '1px solid #e74c3c',
+                              background: chatGptControlsDisabled ? '#333' : 'rgba(231,76,60,0.15)',
+                              color: chatGptControlsDisabled ? '#888' : '#e74c3c',
+                              fontWeight: '600', fontSize: '0.82em'
+                            }}
+                          >
+                            {isGeneratingQuiz ? '⏳ Đang tạo...' : '❓ Quiz'}
+                          </button>
+                          <button
+                            onClick={handleGenerateChapters}
+                            disabled={chatGptControlsDisabled}
+                            title="Tạo lại các mốc Chapter phân đoạn"
+                            style={{
+                              padding: '4px 10px', borderRadius: '4px',
+                              cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
+                              border: '1px solid #16a085',
+                              background: chatGptControlsDisabled ? '#333' : 'rgba(22,160,133,0.15)',
+                              color: chatGptControlsDisabled ? '#888' : '#48c9b0',
+                              fontWeight: '600', fontSize: '0.82em'
+                            }}
+                          >
+                            {isGeneratingChapters ? '⏳ Đang tạo...' : '🕒 Chapters'}
+                          </button>
+                          <button
+                            onClick={handleFetchDescriptionPreview}
+                            title="Xem trước nội dung mô tả YouTube sau khi ghép mẫu template"
+                            style={{
+                              padding: '4px 10px', borderRadius: '4px',
+                              cursor: 'pointer',
+                              border: '1px solid #4dd0e1',
+                              background: 'rgba(77,208,225,0.15)',
+                              color: '#4dd0e1',
+                              fontWeight: '600', fontSize: '0.82em'
+                            }}
+                          >
+                            👁️ Mẫu mô tả YT
+                          </button>
+                        </div>
                         {currentVideoId && (
                           <select
                             value={currentVideoIsError ? 'error' : isCurrentVideoPublished ? 'published' : 'unpublished'}
@@ -2709,6 +2888,88 @@ function App() {
           )}
         </div>
       </main>
+      {showPreviewModal && (
+        <div
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setShowPreviewModal(false);
+            }
+          }}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 1000,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            padding: '20px', background: 'rgba(0, 0, 0, 0.75)'
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="preview-modal-title"
+            style={{
+              width: 'min(680px, 100%)', maxHeight: '85vh', display: 'flex', flexDirection: 'column',
+              padding: '24px', borderRadius: '14px',
+              border: '1px solid rgba(77, 208, 225, 0.5)', background: '#151218',
+              boxShadow: '0 24px 80px rgba(0, 0, 0, 0.65)'
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+              <h3 id="preview-modal-title" style={{ margin: 0, color: '#4dd0e1', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                👁️ Mô tả YouTube thực tế (Description Preview)
+              </h3>
+              <button
+                type="button"
+                onClick={() => setShowPreviewModal(false)}
+                style={{ background: 'transparent', border: 'none', color: '#aaa', fontSize: '1.2rem', cursor: 'pointer' }}
+              >✕</button>
+            </div>
+            <p style={{ margin: '0 0 12px', color: '#aaa', fontSize: '0.85rem' }}>
+              Nội dung mô tả thực tế sẽ được đưa lên YouTube theo Description Template của bộ prompt.
+            </p>
+            <div style={{ flex: 1, overflowY: 'auto', marginBottom: '16px' }}>
+              {isLoadingPreviewDescription ? (
+                <div style={{ padding: '30px', textAlign: 'center', color: '#888' }}>
+                  ⏳ Đang nạp bản xem trước mô tả...
+                </div>
+              ) : (
+                <textarea
+                  readOnly
+                  rows={14}
+                  value={previewDescription}
+                  style={{
+                    width: '100%', boxSizing: 'border-box', padding: '12px',
+                    borderRadius: '8px', border: '1px solid #333',
+                    background: '#1f1b24', color: '#eee', fontSize: '0.9rem',
+                    lineHeight: '1.5', fontFamily: 'inherit', resize: 'vertical'
+                  }}
+                />
+              )}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => {
+                  navigator.clipboard.writeText(previewDescription);
+                  setCopiedPreview(true);
+                  setTimeout(() => setCopiedPreview(false), 2500);
+                }}
+                disabled={!previewDescription || isLoadingPreviewDescription}
+              >
+                {copiedPreview ? '✓ Đã sao chép' : '📋 Sao chép mô tả'}
+              </button>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => setShowPreviewModal(false)}
+              >
+                Đóng
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {publicationDialog && (
         <div
           role="presentation"

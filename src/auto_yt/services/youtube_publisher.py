@@ -145,13 +145,49 @@ def _api_json(
         raise YouTubeTransientError("Không kết nối được YouTube API.") from exc
 
 
+def build_actual_youtube_description(video: dict, publishing_settings: dict | None = None) -> str:
+    settings = publishing_settings or {}
+    script = str(video.get("generated_script") or "").strip()
+    title = str(video.get("generated_title") or db.extract_generated_video_title(script) or video.get("title") or "").strip()
+    slug = db.extract_generated_video_slug(script, default_title=title)
+    description = db.extract_generated_video_description(script)
+    tags = db.extract_generated_video_tags(script)
+    pinned_comment = db.extract_generated_video_pinned_comment(script)
+    quiz = db.extract_generated_video_quiz(script)
+    chapters = db.extract_generated_video_chapters(script)
+
+    template = str(settings.get("description_template") or "").strip()
+    if not template:
+        template = "{description}\n\n{chapters}\n\n{tags}"
+
+    replacements = {
+        "{title}": title,
+        "{slug}": slug,
+        "{description}": description,
+        "{tags}": tags,
+        "{pinned_comment}": pinned_comment,
+        "{quiz}": quiz,
+        "{chapters}": chapters,
+    }
+
+    actual_desc = template
+    for placeholder, val in replacements.items():
+        actual_desc = actual_desc.replace(placeholder, val)
+
+    # Clean redundant blank lines
+    actual_desc = re.sub(r"\n{3,}", "\n\n", actual_desc).strip()
+    return actual_desc
+
+
 def build_upload_metadata(video: dict, publishing_settings: dict) -> dict:
     title = str(video.get("generated_title") or video.get("title") or "").strip()
+    if not title:
+        title = db.extract_generated_video_title(video.get("generated_script") or "")
+
     description = str(video.get("description") or "").strip()
     if not description:
-        description = db.extract_generated_video_description(
-            video.get("generated_script") or ""
-        )
+        description = build_actual_youtube_description(video, publishing_settings)
+
     if not title:
         raise YouTubePublishError("Video chưa có tiêu đề YouTube hợp lệ.")
     if len(title) > 100:
@@ -160,7 +196,18 @@ def build_upload_metadata(video: dict, publishing_settings: dict) -> dict:
         raise YouTubePublishError("Mô tả YouTube vượt quá 5000 ký tự.")
     category_id = str(publishing_settings.get("category_id") or "22").strip() or "22"
     made_for_kids = bool(publishing_settings.get("made_for_kids", False))
-    tags = list(dict.fromkeys(re.findall(r"(?<!\w)#([\w-]+)", description)))[:30]
+
+    tags_extracted: list[str] = []
+    script_tags = db.extract_generated_video_tags(video.get("generated_script") or "")
+    if script_tags:
+        for t in re.findall(r"(?<!\w)#([\w-]+)", script_tags):
+            if t not in tags_extracted:
+                tags_extracted.append(t)
+    for t in re.findall(r"(?<!\w)#([\w-]+)", description):
+        if t not in tags_extracted:
+            tags_extracted.append(t)
+    tags = tags_extracted[:30]
+
     return {
         "snippet": {
             "title": title,

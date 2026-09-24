@@ -153,7 +153,12 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
 
     def test_new_video_job_keeps_a_pipeline_snapshot(self):
         pipeline = {
-            "metadata": True,
+            "title": True,
+            "slug": True,
+            "description": True,
+            "tags": True,
+            "pinned_comment": True,
+            "quiz": True,
             "chapters": False,
             "thumbnail_with_text": False,
             "thumbnail_without_text": True,
@@ -647,7 +652,12 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
 
     def test_pipeline_can_finish_a_video_without_automatic_audio(self):
         pipeline = {
-            "metadata": False,
+            "title": False,
+            "slug": False,
+            "description": False,
+            "tags": False,
+            "pinned_comment": False,
+            "quiz": False,
             "chapters": False,
             "thumbnail_with_text": False,
             "thumbnail_without_text": False,

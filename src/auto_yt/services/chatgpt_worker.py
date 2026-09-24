@@ -2251,15 +2251,34 @@ def build_video_script(state: dict) -> str:
         if (sanitized_part := dedup_consecutive_paragraphs(sanitize_narrative_response(part)))
     )
     outro = dedup_consecutive_paragraphs(sanitize_narrative_response(state.get("outro", "")))
-    raw_script = (
-        f"### [INTRO]\n{intro}\n\n"
-        f"### [BODY]\n{body}\n\n"
-        f"### [OUTRO]\n{outro}\n\n"
-        f"### [METADATA & QUIZ]\n{state.get('metadata', '')}\n\n"
-        f"### [CHAPTERS]\n{state.get('chapters', '')}\n\n"
-        f"### [THUMBNAIL CÓ CHỮ]\n{state.get('thumb_text', '')}\n\n"
-        f"### [THUMBNAIL KHÔNG CHỮ]\n{state.get('thumb_notext', '')}"
-    )
+    
+    sections = [
+        f"### [INTRO]\n{intro}",
+        f"### [BODY]\n{body}",
+        f"### [OUTRO]\n{outro}",
+    ]
+    if state.get("title"):
+        sections.append(f"### [TIÊU ĐỀ]\n{state.get('title', '').strip()}")
+    if state.get("slug"):
+        sections.append(f"### [SLUG]\n{state.get('slug', '').strip()}")
+    if state.get("description"):
+        sections.append(f"### [MÔ TẢ]\n{state.get('description', '').strip()}")
+    if state.get("tags"):
+        sections.append(f"### [TAGS]\n{state.get('tags', '').strip()}")
+    if state.get("pinned_comment"):
+        sections.append(f"### [BÌNH LUẬN GHIM]\n{state.get('pinned_comment', '').strip()}")
+    if state.get("quiz"):
+        sections.append(f"### [QUIZ]\n{state.get('quiz', '').strip()}")
+    if not any(state.get(k) for k in ("title", "slug", "description", "tags", "pinned_comment", "quiz")) and state.get("metadata"):
+        sections.append(f"### [METADATA & QUIZ]\n{state.get('metadata', '').strip()}")
+    if state.get("chapters"):
+        sections.append(f"### [CHAPTERS]\n{state.get('chapters', '').strip()}")
+    if state.get("thumb_text"):
+        sections.append(f"### [THUMBNAIL CÓ CHỮ]\n{state.get('thumb_text', '').strip()}")
+    if state.get("thumb_notext"):
+        sections.append(f"### [THUMBNAIL KHÔNG CHỮ]\n{state.get('thumb_notext', '').strip()}")
+    
+    raw_script = "\n\n".join(s for s in sections if s)
     return sanitize_generated_script(raw_script)
 
 
@@ -2500,9 +2519,99 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 "No metadata, thumbnail, or audio request was sent."
             )
 
-        # Step 6: Metadata & Quiz
-        if pipeline["metadata"] and not state.get("metadata"):
-            print(">>> BƯỚC 6: TẠO METADATA & QUIZ", file=sys.stderr)
+        # Step 6: Tiêu đề (Title)
+        if pipeline.get("title", True) and not state.get("title"):
+            print(">>> BƯỚC 6: TẠO TIÊU ĐỀ", file=sys.stderr)
+            prompt_title = (prompts.get("title", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "title"
+            title = send_or_recover_generation_prompt(
+                page,
+                state,
+                "title",
+                prompt_title,
+            )
+            state["title"] = title
+            clear_pending_generation_prompt(state, "title", prompt_title)
+            persist_generation_state(state)
+
+        # Step 7: URL Slug
+        if pipeline.get("slug", True) and not state.get("slug"):
+            print(">>> BƯỚC 7: TẠO URL SLUG", file=sys.stderr)
+            prompt_slug = (prompts.get("slug", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "slug"
+            slug = send_or_recover_generation_prompt(
+                page,
+                state,
+                "slug",
+                prompt_slug,
+            )
+            state["slug"] = slug
+            clear_pending_generation_prompt(state, "slug", prompt_slug)
+            persist_generation_state(state)
+
+        # Step 8: Mô tả (Description)
+        if pipeline.get("description", True) and not state.get("description"):
+            print(">>> BƯỚC 8: TẠO MÔ TẢ", file=sys.stderr)
+            prompt_desc = (prompts.get("description", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "description"
+            description = send_or_recover_generation_prompt(
+                page,
+                state,
+                "description",
+                prompt_desc,
+            )
+            state["description"] = description
+            clear_pending_generation_prompt(state, "description", prompt_desc)
+            persist_generation_state(state)
+
+        # Step 9: Tags / Hashtags
+        if pipeline.get("tags", True) and not state.get("tags"):
+            print(">>> BƯỚC 9: TẠO TAGS / HASHTAGS", file=sys.stderr)
+            prompt_tags = (prompts.get("tags", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "tags"
+            tags = send_or_recover_generation_prompt(
+                page,
+                state,
+                "tags",
+                prompt_tags,
+            )
+            state["tags"] = tags
+            clear_pending_generation_prompt(state, "tags", prompt_tags)
+            persist_generation_state(state)
+
+        # Step 10: Bình luận ghim (Pinned comment)
+        if pipeline.get("pinned_comment", True) and not state.get("pinned_comment"):
+            print(">>> BƯỚC 10: TẠO BÌNH LUẬN GHIM", file=sys.stderr)
+            prompt_pinned = (prompts.get("pinned_comment", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "pinned_comment"
+            pinned = send_or_recover_generation_prompt(
+                page,
+                state,
+                "pinned_comment",
+                prompt_pinned,
+            )
+            state["pinned_comment"] = pinned
+            clear_pending_generation_prompt(state, "pinned_comment", prompt_pinned)
+            persist_generation_state(state)
+
+        # Step 11: Quiz tương tác
+        if pipeline.get("quiz", True) and not state.get("quiz"):
+            print(">>> BƯỚC 11: TẠO QUIZ TƯƠNG TÁC", file=sys.stderr)
+            prompt_quiz = (prompts.get("quiz", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "quiz"
+            quiz = send_or_recover_generation_prompt(
+                page,
+                state,
+                "quiz",
+                prompt_quiz,
+            )
+            state["quiz"] = quiz
+            clear_pending_generation_prompt(state, "quiz", prompt_quiz)
+            persist_generation_state(state)
+
+        # Legacy metadata fallback if individual steps are not configured but metadata is on
+        if pipeline.get("metadata") and not any(state.get(k) for k in ("title", "slug", "description", "tags", "pinned_comment", "quiz")) and not state.get("metadata"):
+            print(">>> BƯỚC CŨ: TẠO METADATA & QUIZ", file=sys.stderr)
             prompt6 = prompts.get("metadata", "") + STRICT_NO_FILLER
             state["current_step"] = "metadata"
             metadata = send_or_recover_generation_prompt(
@@ -2515,9 +2624,9 @@ def _run_complete(transcript: str, state: dict) -> dict:
             clear_pending_generation_prompt(state, "metadata", prompt6)
             persist_generation_state(state)
 
-        # Step 7: Chapters
-        if pipeline["chapters"] and not state.get("chapters"):
-            print(">>> BƯỚC 7: TẠO CHAPTERS", file=sys.stderr)
+        # Step 12: Chapters
+        if pipeline.get("chapters", True) and not state.get("chapters"):
+            print(">>> BƯỚC 12: TẠO CHAPTERS", file=sys.stderr)
             prompt7 = prompts.get("chapters", "") + STRICT_NO_FILLER
             state["current_step"] = "chapters"
             try:
@@ -2784,6 +2893,74 @@ def generate_chapters_only(
             return sanitize_chapter_response(chapters)
         finally:
             context.close()
+
+
+def generate_single_component_only(
+    chat_url: str,
+    prompt_key: str,
+    prompt_version: str = "",
+) -> str:
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception("Profile directory not found. Please run the auto-login tool first.")
+
+    conversation_url = get_video_chat_url(chat_url)
+    with sync_playwright() as p:
+        context = launch_chatgpt_context(p.chromium, profile_dir)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(conversation_url, wait_until="domcontentloaded")
+            check_chatgpt_page_attention(page)
+            ensure_expected_conversation_page(page.url, conversation_url)
+            time.sleep(2)
+
+            original_prompt_version = os.environ.get("PROMPT_VERSION")
+            if prompt_version:
+                os.environ["PROMPT_VERSION"] = prompt_version
+            try:
+                prompts = get_active_prompts()
+            finally:
+                if original_prompt_version is not None:
+                    os.environ["PROMPT_VERSION"] = original_prompt_version
+                else:
+                    os.environ.pop("PROMPT_VERSION", None)
+
+            raw_prompt = prompts.get(prompt_key, "")
+            if not raw_prompt:
+                from auto_yt.default_prompts import DEFAULT_PROMPTS_DATA
+                raw_prompt = DEFAULT_PROMPTS_DATA["versions"]["default"]["prompts"].get(prompt_key, "")
+
+            full_prompt = raw_prompt.strip() + STRICT_NO_FILLER
+            response = send_prompt(page, full_prompt).strip()
+            if not response:
+                raise RuntimeError(f"ChatGPT did not return content for {prompt_key}.")
+            return response
+        finally:
+            context.close()
+
+
+def generate_title_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "title", prompt_version)
+
+
+def generate_slug_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "slug", prompt_version)
+
+
+def generate_description_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "description", prompt_version)
+
+
+def generate_tags_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "tags", prompt_version)
+
+
+def generate_pinned_comment_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "pinned_comment", prompt_version)
+
+
+def generate_quiz_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "quiz", prompt_version)
 
 
 def generate_metadata_only(

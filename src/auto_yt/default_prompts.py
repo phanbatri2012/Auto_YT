@@ -8,7 +8,12 @@ DEFAULT_PROMPTS_DATA = {
             "project_url": "https://chatgpt.com/g/g-p-6a1f9204f2d88191b39b64eb7f2dbb97-dd-vn2-phan-tich/project",
             "default_voice_id": "",
             "pipeline": {
-                "metadata": True,
+                "title": True,
+                "slug": True,
+                "description": True,
+                "tags": True,
+                "pinned_comment": True,
+                "quiz": True,
                 "chapters": True,
                 "thumbnail_with_text": True,
                 "thumbnail_without_text": True,
@@ -30,6 +35,7 @@ DEFAULT_PROMPTS_DATA = {
                 "made_for_kids": None,
                 "notify_subscribers": True,
                 "contains_synthetic_media": True,
+                "description_template": "{description}\n\n{chapters}\n\n{tags}",
             },
             "prompts": {
                 "outline": "Bạn là biên tập viên nội dung cho kênh YouTube Đinh Đoàn Phân Tích. Dưới đây là một kịch bản dài đã có sẵn. Dưới góc nhìn của tiến sĩ, Chuyên gia tâm lý Đinh Đoàn Đinh Đoàn phân tích Hãy chia nội dung này thành các phần lớn hợp lý theo dòng chảy tự nhiên của câu chuyện để dễ viết lại thành lời dẫn video. Không cần đặt tiêu đề cho từng phần. Hãy gộp thành các phần lớn, KHÔNG tách nhỏ quá nhiều. Mỗi phần lớn chỉ cần trình bày dưới dạng gạch đầu dòng các ý chính cơ bản, nhưng phải bao quát đủ thông tin quan trọng như bản gốc, không cắt gọn mất ý chính, không viết tắt. Kiểm tra các Tên riêng, mốc thời gian, địa điểm, số liệu để sửa lại cho đúng.\n\nLưu ý CỰC KỲ QUAN TRỌNG: Khi lập dàn ý, CHỈ LẤY phần nội dung câu chuyện bám sát theo đúng TIÊU ĐỀ KỊCH BẢN. Tuyệt đối bỏ qua tất cả các nội dung khác (ví dụ như đoạn quảng cáo, giới thiệu đầu video, hoặc các câu chuyện phụ không liên quan đến tiêu đề).\n\nQuan trọng: Định dạng mỗi phần bằng chuỗi [PHAN] ở đầu, ví dụ:\n[PHAN]\nNội dung phần 1...\n[PHAN]\nNội dung phần 2...\n\nDưới đây là kịch bản (Bao gồm Tiêu đề và Nội dung):\n{transcript}",
@@ -39,6 +45,18 @@ DEFAULT_PROMPTS_DATA = {
                 "body": "Bạn là biên tập viên nội dung cho kênh YouTube Thấu Hiểu Hôn Nhân. Dưới góc nhìn của tiến sĩ, Chuyên gia tâm lý Đinh Đoàn Đinh Đoàn kể lại Hãy viết tiếp phần nội dung trước,không lặp lại nội dung đã viết trước đó,không viết vào nội dung phần sau, viết ngắn gọn, súc tích, không xuống dòng, không sử dụng dấu gạch ngang \"—\", không dùng dấu gạch ngang \"–\", nhưng phải đảm bảo đầy đủ dấu câu, rõ ràng, dễ đọc và dễ đọc thành lời. Nội dung viết lại phải giữ đầy đủ ý so với bản gốc, tốt hơn nếu chi tiết và sâu sắc hơn. Giọng văn cần mạch lạc, có nhịp kể hợp lý, phù hợp với phong cách kể chuyện về gia đình, giúp người xem dễ theo dõi và bị cuốn hút,không viết tắt.\n\nDưới đây là phần dàn ý cần viết lại ở lượt này:\n{part}",
                 
                 "outro": "viết outro cho video (viết lại nội dung đầy đủ chi tiết, nội dung viết liền không cần xuống dòng) :\n- kết luận.\n- Lời cảm ơn đến người xem.\n- Kêu gọi like, chia sẻ và đăng ký kênh.\n- Nhắc nhở về việc bình luận và chia sẻ ý kiến về câu chuyện\n- Hứa hẹn cập nhật những câu chuyện hấp dẫn nhất trong các video tiếp theo.\n- Kêu gọi nhấn nút \"Tham gia\" để đăng ký thành viên hoặc gửi \"Cảm ơn\"",
+                
+                "title": "Dựa vào toàn bộ nội dung vừa viết, hãy viết tiêu đề video YouTube theo phong cách giật gân, chuẩn SEO, sử dụng từ ngữ gây tò mò hoặc sốc để thu hút người xem. Các từ khóa chính cần được VIẾT HOA để tăng khả năng nhận diện. Tiêu đề không được vượt quá 100 ký tự, khiến người xem tò mò về câu chuyện chưa từng được kể hoặc ít người biết đến và phải đủ sức khiến người xem muốn bấm vào ngay. Chỉ trả về tiêu đề, không kèm lời giải thích thừa.",
+                
+                "slug": "Dựa vào nội dung kịch bản vừa viết, hãy tạo một URL slug ngắn gọn, dễ nhớ, thân thiện với SEO dùng làm tên file và đường dẫn. Slug chỉ sử dụng chữ thường không dấu và dấu gạch ngang (ví dụ: bai-hoc-cuoc-song-y-nghia), không chứa ký tự đặc biệt, không quá 50 ký tự. Chỉ trả về duy nhất chuỗi slug.",
+                
+                "description": "Dựa vào toàn bộ nội dung vừa viết, hãy viết một đoạn mô tả video ngắn gọn, súc tích, hấp dẫn chuẩn SEO, tóm tắt đúng nội dung cốt lõi của câu chuyện và có lời kêu gọi tương tác ngắn.",
+                
+                "tags": "Dựa vào nội dung video vừa viết, hãy đề xuất chính xác từ 3 đến 5 hashtag liên quan trực tiếp nhất đến nội dung video (ưu tiên tên nhân vật, sự kiện lịch sử, chủ đề ngách), đảm bảo là các từ khóa có thứ hạng cao và lượng tìm kiếm lớn để tăng khả năng được đề xuất. Các tag được viết trên 1 hàng, có # ở đầu, trong 1 tag các từ viết liền nhau, tuyệt đối không viết quá 5 hashtag và không chèn các hashtag chung chung ngoài lề.",
+                
+                "pinned_comment": "Hãy gợi ý một bình luận ghim cho video với vai trò là chủ kênh. Nội dung bình luận cần viết thành một đoạn hoàn chỉnh, mang tính gợi mở hoặc đặt câu hỏi nhằm khuyến khích người xem tương tác, chia sẻ quan điểm hoặc cảm xúc về video. dùng icon, xuống dòng từng ý, ngắn gọn khoảng 1-2 dòng.",
+                
+                "quiz": "Dựa vào nội dung vid trên hãy Tạo 1 câu hỏi và 4 câu trả lời dành cho khán giả trả lời (câu hỏi không đc quá 100 ký tự, câu trả lời không đc quá 30 ký tự). sau đó hãy tạo nội dung giải thích cho câu hỏi (không được quá 200 ký tự).hãy chỉ ra câu trả lời đúng. bắt đầu bằng: theo các bạn...",
                 
                 "metadata": "Dựa vào toàn bộ nội dung vừa viết, hãy thực hiện các yêu cầu sau:\n- Hãy viết tiêu đề video YouTube theo phong cách giật gân, chuẩn SEO, sử dụng từ ngữ gây tò mò hoặc sốc để thu hút người xem. Các từ khóa chính cần được VIẾT HOA để tăng khả năng nhận diện. Tiêu đề không được vượt quá 100 ký tự, khiến người xem tò mò về câu chuyện chưa từng được kể hoặc ít người biết đến và phải đủ sức khiến người xem muốn bấm vào ngay.\n- Hãy tạo lại một URL slug ngắn gọn, dễ nhớ, thân thiện với SEO. Slug chỉ sử dụng chữ thường và dấu gạch ngang, không có dấu tiếng Việt, không chứa ký tự đặc biệt, và phải phản ánh đúng nội dung chính của video. slug url không quá 50 ký tự.\n- Hãy viết một đoạn mô tả video ngắn gọn, súc tích, hấp dẫn chuẩn SEO, tóm tắt đúng nội dung cốt lõi của câu chuyện và lời kêu gọi tương tác ngắn. Sau đó, đề xuất chính xác từ 3 đến 5 hashtag liên quan trực tiếp nhất đến nội dung video (ưu tiên tên nhân vật, sự kiện lịch sử, chủ đề ngách), đảm bảo là các từ khóa có thứ hạng cao và lượng tìm kiếm lớn để tăng khả năng được đề xuất. Các tag được viết trên 1 hàng, có # ở đầu, trong 1 tag các từ viết liền nhau, tuyệt đối không viết quá 5 hashtag và không chèn các hashtag chung chung ngoài lề.\n- Hãy gợi ý một bình luận ghim cho video với vai trò là chủ kênh. Nội dung bình luận cần viết thành một đoạn hoàn chỉnh, mang tính gợi mở hoặc đặt câu hỏi nhằm khuyến khích người xem tương tác, chia sẻ quan điểm hoặc cảm xúc về video. dùng icon, xuống dòng từng ý, ngắn gọn khoảng 1-2 dòng.\n- Dựa vào nội dung vid trên hãy Tạo 1 câu hỏi và 4 câu trả lời dành cho khán giả trả lời (câu hỏi không đc quá 100 ký tự, câu trả lời không đc quá 30 ký tự). sau đó hãy tạo nội dung giải thích cho câu hỏi (không được quá 200 ký tự).hãy chỉ ra câu trả lời đúng. bắt đầu bằng: theo các bạn...",
                 

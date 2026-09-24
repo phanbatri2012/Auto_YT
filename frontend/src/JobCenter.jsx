@@ -29,6 +29,12 @@ function formatDate(value) {
 }
 
 const PIPELINE_LABELS = {
+  title: 'Tiêu đề',
+  slug: 'Slug',
+  description: 'Mô tả',
+  tags: 'Tags',
+  pinned_comment: 'Ghim',
+  quiz: 'Quiz',
   metadata: 'Metadata',
   chapters: 'Chapter',
   thumbnail_with_text: 'Ảnh có chữ',

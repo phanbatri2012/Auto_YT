@@ -89,3 +89,42 @@ SLUG: video-thieu-mo-ta
   assert.ok(combinedSection)
   assert.match(combinedSection.content, /^00:00 Mở đầu/)
 })
+
+test('parses standalone individual metadata tags', () => {
+  const result = parseVideoSections(`
+### [INTRO]
+Mở đầu video.
+### [BODY]
+Nội dung video.
+### [TIÊU ĐỀ]
+10 Bí Ẩn Lớn Nhất Vũ Trụ
+### [SLUG]
+10-bi-an-lon-nhat-vu-tru
+### [MÔ TẢ]
+Khám phá những bí ẩn chưa có lời giải của không gian.
+### [TAGS]
+#VuTru #KhoaHoc #BiAn
+### [BÌNH LUẬN GHIM]
+Bạn thích bí ẩn nào nhất trong video này? Hãy bình luận nhé!
+### [QUIZ]
+Thiên hà gần Dải Ngân Hà nhất là gì?
+A. Andromeda
+B. Triangulum
+C. Centaurus A
+D. Messier 87
+Đáp án: A
+### [CHAPTERS]
+00:00 Mở đầu
+01:30 Bí ẩn 1
+`)
+
+  assert.equal(result.find(s => s.title === 'TIÊU ĐỀ VIDEO')?.content, '10 Bí Ẩn Lớn Nhất Vũ Trụ')
+  assert.equal(result.find(s => s.title === 'URL SLUG')?.content, '10-bi-an-lon-nhat-vu-tru')
+  const descSec = result.find(s => s.title === 'MÔ TẢ, TAG & CHAPTERS')
+  assert.ok(descSec)
+  assert.match(descSec.content, /Khám phá những bí ẩn/)
+  assert.match(descSec.content, /00:00 Mở đầu/)
+  assert.match(descSec.content, /#VuTru #KhoaHoc/)
+  assert.match(result.find(s => s.title === 'QUIZ')?.content, /Andromeda/)
+  assert.equal(result.find(s => s.title === 'BÌNH LUẬN GHIM')?.content, 'Bạn thích bí ẩn nào nhất trong video này? Hãy bình luận nhé!')
+})

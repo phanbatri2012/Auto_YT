@@ -13,7 +13,12 @@ DEFAULT_CHATGPT_PROJECT_URL = (
 )
 PROMPT_PIPELINE_ENV = "PROMPT_PIPELINE_JSON"
 DEFAULT_PROMPT_PIPELINE = {
-    "metadata": True,
+    "title": True,
+    "slug": True,
+    "description": True,
+    "tags": True,
+    "pinned_comment": True,
+    "quiz": True,
     "chapters": True,
     "thumbnail_with_text": True,
     "thumbnail_without_text": True,
@@ -40,6 +45,7 @@ DEFAULT_PUBLISHING_SETTINGS = {
     "made_for_kids": None,
     "notify_subscribers": True,
     "contains_synthetic_media": True,
+    "description_template": "{description}\n\n{chapters}\n\n{tags}",
 }
 
 
@@ -51,7 +57,7 @@ def _pipeline_dependencies(thumbnail_variant: str) -> dict[str, tuple[str, ...]]
     )
     return {
         "video_render": ("audio",),
-        "youtube_upload": ("video_render", "metadata", thumbnail_step),
+        "youtube_upload": ("video_render", "title", "description", "tags", thumbnail_step),
         "youtube_schedule": ("youtube_upload",),
     }
 
@@ -88,10 +94,19 @@ def normalize_prompt_pipeline(
 ) -> dict[str, bool]:
     """Return a complete, dependency-safe pipeline for legacy config data."""
     pipeline = value if isinstance(value, dict) else {}
-    normalized = {
-        key: pipeline.get(key) if isinstance(pipeline.get(key), bool) else default
-        for key, default in DEFAULT_PROMPT_PIPELINE.items()
-    }
+    legacy_metadata = pipeline.get("metadata")
+    normalized = {}
+    for key, default in DEFAULT_PROMPT_PIPELINE.items():
+        if isinstance(pipeline.get(key), bool):
+            normalized[key] = pipeline[key]
+        elif (
+            key in {"title", "slug", "description", "tags", "pinned_comment", "quiz"}
+            and isinstance(legacy_metadata, bool)
+        ):
+            normalized[key] = legacy_metadata
+        else:
+            normalized[key] = default
+
     resolved_variant = thumbnail_variant
     if resolved_variant is None and normalized.get("youtube_upload"):
         with_text = normalized.get("thumbnail_with_text", False)
@@ -112,31 +127,22 @@ def validate_prompt_pipeline(
         return dict(DEFAULT_PROMPT_PIPELINE)
     if not isinstance(value, dict):
         raise ValueError("Cấu hình pipeline của bộ prompt không hợp lệ.")
-    unknown_keys = set(value) - set(DEFAULT_PROMPT_PIPELINE)
+    cleaned_value = {k: v for k, v in value.items() if v is not None}
+    allowed_keys = set(DEFAULT_PROMPT_PIPELINE) | {"metadata"}
+    unknown_keys = set(cleaned_value) - allowed_keys
     if unknown_keys:
         raise ValueError(
             "Pipeline chứa bước không được hỗ trợ: " + ", ".join(sorted(unknown_keys))
         )
     invalid_keys = [
-        key for key, enabled in value.items() if not isinstance(enabled, bool)
+        key for key, enabled in cleaned_value.items() if not isinstance(enabled, bool)
     ]
     if invalid_keys:
         raise ValueError(
             "Trạng thái bước pipeline phải là bật hoặc tắt: "
             + ", ".join(sorted(invalid_keys))
         )
-    normalized = {
-        key: value.get(key, default) for key, default in DEFAULT_PROMPT_PIPELINE.items()
-    }
-    resolved_variant = thumbnail_variant
-    if resolved_variant is None and normalized.get("youtube_upload"):
-        with_text = normalized.get("thumbnail_with_text", False)
-        without_text = normalized.get("thumbnail_without_text", False)
-        if with_text != without_text:
-            resolved_variant = "with_text" if with_text else "without_text"
-    return resolve_prompt_pipeline_dependencies(
-        normalized, resolved_variant or "without_text"
-    )[0]
+    return normalize_prompt_pipeline(cleaned_value, thumbnail_variant)
 
 
 def normalize_image_generation_settings(value: object) -> dict:
@@ -206,6 +212,11 @@ def normalize_publishing_settings(value: object) -> dict:
     )
     # All videos produced by this pipeline use synthetic scene images.
     normalized["contains_synthetic_media"] = True
+    template_val = settings.get("description_template")
+    if isinstance(template_val, str):
+        normalized["description_template"] = template_val
+    else:
+        normalized["description_template"] = DEFAULT_PUBLISHING_SETTINGS["description_template"]
     return normalized
 
 
@@ -231,6 +242,11 @@ def validate_publishing_settings(value: object) -> dict:
     notify_subscribers = settings.get("notify_subscribers", True)
     if not isinstance(notify_subscribers, bool):
         raise ValueError("Thiết lập thông báo người đăng ký không hợp lệ.")
+    desc_template = settings.get("description_template")
+    if desc_template is not None and not isinstance(desc_template, str):
+        raise ValueError("Mẫu mô tả YouTube phải là chuỗi ký tự.")
+    if isinstance(desc_template, str) and len(desc_template) > 5000:
+        raise ValueError("Mẫu mô tả YouTube không được vượt quá 5000 ký tự.")
     return normalize_publishing_settings(settings)
 
 

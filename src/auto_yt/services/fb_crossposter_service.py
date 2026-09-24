@@ -1140,8 +1140,8 @@ def upload_large_video_resumable(
     )
     time.sleep(10)
 
-    max_finish_retries = 10
-    finish_delays = [10, 15, 20, 30, 45, 60, 60, 90, 90, 120]
+    max_finish_retries = 12
+    finish_delays = [15, 20, 30, 45, 60, 60, 90, 90, 120, 120, 150, 180]
     last_finish_error = None
     finish_data: dict[str, Any] | None = None
 
@@ -3025,6 +3025,36 @@ def process_queue_item_jit(
             "meta_error_message": safe_error,
             "upload_phase": "finish_failed" if is_retryable_finish else str(current_item.get("upload_phase") or ""),
         })
+        if is_retryable_finish:
+            logger.info("Attempting JIT auto-recovery reconcile for video #%d after transient Meta finish delay...", item_id)
+            time.sleep(15)
+            try:
+                recovery_res = reconcile_fb_queue_item(item_id)
+                rec_status = str(recovery_res.get("status") or "")
+                if rec_status in {"meta_scheduled", "published"}:
+                    rec_post_id = str(recovery_res.get("fb_post_id") or "")
+                    logger.info("JIT auto-recovery succeeded for video #%d: %s (Post ID: %s)", item_id, rec_status, rec_post_id)
+                    if sys_job_id:
+                        try:
+                            db.update_system_job(
+                                sys_job_id,
+                                status="completed",
+                                progress=f"Meta đã xác nhận trạng thái {rec_status} sau tự động phục hồi (Post ID: {rec_post_id})",
+                                error="",
+                                finished_at=db.utc_now(),
+                            )
+                        except Exception:
+                            pass
+                    return {
+                        "success": True,
+                        "status": rec_status,
+                        "fb_post_id": rec_post_id,
+                        "item_id": item_id,
+                        "title": title,
+                    }
+            except Exception as rec_exc:
+                logger.warning("JIT auto-recovery reconcile failed: %s", rec_exc)
+
         if sys_job_id:
             try:
                 db.update_system_job(

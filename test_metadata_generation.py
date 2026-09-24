@@ -139,8 +139,10 @@ class MetadataGenerationTests(unittest.TestCase):
                     status="ready",
                 )
 
-                # Third video should get -2
-                third_name = database.resolve_render_filename(video3_id, "khe-sanh-1968", renders_dir)
+                # Third video should get -2 (test keyword argument renders_dir)
+                third_name = database.resolve_render_filename(
+                    video3_id, "khe-sanh-1968", renders_dir=renders_dir
+                )
                 self.assertEqual(third_name, "khe-sanh-1968-2")
 
     def test_extracts_inline_and_multiline_generated_titles(self):

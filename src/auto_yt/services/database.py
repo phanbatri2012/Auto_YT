@@ -5033,50 +5033,6 @@ def delete_fb_crossposter_campaign(page_id: str) -> bool:
         conn.close()
 
 
-# ==============================================================================
-# Helper & Slugs
-# ==============================================================================
-
-# Helpers and extract_generated_video_slug are defined at top of file
-
-def resolve_render_filename(
-    video_id: int,
-    base_slug: str,
-    output_dir: Path | str | None = None,
-) -> str:
-    target_dir = Path(output_dir) if output_dir else Path("renders")
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    try:
-        own_artifact = conn.execute(
-            "SELECT path FROM video_artifacts WHERE video_id = ? AND artifact_type = 'final_mp4' ORDER BY id DESC LIMIT 1",
-            (video_id,),
-        ).fetchone()
-        if own_artifact:
-            own_stem = Path(own_artifact["path"]).stem
-            if own_stem == base_slug or own_stem.startswith(f"{base_slug}-"):
-                return own_stem
-
-        other_artifacts = conn.execute(
-            "SELECT video_id, path FROM video_artifacts WHERE video_id != ? AND artifact_type = 'final_mp4'",
-            (video_id,),
-        ).fetchall()
-        used_stems = {Path(row["path"]).stem for row in other_artifacts}
-
-        candidate = base_slug
-        candidate_file = target_dir / f"{candidate}.mp4"
-        if candidate not in used_stems and not candidate_file.exists():
-            return candidate
-
-        index = 1
-        while True:
-            candidate = f"{base_slug}-{index}"
-            candidate_file = target_dir / f"{candidate}.mp4"
-            if candidate not in used_stems and not candidate_file.exists():
-                return candidate
-            index += 1
-    finally:
-        conn.close()
 
 
 def _decode_json_field(value: str, fallback):

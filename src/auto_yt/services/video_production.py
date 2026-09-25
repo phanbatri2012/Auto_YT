@@ -566,16 +566,22 @@ def _generate_scene_image(
                 asset_url = await worker.generate_scene(prompt, avoid, refs)
             except Exception as first_err:
                 logger.warning(
-                    "First attempt generate_scene for scene %d failed (%s). Retrying with safe minimal prompt...",
+                    "First attempt generate_scene for scene %d failed (%s). Retrying with generic context-aware fallback prompt...",
                     scene.get("index", 0),
                     first_err,
                 )
-                safe_subject = scene.get("subject") or "characters"
-                safe_clean_subject = _sanitize_scene_prompt_context(safe_subject, max_chars=60) or "people"
-                safe_prompt = (
-                    f"Authentic Vietnamese cinematic photography: {safe_clean_subject} in contemporary Vietnam, "
-                    f"calm atmosphere, natural documentary lighting, photorealistic 8k, 16:9 widescreen"
+                safe_clean_subject = _sanitize_scene_prompt_context(
+                    scene.get("subject") or scene.get("transcript", "") or "",
+                    max_chars=120,
                 )
+                raw_style = str(settings.get("style_prompt") or profile.get("style_prompt") or "").strip()
+                concise_style = raw_style.split("\n")[0][:200].strip() if raw_style else "Cinematic documentary visual style, photorealistic, 8k resolution"
+                context_desc = f"Scene depiction: {safe_clean_subject}. " if safe_clean_subject else ""
+                safe_prompt = (
+                    f"A cinematic still photograph: {concise_style}. "
+                    f"{context_desc}"
+                    f"16:9 widescreen still photograph, authentic realism, dramatic atmospheric lighting."
+                ).replace("  ", " ").strip()
                 asset_url = await worker.generate_scene(safe_prompt, "", refs)
 
             await worker.download_image(asset_url, str(target))
@@ -1850,12 +1856,12 @@ def build_default_visual_scene_plan(
                     f"16:9 widescreen, photorealistic 8k, authentic documentary realism."
                 ).replace("  ", " ").strip()
         elif is_video:
-            # Subsequent intro video scenes: Story-aware dynamic continuation
+            # Subsequent intro video scenes: Story-aware dramatic continuation
             prompt = (
-                f"A cinematic movie scene: {style}, dramatic intro scene {w['index'] + 1} continuation. "
+                f"A cinematic documentary photograph: {style}, scene {w['index'] + 1} dramatic storytelling. "
                 f"{ref_note}"
                 f"{context_part}"
-                f"16:9 widescreen, cinematic dynamic lighting, continuous dramatic motion."
+                f"16:9 widescreen still photograph, authentic realism, dramatic lighting."
             ).replace("  ", " ").strip()
         else:
             # Standard body/outro scene

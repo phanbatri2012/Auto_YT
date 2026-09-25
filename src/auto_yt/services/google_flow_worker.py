@@ -127,28 +127,64 @@ class GoogleFlowWorker:
         await self.handle_confirmation_prompts()
 
     async def handle_confirmation_prompts(self) -> bool:
-        """Automatically approve credit spend or assistant confirmation prompts."""
-        approve_selectors = [
-            "button:has-text('Always approve')",
-            "div[role='button']:has-text('Always approve')",
-            "[aria-label*='Always approve' i]",
+        """Automatically approve credit spend or assistant confirmation prompts, strictly prioritizing 'Always approve'."""
+        # Priority 1: Always approve (Luôn phê duyệt) - remembers permission for entire session
+        always_approve_selectors = [
+            "[role='button']:has-text('Luôn phê duyệt')",
+            "div.chat-action-button:has-text('Luôn phê duyệt')",
+            "div:has-text('Luôn phê duyệt')",
             "button:has-text('Luôn phê duyệt')",
-            "button:has-text('Approve')",
-            "div[role='button']:has-text('Approve')",
-            "[aria-label*='Approve' i]",
+            "[aria-label*='Luôn phê duyệt' i]",
+            "[role='button']:has-text('Always approve')",
+            "div.chat-action-button:has-text('Always approve')",
+            "div:has-text('Always approve')",
+            "button:has-text('Always approve')",
+            "[aria-label*='Always approve' i]",
+        ]
+
+        # Priority 2: Single approve (Phê duyệt) - fallback if 'Always approve' is not present
+        single_approve_selectors = [
+            "[role='button']:has-text('Phê duyệt')",
+            "div:has-text('Phê duyệt')",
             "button:has-text('Phê duyệt')",
             "button:has-text('Xác nhận')",
+            "[aria-label*='Phê duyệt' i]",
+            "[role='button']:has-text('Approve')",
+            "div:has-text('Approve')",
+            "button:has-text('Approve')",
+            "[aria-label*='Approve' i]",
         ]
-        for sel in approve_selectors:
+
+        for sel in always_approve_selectors:
             try:
                 btn = self.page.locator(sel).first
                 if await btn.is_visible(timeout=300):
-                    logger.info("Found confirmation prompt ('%s'), clicking to approve...", sel)
+                    logger.info("Found 'Always approve' prompt ('%s'), clicking to grant persistent permission...", sel)
+                    try:
+                        await btn.scroll_into_view_if_needed(timeout=1000)
+                    except Exception:
+                        pass
                     await btn.click(force=True, timeout=2000)
                     await asyncio.sleep(0.5)
                     return True
             except Exception:
                 continue
+
+        for sel in single_approve_selectors:
+            try:
+                btn = self.page.locator(sel).first
+                if await btn.is_visible(timeout=300):
+                    logger.info("Found single confirmation prompt ('%s'), clicking to approve...", sel)
+                    try:
+                        await btn.scroll_into_view_if_needed(timeout=1000)
+                    except Exception:
+                        pass
+                    await btn.click(force=True, timeout=2000)
+                    await asyncio.sleep(0.5)
+                    return True
+            except Exception:
+                continue
+
         return False
 
     async def wait_for_editor(self, timeout: float = 30.0) -> Locator:

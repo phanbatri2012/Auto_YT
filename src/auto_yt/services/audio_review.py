@@ -39,11 +39,16 @@ EDITORIAL_PREFIXES = (
     "thêm ",
     "triển khai ",
     "viết lại ",
+    "mở đầu bằng ",
+    "giảm tiết lộ ",
+    "làm rõ mốc ",
 )
 STRUCTURAL_NARRATIVE_LABEL_PATTERN = re.compile(
     r"^(?:intro|body|outro|giới thiệu|dẫn nhập|lời dẫn|"
     r"mở\s+(?:đầu|bài)|nội\s+dung\s+chính|thân\s+bài|"
     r"kết\s+(?:luận|bài|thúc)|lời\s+kết|"
+    r"thu\s+gọn|mở\s+rộng|"
+    r"(?:mở\s+(?:đầu|bài)|kết\s+(?:thúc|bài|luận)|intro|body|outro|thân\s+bài)\s+(?:video|kịch\s+bản|bài\s+viết)(?:\s+.*)?|"
     r"phần\s+(?:\d+|intro|body|outro|giới thiệu|dẫn nhập|"
     r"mở\s+(?:đầu|bài)|nội\s+dung\s+chính|thân\s+bài|"
     r"kết\s+(?:luận|bài|thúc)))\s*:?\s*$",

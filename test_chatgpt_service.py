@@ -1209,6 +1209,43 @@ class ChatGptServiceTests(unittest.TestCase):
             "Phần 2: Cách ứng xử phù hợp",
         ])
 
+    def test_narrative_sanitizer_removes_canvas_headers_and_suggestion_chips(self):
+        long_paragraph = (
+            "Chiến tranh biên giới Tây Nam là một cuộc chiến đặc biệt cả về tốc độ, "
+            "quy mô lực lượng và thời gian kéo dài sau đó. Quân đội nhân dân Việt Nam "
+            "đã huy động lực lượng lớn cùng với quân giải phóng Campuchia tiến công. " * 2
+        ).strip()
+        raw_text = (
+            f"Nội dung chính\n\n"
+            f"{long_paragraph}\n\n"
+            f"Thu gọn\n"
+            f"Mở đầu bằng cú móc ngắn hơn\n"
+            f"Giảm tiết lộ kết quả chiến dịch\n"
+            f"Làm rõ mốc thời gian then chốt"
+        )
+        result = chatgpt_worker.sanitize_narrative_response(raw_text)
+        self.assertEqual(result, long_paragraph)
+        self.assertNotIn("Nội dung chính", result)
+        self.assertNotIn("Thu gọn", result)
+        self.assertNotIn("Mở đầu bằng cú móc", result)
+
+    def test_narrative_sanitizer_removes_inline_canvas_headers(self):
+        long_paragraph = (
+            "Chỉ trong chưa đầy một tháng, một thế trận tưởng như sẽ kéo dài đã sụp đổ "
+            "với tốc độ khiến cả chiến trường Campuchia đảo chiều. " * 3
+        ).strip()
+        raw_text = f"Mở đầu video: {long_paragraph}"
+        result = chatgpt_worker.sanitize_narrative_response(raw_text)
+        self.assertEqual(result, long_paragraph)
+        self.assertFalse(result.startswith("Mở đầu video"))
+
+    def test_dedup_consecutive_paragraphs_removes_subset_duplicates(self):
+        p1 = "Đây là một đoạn văn bản rất dài về lịch sử quân sự của chiến trường biên giới Tây Nam trong năm 1979 với nhiều sự kiện."
+        p2 = "Đây là một đoạn văn bản rất dài về lịch sử quân sự của chiến trường biên giới Tây Nam trong năm 1979 với nhiều sự kiện. Đoạn này có thêm thông tin chi tiết hơn về các cánh quân."
+        result = chatgpt_worker.dedup_consecutive_paragraphs(f"{p1}\n\n{p2}")
+        self.assertEqual(result, p2)
+
 
 if __name__ == "__main__":
     unittest.main()
+

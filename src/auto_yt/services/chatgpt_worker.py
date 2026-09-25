@@ -1347,22 +1347,41 @@ def looks_like_citation_artifact(text: str) -> bool:
 
 
 def clean_text(text: str) -> str:
-    """Removes 'Edit', citations, search badges, and common AI conversational fillers from the output."""
+    """Removes 'Edit', citations, search badges, Canvas artifacts, and common AI conversational fillers from the output."""
     if not isinstance(text, str) or not text:
         return ""
     text = remove_citation_artifacts(text)
+    
+    # Strip inline structural/canvas headers prepended to paragraphs (e.g. "Nội dung chính: ...", "Mở đầu video: ...")
+    canvas_inline_header = re.compile(
+        r"^(?:(?:mở\s+(?:đầu|bài)|kết\s+(?:thúc|bài|luận)|intro|body|outro|thân\s+bài)\s+(?:video|kịch\s+bản|bài\s+viết)|nội\s+dung\s+chính)\s*[:\-–—]?\s*",
+        flags=re.IGNORECASE,
+    )
+    
     lines = text.split('\n')
     cleaned = []
-    skip_keywords = ["dưới đây là", "trân trọng gửi", "chắc chắn rồi", "dạ vâng", "vâng,", "đã hoàn thành", "bạn chưa cung cấp", "nội dung hoàn chỉnh", "chào bạn"]
+    skip_keywords = [
+        "dưới đây là", "trân trọng gửi", "chắc chắn rồi", "dạ vâng", "vâng,",
+        "đã hoàn thành", "bạn chưa cung cấp", "nội dung hoàn chỉnh", "chào bạn",
+        "thu gọn", "mở rộng"
+    ]
     for line in lines:
-        lower_line = line.strip().lower()
+        stripped = line.strip()
+        if not stripped:
+            cleaned.append("")
+            continue
+        lower_line = stripped.lower()
         if lower_line == "edit":
             continue
         if any(lower_line.startswith(kw) for kw in skip_keywords):
             continue
         if lower_line.endswith(":") and len(line) < 100 and ("đây" in lower_line or "sau" in lower_line or "hoàn chỉnh" in lower_line):
             continue
-        cleaned.append(line)
+        if looks_like_editorial_artifact(lower_line):
+            continue
+        # Strip inline header if present at start of line
+        stripped_line = canvas_inline_header.sub("", line).strip()
+        cleaned.append(stripped_line if stripped_line else line)
     
     result = '\n'.join(cleaned).strip()
     # Remove leading 'Edit' that might be left if it wasn't on its own line
@@ -1406,7 +1425,7 @@ def _is_short_narrative_artifact(block: str) -> tuple[bool, bool]:
 
 
 def dedup_consecutive_paragraphs(text: str, min_chars: int = 60) -> str:
-    """Remove consecutive duplicate paragraphs within a text block."""
+    """Remove consecutive duplicate or near-duplicate paragraphs within a text block."""
     if not isinstance(text, str) or not text:
         return text
     blocks = [b.strip() for b in re.split(r"\n[ \t]*\n+", text) if b.strip()]
@@ -1416,6 +1435,14 @@ def dedup_consecutive_paragraphs(text: str, min_chars: int = 60) -> str:
         if deduped and len(normalized) >= min_chars:
             prev_normalized = re.sub(r"\s+", " ", deduped[-1]).strip()
             if normalized == prev_normalized:
+                continue
+            # If current block is a prefix/suffix/substring of previous or vice-versa
+            if len(prev_normalized) >= min_chars and (
+                normalized in prev_normalized
+                or prev_normalized in normalized
+            ):
+                if len(normalized) > len(prev_normalized):
+                    deduped[-1] = block
                 continue
         deduped.append(block)
     return "\n\n".join(deduped)
@@ -1594,6 +1621,11 @@ def _extract_clean_markdown_text(node) -> str:
     try:
         cleaned = node.evaluate("""(el) => {
             const clone = el.cloneNode(true);
+
+            // 1. Remove all buttons (assistant responses are pure markdown/prose; all <button> elements are UI artifacts: Copy, Collapse, Suggestions, Search, Citations, etc.)
+            clone.querySelectorAll('button').forEach((b) => b.remove());
+
+            // 2. Remove specific citation, search, attribution, and Canvas UI selectors
             const junkSelectors = [
                 '[data-testid*="citation"]',
                 '[data-testid*="source"]',
@@ -1601,18 +1633,50 @@ def _extract_clean_markdown_text(node) -> str:
                 'a[class*="citation"]',
                 'div[class*="citation"]',
                 'span[class*="citation"]',
-                'button[aria-label*="citation" i]',
-                'button[aria-label*="trích dẫn" i]',
-                'button[data-testid*="search"]',
                 '.citation',
                 '[class*="citation-"]',
                 '[class*="attribution-"]',
                 '[data-citation-index]',
                 'sup.citation',
+                '[data-testid*="canvas-header"]',
+                '[data-testid*="document-header"]',
+                '[class*="canvas-header"]',
+                '[class*="document-header"]',
+                '[class*="suggestion"]',
+                '[class*="pill"]',
+                '[class*="chip"]',
+                '[data-testid*="suggestion"]',
+                '[data-testid*="action-pill"]',
+                '[data-testid*="canvas-action"]',
+                '[data-testid*="canvas-title"]',
             ];
             junkSelectors.forEach((sel) => {
                 clone.querySelectorAll(sel).forEach((badEl) => badEl.remove());
             });
+
+            // 3. Remove standalone Canvas title headers & controls
+            clone.querySelectorAll('div, span, p, header').forEach((elem) => {
+                const txt = (elem.textContent || '').trim().toLowerCase();
+                if (
+                    txt === 'nội dung chính' ||
+                    txt === 'outro video' ||
+                    txt === 'mở đầu video' ||
+                    txt === 'kết thúc video' ||
+                    txt === 'thân bài' ||
+                    txt === 'thu gọn' ||
+                    txt === 'mở rộng' ||
+                    txt.startsWith('mở đầu bằng cú móc') ||
+                    txt.startsWith('giảm tiết lộ') ||
+                    txt.startsWith('làm rõ mốc') ||
+                    txt.startsWith('tăng nhịp') ||
+                    txt.startsWith('rút gọn chi tiết')
+                ) {
+                    if (elem.children.length === 0) {
+                        elem.remove();
+                    }
+                }
+            });
+
             return clone.innerText || clone.textContent || '';
         }""")
         if isinstance(cleaned, str) and cleaned.strip():
@@ -1643,7 +1707,18 @@ def _read_assistant_message(message) -> str:
             and not _is_pure_thinking_indicator(markdown_text)
             and markdown_text not in markdown_parts
         ):
-            markdown_parts.append(markdown_text)
+            # If this markdown part is a subset of an existing one or vice versa, keep the longer one
+            is_subset = False
+            for existing_idx, existing in enumerate(markdown_parts):
+                if markdown_text in existing:
+                    is_subset = True
+                    break
+                elif existing in markdown_text:
+                    markdown_parts[existing_idx] = markdown_text
+                    is_subset = True
+                    break
+            if not is_subset:
+                markdown_parts.append(markdown_text)
     if markdown_parts:
         return "\n\n".join(markdown_parts)
     fallback = _extract_clean_markdown_text(message)

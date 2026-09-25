@@ -287,23 +287,30 @@ try {
     }
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $activePortListeners = @()
     do {
-        Start-Sleep -Milliseconds 300
-        $remainingProjectListeners = @()
-        $snapshot = Get-ProcessSnapshot
+        Start-Sleep -Milliseconds 150
+        $activePortListeners = @()
         foreach ($port in $servicePorts) {
-            foreach ($listenerId in Get-ListeningProcessIds $port) {
-                $proc = $snapshot | Where-Object { [int]$_.ProcessId -eq [int]$listenerId } | Select-Object -First 1
-                if ($proc -and (Test-AutoYTProcess $proc -or [string]$proc.CommandLine -match "api_server:app" -or [string]$proc.CommandLine -match "auto_yt")) {
-                    $remainingProjectListeners += $listenerId
-                }
+            $listeners = @(Get-ListeningProcessIds $port)
+            if ($listeners.Length -gt 0) {
+                $activePortListeners += $listeners
             }
         }
-    } while ($remainingProjectListeners.Count -gt 0 -and (Get-Date) -lt $deadline)
+        if ($activePortListeners.Length -eq 0) {
+            break
+        }
+    } while ((Get-Date) -lt $deadline)
 
-    if ($remainingProjectListeners.Count -gt 0) {
-        foreach ($remId in $remainingProjectListeners) {
-            Stop-Process -Id $remId -Force -ErrorAction SilentlyContinue
+    if ($activePortListeners.Length -gt 0) {
+        $snapshot = Get-ProcessSnapshot
+        foreach ($port in $servicePorts) {
+            foreach ($listenerId in @(Get-ListeningProcessIds $port)) {
+                $proc = $snapshot | Where-Object { [int]$_.ProcessId -eq [int]$listenerId } | Select-Object -First 1
+                if ($proc -and (Test-AutoYTProcess $proc -or [string]$proc.CommandLine -match "api_server:app" -or [string]$proc.CommandLine -match "auto_yt")) {
+                    Stop-Process -Id $listenerId -Force -ErrorAction SilentlyContinue
+                }
+            }
         }
     }
 

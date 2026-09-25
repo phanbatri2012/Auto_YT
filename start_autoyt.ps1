@@ -282,12 +282,9 @@ function Test-OmniVoiceReady {
         return $response.StatusCode -eq 200
     }
     catch {
-        $responseProperty = $_.Exception.PSObject.Properties["Response"]
-        if ($responseProperty -and $null -ne $responseProperty.Value) {
-            $statusCodeProperty = $responseProperty.Value.PSObject.Properties["StatusCode"]
-            if ($statusCodeProperty -and [int]$statusCodeProperty.Value -eq 401) {
-                return $true
-            }
+        if ($_.Exception -is [System.Net.WebException] -and $_.Exception.Response) {
+            $status = [int]$_.Exception.Response.StatusCode
+            return ($status -eq 401 -or $status -eq 200)
         }
         return $false
     }
@@ -384,10 +381,11 @@ function Wait-ForService {
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         if (& $Probe) {
-            Write-Step "$Name is ready."
+            $elapsedStr = [math]::Round($timer.Elapsed.TotalSeconds, 1)
+            Write-Step "$Name is ready ($elapsedStr s)."
             return
         }
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 300
     }
     throw "$Name did not become ready within $TimeoutSeconds seconds."
 }
@@ -475,11 +473,7 @@ function Ensure-PythonEnvironment {
         ""
     }
 
-    $dependenciesHealthy = $false
-    if ($installedFingerprint -eq $requirementsFingerprint) {
-        & $venvPython -m pip check *> $null
-        $dependenciesHealthy = $LASTEXITCODE -eq 0
-    }
+    $dependenciesHealthy = ($installedFingerprint -ne "" -and $installedFingerprint -eq $requirementsFingerprint)
 
     if (-not $dependenciesHealthy) {
         Write-Step "Installing Python dependencies."
@@ -493,21 +487,30 @@ function Ensure-PythonEnvironment {
         Write-Step "Python dependencies are up to date."
     }
 
-    $playwrightVersion = (& $venvPython -c "from importlib.metadata import version; print(version('playwright'))").Trim()
-    $installedBrowsers = @(& $venvPython -m playwright install --list 2>&1)
-    $browserListExitCode = $LASTEXITCODE
-    $browserListText = $installedBrowsers -join "`n"
-    $versionPattern = [regex]::Escape($playwrightVersion)
-    $currentVersionBlock = @(
-        $browserListText -split "Playwright version:\s*" |
-            Where-Object { $_ -match "^$versionPattern(?:\r?\n|$)" }
-    ) | Select-Object -First 1
-    $chromiumReady = $browserListExitCode -eq 0 -and
-        $currentVersionBlock -match "(?m)^\s+.*[\\/]chromium-\d+\s*$"
+    $playwrightStamp = Join-Path $venvRoot ".autoyt-playwright.stamp"
+    $playwrightHealthy = (Test-Path -LiteralPath $playwrightStamp -PathType Leaf) -and $dependenciesHealthy
 
-    if (-not $chromiumReady) {
-        Write-Step "Installing the Playwright Chromium browser."
-        Invoke-ExternalCommand $venvPython @("-m", "playwright", "install", "chromium") "Chromium installation failed"
+    if (-not $playwrightHealthy) {
+        $playwrightVersion = (& $venvPython -c "from importlib.metadata import version; print(version('playwright'))").Trim()
+        $installedBrowsers = @(& $venvPython -m playwright install --list 2>&1)
+        $browserListExitCode = $LASTEXITCODE
+        $browserListText = $installedBrowsers -join "`n"
+        $versionPattern = [regex]::Escape($playwrightVersion)
+        $currentVersionBlock = @(
+            $browserListText -split "Playwright version:\s*" |
+                Where-Object { $_ -match "^$versionPattern(?:\r?\n|$)" }
+        ) | Select-Object -First 1
+        $chromiumReady = $browserListExitCode -eq 0 -and
+            $currentVersionBlock -match "(?m)^\s+.*[\\/]chromium-\d+\s*$"
+
+        if (-not $chromiumReady) {
+            Write-Step "Installing the Playwright Chromium browser."
+            Invoke-ExternalCommand $venvPython @("-m", "playwright", "install", "chromium") "Chromium installation failed"
+        }
+        else {
+            Write-Step "Playwright Chromium is ready."
+        }
+        Set-Content -LiteralPath $playwrightStamp -Value "playwright-$playwrightVersion" -Encoding ASCII -NoNewline
     }
     else {
         Write-Step "Playwright Chromium is ready."
@@ -660,21 +663,7 @@ try {
             }
         }
 
-        # 2. Ensure OmniVoice Worker is running on port 8011
-        if (-not $omniVoiceReady) {
-            Ensure-PythonEnvironment
-            Start-OmniVoiceWorker
-            try {
-                Wait-ForService "OmniVoice TTS Worker (8011)" ${function:Test-OmniVoiceReady} 45
-                $omniVoiceReady = $true
-            }
-            catch {
-                Write-Warning "OmniVoice worker did not respond within timeout. Audio generation will fallback to remote/Genmax if configured."
-                $omniVoiceReady = $false
-            }
-        }
-
-        # 3. Start Frontend UI on port 5173
+        # 2. Start Frontend UI on port 5173 (runs concurrently while background workers initialize)
         if (-not $frontendReady) {
             if (Test-PortInUse 5173) {
                 Wait-ForService "Frontend (5173)" ${function:Test-FrontendReady} 10
@@ -714,6 +703,25 @@ try {
                 }
             }
         }
+
+        # 3. Verify OmniVoice Worker readiness on port 8011
+        if (-not $omniVoiceReady) {
+            try {
+                Wait-ForService "OmniVoice TTS Worker (8011)" ${function:Test-OmniVoiceReady} 10
+                $omniVoiceReady = $true
+            }
+            catch {
+                Start-OmniVoiceWorker
+                try {
+                    Wait-ForService "OmniVoice TTS Worker (8011)" ${function:Test-OmniVoiceReady} 15
+                    $omniVoiceReady = $true
+                }
+                catch {
+                    Write-Warning "OmniVoice worker did not respond within timeout. Audio generation will fallback to remote/Genmax if configured."
+                    $omniVoiceReady = $false
+                }
+            }
+        }
     }
 
     if (-not $backendReady -or -not $frontendReady) {
@@ -722,13 +730,13 @@ try {
 
     # 4. Check Browser Services readiness (ChatGPT & Google Flow)
     Write-Step "Checking browser automation services (ChatGPT & Google Flow)..."
-    $browserDeadline = (Get-Date).AddSeconds(20)
+    $browserDeadline = (Get-Date).AddSeconds(3)
     do {
         $bs = Test-BrowserServicesReady
         if ($bs.ChatGPT -and $bs.GoogleFlow) {
             break
         }
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $browserDeadline)
 
     $finalBrowserState = Test-BrowserServicesReady

@@ -4054,6 +4054,32 @@ def _start_omnivoice_worker_safely() -> None:
         print(f"OmniVoice worker is unavailable: {message}", file=sys.stderr)
 
 
+def _start_chatgpt_browser_safely() -> None:
+    try:
+        browser_status = chatgpt_browser_service.start_browser_service()
+        if not browser_status.get("connected"):
+            print(
+                "ChatGPT Browser Service is unavailable; ChatGPT jobs will pause "
+                f"instead of opening a new window: {browser_status.get('message', '')}",
+                file=sys.stderr,
+            )
+    except Exception as exc:
+        print(f"ChatGPT Browser Service startup error: {exc}", file=sys.stderr)
+
+
+def _start_google_flow_browser_safely() -> None:
+    try:
+        flow_browser_status = google_flow_browser_service.start_browser_service()
+        if not flow_browser_status.get("connected"):
+            print(
+                "Google Flow Browser Service is unavailable: "
+                f"{flow_browser_status.get('message', '')}",
+                file=sys.stderr,
+            )
+    except Exception as exc:
+        print(f"Google Flow Browser Service startup error: {exc}", file=sys.stderr)
+
+
 @app.on_event("startup")
 def resume_background_jobs() -> None:
     global _comment_sync_thread, _tts_preview_cleanup_thread
@@ -4076,20 +4102,16 @@ def resume_background_jobs() -> None:
             daemon=True,
             name="omnivoice-api-startup",
         ).start()
-    browser_status = chatgpt_browser_service.start_browser_service()
-    if not browser_status.get("connected"):
-        print(
-            "ChatGPT Browser Service is unavailable; ChatGPT jobs will pause "
-            f"instead of opening a new window: {browser_status.get('message', '')}",
-            file=sys.stderr,
-        )
-    flow_browser_status = google_flow_browser_service.start_browser_service()
-    if not flow_browser_status.get("connected"):
-        print(
-            "Google Flow Browser Service is unavailable: "
-            f"{flow_browser_status.get('message', '')}",
-            file=sys.stderr,
-        )
+    threading.Thread(
+        target=_start_chatgpt_browser_safely,
+        daemon=True,
+        name="chatgpt-browser-startup",
+    ).start()
+    threading.Thread(
+        target=_start_google_flow_browser_safely,
+        daemon=True,
+        name="google-flow-browser-startup",
+    ).start()
     for task in db.get_active_audio_tasks():
         _start_audio_watcher(task["video_id"])
     db.recover_interrupted_system_jobs("video_generation")

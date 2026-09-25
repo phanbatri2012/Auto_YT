@@ -17,7 +17,45 @@ const DEFAULT_PIPELINE = {
   youtube_schedule: false
 };
 
+const GOOGLE_FLOW_MODELS = [
+  {
+    id: 'nano_banana_pro',
+    name: 'Nano Banana Pro (Imagen 3 Fast)',
+    badge: '🟢 Tiết kiệm Credit',
+    creditLabel: '🟢 Thấp nhất (~1 credit/ảnh)',
+    speed: '⚡ 3–5s',
+    description: '⭐ Khuyên dùng mặc định để tiết kiệm credit tối đa. Tốc độ sinh nhanh, màu sắc chân thực, phù hợp tạo 30–50 cảnh visual cho video dài.',
+    recommended: true
+  },
+  {
+    id: 'imagen_3_standard',
+    name: 'Google Imagen 3 (High-Fidelity)',
+    badge: '🟡 Chất lượng cao',
+    creditLabel: '🟡 Trung bình (~2–3 credit/ảnh)',
+    speed: '⏳ 8–12s',
+    description: 'Chất lượng siêu thực cao cấp. Tái tạo biểu cảm nhân vật, bàn tay, ánh sáng và chi tiết da xuất sắc; bám sát prompt phức tạp.'
+  },
+  {
+    id: 'imagen_3_photoreal',
+    name: 'Google Imagen 3 (Photorealistic / 35mm)',
+    badge: '🟡 Tư liệu thực tế',
+    creditLabel: '🟡 Tiêu chuẩn (~2 credit/ảnh)',
+    speed: '⏳ 6–10s',
+    description: 'Phong cách ảnh tư liệu / Điện ảnh thực tế. Tối ưu đặc biệt cho video kể chuyện, phim tài liệu, hạn chế cảm giác bóng bẩy 3D/CGI.'
+  },
+  {
+    id: 'google_veo_intro',
+    name: 'Google Veo (Intro Video Generator)',
+    badge: '🔴 Video AI',
+    creditLabel: '🔴 Cao (~10–20 credit/clip)',
+    speed: '🐌 30–60s',
+    description: 'Sinh video chuyển động AI 4–8 giây cho cảnh mở đầu để giữ chân người xem. (Chỉ nên bật cho cảnh đầu tiên để bảo toàn credit).'
+  }
+];
+
 const DEFAULT_IMAGE_GENERATION_SETTINGS = {
+  provider: 'google_flow',
+  model: 'nano_banana_pro',
   style_prompt: '',
   avoid_prompt: '',
   negative_prompt: '',
@@ -1541,7 +1579,24 @@ export default function Settings({
               💾 Lưu cấu hình ảnh
             </button>
           </div>
-          <div className="production-settings-grid">
+          <div className="production-settings-grid" style={{ marginBottom: 12 }}>
+            <label>
+              Model tạo ảnh Google Flow
+              <select
+                className="version-select"
+                value={currentImageGeneration.model || 'nano_banana_pro'}
+                onChange={event => handlePromptSettingChange(
+                  'image_generation_settings', 'model', event.target.value
+                )}
+                disabled={activeVersionLocked}
+              >
+                {GOOGLE_FLOW_MODELS.map(m => (
+                  <option key={m.id} value={m.id}>
+                    {m.name} [{m.badge}]
+                  </option>
+                ))}
+              </select>
+            </label>
             <label>
               Thumbnail dùng để upload
               <select
@@ -1574,6 +1629,33 @@ export default function Settings({
               </label>
             ))}
           </div>
+
+          {/* Model Info Card */}
+          {(() => {
+            const selectedModel = GOOGLE_FLOW_MODELS.find(
+              m => m.id === (currentImageGeneration.model || 'nano_banana_pro')
+            ) || GOOGLE_FLOW_MODELS[0];
+            return (
+              <div
+                style={{
+                  background: 'rgba(255, 255, 255, 0.04)',
+                  border: '1px solid rgba(255, 255, 255, 0.12)',
+                  borderRadius: 8,
+                  padding: '10px 14px',
+                  marginBottom: 14,
+                  fontSize: '0.85rem'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                  <strong style={{ color: '#6ee7b7' }}>{selectedModel.name}</strong>
+                  <span style={{ fontSize: '0.78rem', color: '#93c5fd' }}>({selectedModel.creditLabel} • {selectedModel.speed})</span>
+                </div>
+                <div style={{ color: '#d1d5db', lineHeight: 1.4 }}>
+                  {selectedModel.description}
+                </div>
+              </div>
+            );
+          })()}
           <div className="help-text" style={{ marginBottom: 12 }}>
             Hệ thống ưu tiên biên câu trong khoảng 25–35 giây, rồi dùng ChatGPT qua
             Playwright để tạo visual bible và prompt riêng cho từng cảnh.

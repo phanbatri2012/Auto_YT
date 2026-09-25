@@ -23,6 +23,8 @@ DEFAULT_PROMPTS_DATA = {
                 "youtube_schedule": False,
             },
             "image_generation_settings": {
+                "provider": "google_flow",
+                "model": "nano_banana_pro",
                 "workflow_profile_id": "",
                 "style_prompt": "",
                 "negative_prompt": "",

@@ -555,6 +555,55 @@ class PromptSettingsTests(unittest.TestCase):
         self.assertNotIn("comfyui_workflow_profile", snapshot)
         self.assertNotIn("workflow_profile_id", img)
 
+    def test_save_and_normalize_google_flow_models(self):
+        """Test that different Google Flow models can be saved and unknown models fall back to nano_banana_pro."""
+        # 1. Test saving standard Imagen 3
+        res = main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                model="imagen_3_standard",
+                style_prompt="photorealistic portrait",
+                density=30,
+                thumbnail_variant="without_text",
+            ),
+        )
+        self.assertEqual(res["version"]["image_generation_settings"]["model"], "imagen_3_standard")
+
+        # 2. Test saving Veo intro
+        res = main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                model="google_veo_intro",
+                style_prompt="cinematic intro hook",
+                density=30,
+                thumbnail_variant="without_text",
+            ),
+        )
+        self.assertEqual(res["version"]["image_generation_settings"]["model"], "google_veo_intro")
+
+        # 3. Test unknown model fallback to nano_banana_pro
+        res = main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                model="non_existent_model_xyz",
+                style_prompt="",
+                density=30,
+                thumbnail_variant="without_text",
+            ),
+        )
+        self.assertEqual(res["version"]["image_generation_settings"]["model"], "nano_banana_pro")
+
+        # 4. Restore default model nano_banana_pro
+        main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                model="nano_banana_pro",
+                style_prompt="",
+                density=30,
+                thumbnail_variant="without_text",
+            ),
+        )
+
 
     def test_rejects_blank_name_and_unknown_prompt(self):
         with self.assertRaises(HTTPException) as blank_name_error:

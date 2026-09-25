@@ -29,9 +29,52 @@ DEFAULT_PROMPT_PIPELINE = {
 }
 
 THUMBNAIL_VARIANTS = {"with_text", "without_text"}
+DEFAULT_IMAGE_MODEL = "nano_banana_pro"
+GOOGLE_FLOW_MODELS = {
+    "nano_banana_pro": {
+        "id": "nano_banana_pro",
+        "name": "Nano Banana Pro (Imagen 3 Fast)",
+        "provider": "google_flow",
+        "credit_tier": "low",
+        "credit_label": "🟢 Thấp nhất (~1 credit/ảnh)",
+        "speed": "⚡ 3–5s",
+        "description": "⭐ Khuyên dùng mặc định để tiết kiệm credit tối đa. Tốc độ sinh nhanh, màu sắc chân thực, phù hợp tạo 30–50 cảnh visual cho video dài.",
+        "is_default": True,
+    },
+    "imagen_3_standard": {
+        "id": "imagen_3_standard",
+        "name": "Google Imagen 3 (High-Fidelity)",
+        "provider": "google_flow",
+        "credit_tier": "medium",
+        "credit_label": "🟡 Trung bình (~2–3 credit/ảnh)",
+        "speed": "⏳ 8–12s",
+        "description": "Chất lượng siêu thực cao cấp. Tái tạo biểu cảm nhân vật, bàn tay, ánh sáng và chi tiết da xuất sắc; bám sát prompt phức tạp.",
+        "is_default": False,
+    },
+    "imagen_3_photoreal": {
+        "id": "imagen_3_photoreal",
+        "name": "Google Imagen 3 (Photorealistic / 35mm)",
+        "provider": "google_flow",
+        "credit_tier": "standard",
+        "credit_label": "🟡 Tiêu chuẩn (~2 credit/ảnh)",
+        "speed": "⏳ 6–10s",
+        "description": "Phong cách ảnh tư liệu / Điện ảnh thực tế. Tối ưu đặc biệt cho video kể chuyện, phim tài liệu, hạn chế cảm giác bóng bẩy 3D/CGI.",
+        "is_default": False,
+    },
+    "google_veo_intro": {
+        "id": "google_veo_intro",
+        "name": "Google Veo (Intro Video Generator)",
+        "provider": "google_flow",
+        "credit_tier": "high",
+        "credit_label": "🔴 Cao (~10–20 credit/clip)",
+        "speed": "🐌 30–60s",
+        "description": "Sinh video chuyển động AI 4–8 giây cho cảnh mở đầu để giữ chân người xem. (Chỉ nên bật cho cảnh đầu tiên để bảo toàn credit).",
+        "is_default": False,
+    },
+}
 DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "provider": "google_flow",
-    "model": "nano_banana_pro",
+    "model": DEFAULT_IMAGE_MODEL,
     "style_prompt": "",
     "avoid_prompt": "",
     "negative_prompt": "",  # alias for avoid_prompt, kept for frontend compatibility
@@ -151,6 +194,16 @@ def validate_prompt_pipeline(
 def normalize_image_generation_settings(value: object) -> dict:
     settings = value if isinstance(value, dict) else {}
     normalized = dict(DEFAULT_IMAGE_GENERATION_SETTINGS)
+
+    # Model and Provider normalization
+    model = str(settings.get("model") or "").strip()
+    if model in GOOGLE_FLOW_MODELS:
+        normalized["model"] = model
+    else:
+        normalized["model"] = DEFAULT_IMAGE_MODEL
+
+    provider = str(settings.get("provider") or "").strip()
+    normalized["provider"] = provider if provider else "google_flow"
 
     # Both negative_prompt (used by frontend) and avoid_prompt (backend alias) are supported.
     avoid = str(settings.get("avoid_prompt") or "").strip()

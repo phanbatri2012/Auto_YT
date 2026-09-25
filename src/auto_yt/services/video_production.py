@@ -23,6 +23,7 @@ from auto_yt.paths import (
     RENDERS_DIR,
     SCENES_DIR,
     SEGMENTS_DIR,
+    THUMBNAILS_DIR,
     VISUAL_PLANS_DIR,
 )
 from auto_yt.services import database as db
@@ -1733,10 +1734,14 @@ def _sanitize_scene_prompt_context(text: str, max_chars: int = 140) -> str:
 def _sanitize_thumbnail_concept_for_scene0(raw_text: str, max_chars: int = 300) -> str:
     if not raw_text:
         return ""
+    # Strip any image URL tags or URLs first
+    cleaned = re.sub(r"\[IMAGE_URL:[^\]]*\]", "", raw_text)
+    cleaned = re.sub(r"https?://\S+", "", cleaned)
+    cleaned = re.sub(r"/api/thumbnails/\S+", "", cleaned)
     cleaned = re.sub(
         r"(?i)^(?:prompt(?:\s*(?:tiếng anh|chi tiết|hình ảnh))?|ý tưởng(?: thiết kế)?|mô tả)\s*[:：\-–—]\s*",
         "",
-        raw_text.strip(),
+        cleaned.strip(),
     )
     cleaned = re.sub(
         r"(?i)\b(?:thumbnail|font chữ|màu chữ|clickbait|tiêu đề|chữ to|dòng chữ|không có chữ|có chữ|chữ nổi bật|tỷ lệ khung hình 16:9)\b",
@@ -1775,16 +1780,34 @@ def build_default_visual_scene_plan(
         first_para = first_para[:250].rsplit(" ", 1)[0]
     style = first_para or "Cinematic documentary visual style, photorealistic, 8k resolution"
 
-    # Extract thumbnail concept without text for Scene 0
+    # Extract thumbnail reference file and concept for Scene 0
     clean_thumb_concept = ""
+    thumb_ref_path = ""
+    thumb_ref_id = ""
     if generated_script:
-        thumb_match = re.search(
-            r"### \[(?:THUMBNAIL KHÔNG CHỮ|THUMBNAIL_WITHOUT_TEXT|THUMBNAIL NOTEXT|THUMBNAIL)\]\s*\n(.*?)(?=\n### \[|\Z)",
+        # Priority 1: Thumbnail KHÔNG CHỮ (clean visual without text overlay)
+        thumb_img_match = re.search(
+            r"### \[(?:THUMBNAIL KHÔNG CHỮ|THUMBNAIL_WITHOUT_TEXT|THUMBNAIL NOTEXT)\]\s*\n(.*?)(?=\n### \[|\Z)",
             generated_script,
             flags=re.DOTALL | re.IGNORECASE,
         )
-        if thumb_match:
-            clean_thumb_concept = _sanitize_thumbnail_concept_for_scene0(thumb_match.group(1))
+        if not thumb_img_match:
+            # Priority 2: Fallback to other thumbnail section if notext not found
+            thumb_img_match = re.search(
+                r"### \[(?:THUMBNAIL CÓ CHỮ|THUMBNAIL)\]\s*\n(.*?)(?=\n### \[|\Z)",
+                generated_script,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+        if thumb_img_match:
+            sec_content = thumb_img_match.group(1)
+            url_match = re.search(r"\[IMAGE_URL:(?:/api/thumbnails/)?([a-zA-Z0-9_\-\.]+)\]", sec_content)
+            if url_match:
+                img_name = Path(url_match.group(1)).name
+                candidate_path = THUMBNAILS_DIR / img_name
+                if candidate_path.is_file() and candidate_path.stat().st_size > 0:
+                    thumb_ref_path = str(candidate_path)
+                    thumb_ref_id = "thumb_anchor"
+            clean_thumb_concept = _sanitize_thumbnail_concept_for_scene0(sec_content)
 
     scenes = []
     for w in windows:
@@ -1805,7 +1828,13 @@ def build_default_visual_scene_plan(
         is_video = bool(w.get("is_video") or w.get("media_type") == "video")
 
         if w["index"] == 0:
-            # Scene 0: Use Clean Thumbnail concept if available, otherwise story hook
+            # Scene 0: Attach thumbnail reference image if available
+            if thumb_ref_path:
+                ref_id = thumb_ref_id
+                ref_path = thumb_ref_path
+                ref_note = "Visual anchor from story thumbnail. "
+
+            # Scene 0: Use Clean Thumbnail concept text if available, otherwise story hook
             if clean_thumb_concept and len(clean_thumb_concept) >= 20:
                 prompt = (
                     f"A cinematic movie still: {style}, opening scene hook. "

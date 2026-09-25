@@ -532,10 +532,14 @@ class GoogleFlowWorker:
             await self.dismiss_blocking_dialogs()
             return
 
-        # Click "Add to prompt"
+        # Click "Add to prompt" / "Thêm vào câu lệnh"
         add_to_prompt_btn = self.page.locator(
             ".cdk-overlay-container button.detail-add-to-prompt-btn, "
-            "button:has-text('Add to prompt')"
+            "button:has-text('Thêm vào câu lệnh'), "
+            "[role='menuitem']:has-text('Thêm vào câu lệnh'), "
+            "button:has-text('Add to prompt'), "
+            "[role='menuitem']:has-text('Add to prompt'), "
+            ".cdk-overlay-container mat-icon:has-text('add')"
         ).first
         try:
             if await add_to_prompt_btn.is_visible(timeout=3000):
@@ -543,22 +547,27 @@ class GoogleFlowWorker:
                 await asyncio.sleep(0.8)
                 logger.info("Successfully attached reference ingredient '%s' to prompt bar.", target_ref)
             else:
-                logger.warning("'Add to prompt' button not visible.")
+                logger.warning("'Add to prompt' / 'Thêm vào câu lệnh' button not visible.")
         except Exception as exc:
             logger.warning("Failed to click 'Add to prompt': %s", exc)
         finally:
             await self.dismiss_blocking_dialogs()
 
     async def generate_scene(self, prompt: str, avoid_prompt: str, reference_ids: list[str]) -> str:
+        # Clean any URL / bracket tags from prompt
+        clean_prompt = re.sub(r"\[IMAGE_URL:[^\]]*\]", "", prompt)
+        clean_prompt = re.sub(r"https?://\S+", "", clean_prompt)
+        clean_prompt = re.sub(r"/api/thumbnails/\S+", "", clean_prompt).strip()
+
         # Snapshot existing generated images on the page
         existing_imgs = await self._get_existing_images()
 
         # Synchronize reference image ingredients with the prompt bar
         await self.sync_reference_ingredients(reference_ids)
 
-        full_prompt = prompt
+        full_prompt = clean_prompt
         if avoid_prompt:
-            full_prompt = f"{prompt}. Avoid: {avoid_prompt}"
+            full_prompt = f"{clean_prompt}. Avoid: {avoid_prompt}"
 
         # Locate prompt editor
         editor = await self.wait_for_editor(timeout=25.0)
@@ -887,7 +896,10 @@ class GoogleFlowWorker:
         # 2. Add strict negative prompt for text/watermarks
         strict_avoid = "text, letters, words, typography, watermark, logo, headline, caption, subtitle, poster text"
         combined_avoid = f"{avoid_prompt}, {strict_avoid}" if avoid_prompt else strict_avoid
-        full_prompt = f"{prompt}. Avoid: {combined_avoid}"
+        clean_prompt = re.sub(r"\[IMAGE_URL:[^\]]*\]", "", prompt)
+        clean_prompt = re.sub(r"https?://\S+", "", clean_prompt)
+        clean_prompt = re.sub(r"/api/thumbnails/\S+", "", clean_prompt).strip()
+        full_prompt = f"{clean_prompt}. Avoid: {combined_avoid}"
 
         # 3. Locate prompt editor
         editor = await self.wait_for_editor(timeout=25.0)

@@ -285,7 +285,12 @@ class PromptPipelineData(BaseModel):
 
 class PromptImageGenerationData(BaseModel):
     provider: str = "google_flow"
-    model: str = "nano_banana_pro"
+    model: str = "nano_banana_2"
+    aspect_ratio: str = "16:9"
+    output_count: int = 2
+    video_model: str = "omni_1_1_flash"
+    video_aspect_ratio: str = "16:9"
+    video_output_count: int = 1
     workflow_profile_id: str = Field(default="", max_length=120)
     reference_workflow_profile_id: str = Field(default="", max_length=120)
     style_prompt: str = Field(default="", max_length=8000)
@@ -295,6 +300,9 @@ class PromptImageGenerationData(BaseModel):
     outputs_per_scene: int = 1
     seed_mode: str = "random"
     thumbnail_variant: Literal["with_text", "without_text"] = "without_text"
+    enable_intro_video: bool = True
+    intro_scene_target_seconds: float = 8.0
+    intro_crop_watermark: bool = True
     scene_duration_min_seconds: int = Field(default=25, ge=10, le=90)
     scene_duration_target_seconds: int = Field(default=30, ge=10, le=90)
     scene_duration_max_seconds: int = Field(default=35, ge=10, le=90)

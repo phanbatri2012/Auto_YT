@@ -123,8 +123,45 @@ class GoogleFlowWorker:
             except Exception:
                 continue
 
-        # 3. Check and approve credit or assistant confirmation prompts
+        # 3. Check and auto-configure Agent Settings dialog if open
+        await self.handle_agent_settings_dialog()
+
+        # 4. Check and approve credit or assistant confirmation prompts
         await self.handle_confirmation_prompts()
+
+    async def handle_agent_settings_dialog(self) -> bool:
+        """If Agent Settings dialog ('Cài đặt tác nhân') is open, select 'Không bao giờ' (Never) and close."""
+        try:
+            settings_dialog = self.page.locator(
+                ":is(.cdk-overlay-pane, mat-dialog-container, div):has-text('Cài đặt tác nhân'), "
+                ":is(.cdk-overlay-pane, mat-dialog-container, div):has-text('Agent settings')"
+            ).first
+            if await settings_dialog.is_visible(timeout=300):
+                never_radio = self.page.locator(
+                    "mat-radio-button:has-text('Không bao giờ'), "
+                    "[role='radio']:has-text('Không bao giờ'), "
+                    "label:has-text('Không bao giờ'), "
+                    "div:has-text('Không bao giờ'):not(:has(*)), "
+                    "mat-radio-button:has-text('Never'), "
+                    "[role='radio']:has-text('Never')"
+                ).first
+                if await never_radio.is_visible(timeout=300):
+                    logger.info("Found 'Cài đặt tác nhân' dialog, selecting 'Không bao giờ' (Never ask confirmation)...")
+                    await never_radio.click(force=True, timeout=2000)
+                    await asyncio.sleep(0.4)
+
+                close_btn = self.page.locator(
+                    "button:has-text('close'), button mat-icon:has-text('close'), "
+                    "button[aria-label*='close' i], button[aria-label*='đóng' i], "
+                    "button.close-button"
+                ).first
+                if await close_btn.is_visible(timeout=400):
+                    await close_btn.click(force=True, timeout=1500)
+                    await asyncio.sleep(0.3)
+                return True
+        except Exception:
+            pass
+        return False
 
     async def handle_confirmation_prompts(self) -> bool:
         """Automatically approve credit spend or assistant confirmation prompts, strictly prioritizing 'Always approve'."""

@@ -17,15 +17,23 @@ const DEFAULT_PIPELINE = {
   youtube_schedule: false
 };
 
-const GOOGLE_FLOW_MODELS = [
+const GOOGLE_FLOW_IMAGE_MODELS = [
+  {
+    id: 'nano_banana_2',
+    name: '🍌 Nano Banana 2',
+    badge: '🟢 Chuẩn Google Flow',
+    creditLabel: '🟢 Tiết kiệm (~1 credit/ảnh)',
+    speed: '⚡ 3–5s',
+    description: '⭐ Model tạo ảnh mặc định mới nhất trên Google Flow. Tốc độ sinh nhanh, màu sắc chân thực, chi tiết sắc nét, phù hợp tạo 30–50 cảnh visual cho video dài.',
+    recommended: true
+  },
   {
     id: 'nano_banana_pro',
-    name: 'Nano Banana Pro (Imagen 3 Fast)',
+    name: 'Nano Banana Pro (Legacy)',
     badge: '🟢 Tiết kiệm Credit',
     creditLabel: '🟢 Thấp nhất (~1 credit/ảnh)',
     speed: '⚡ 3–5s',
-    description: '⭐ Khuyên dùng mặc định để tiết kiệm credit tối đa. Tốc độ sinh nhanh, màu sắc chân thực, phù hợp tạo 30–50 cảnh visual cho video dài.',
-    recommended: true
+    description: 'Model thế hệ tiền nhiệm, tương thích hoàn toàn với các prompt version cũ.'
   },
   {
     id: 'imagen_3_standard',
@@ -42,24 +50,70 @@ const GOOGLE_FLOW_MODELS = [
     creditLabel: '🟡 Tiêu chuẩn (~2 credit/ảnh)',
     speed: '⏳ 6–10s',
     description: 'Phong cách ảnh tư liệu / Điện ảnh thực tế. Tối ưu đặc biệt cho video kể chuyện, phim tài liệu, hạn chế cảm giác bóng bẩy 3D/CGI.'
+  }
+];
+
+const GOOGLE_FLOW_VIDEO_MODELS = [
+  {
+    id: 'omni_1_1_flash',
+    name: 'Omni 1.1 Flash',
+    badge: '⚡ Mặc định / Siêu tốc',
+    creditLabel: '🟡 Tiêu chuẩn (~10 credit/clip)',
+    speed: '⚡ 15–25s',
+    description: '⭐ Model tạo video AI mặc định mới nhất của Google Flow. Tốc độ sinh siêu nhanh, chuyển động mượt mà và phối cảnh nhất quán.',
+    recommended: true
+  },
+  {
+    id: 'veo_3_1_lite',
+    name: 'Veo 3.1 – Lite',
+    badge: '🟢 Tiết kiệm Credit',
+    creditLabel: '🟢 Thấp (~8 credit/clip)',
+    speed: '⏳ 20–30s',
+    description: 'Bản rút gọn của Veo 3.1, tối ưu chi phí credit cho các cảnh intro ngắn.'
+  },
+  {
+    id: 'veo_3_1_fast',
+    name: 'Veo 3.1 – Fast',
+    badge: '🟡 Tốc độ cao',
+    creditLabel: '🟡 Trung bình (~12 credit/clip)',
+    speed: '⏳ 25–40s',
+    description: 'Veo 3.1 phiên bản tối ưu tốc độ, cân bằng chuyển động điện ảnh và thời gian chờ.'
+  },
+  {
+    id: 'veo_3_1_quality',
+    name: 'Veo 3.1 – Quality',
+    badge: '🔴 Chất lượng Điện ảnh',
+    creditLabel: '🔴 Cao (~15–20 credit/clip)',
+    speed: '🐌 45–75s',
+    description: 'Veo 3.1 chất lượng cao nhất với độ sâu trường ảnh và ánh sáng chân thực tối đa.'
   },
   {
     id: 'google_veo_intro',
     name: 'Google Veo (Intro Video Generator)',
-    badge: '🔴 Video AI',
+    badge: '🔴 Video AI Legacy',
     creditLabel: '🔴 Cao (~10–20 credit/clip)',
     speed: '🐌 30–60s',
-    description: 'Sinh video chuyển động AI 4–8 giây cho cảnh mở đầu để giữ chân người xem. (Chỉ nên bật cho cảnh đầu tiên để bảo toàn credit).'
+    description: 'Sinh video chuyển động AI 4–8 giây cho cảnh mở đầu để giữ chân người xem (Legacy ID).'
   }
 ];
 
+const GOOGLE_FLOW_MODELS = [...GOOGLE_FLOW_IMAGE_MODELS, ...GOOGLE_FLOW_VIDEO_MODELS];
+
 const DEFAULT_IMAGE_GENERATION_SETTINGS = {
   provider: 'google_flow',
-  model: 'nano_banana_pro',
+  model: 'nano_banana_2',
+  aspect_ratio: '16:9',
+  output_count: 2,
+  video_model: 'omni_1_1_flash',
+  video_aspect_ratio: '16:9',
+  video_output_count: 1,
   style_prompt: '',
   avoid_prompt: '',
   negative_prompt: '',
   thumbnail_variant: 'without_text',
+  enable_intro_video: true,
+  intro_scene_target_seconds: 8.0,
+  intro_crop_watermark: true,
   scene_duration_min_seconds: 25,
   scene_duration_target_seconds: 30,
   scene_duration_max_seconds: 35
@@ -1566,9 +1620,9 @@ export default function Settings({
         <div className="prompt-item" style={{ marginBottom: '20px' }}>
           <div className="prompt-header">
             <div>
-              <label>🖼️ Cấu hình phân cảnh & tạo ảnh cho video MP4</label>
+              <label>🖼️ Cấu hình Media & Video Google Flow (Nano Banana 2 / Omni 1.1 / Veo 3.1)</label>
               <div className="help-text" style={{ marginTop: 5 }}>
-                Hệ thống chia phân cảnh theo câu từ phụ đề SRT (25–35s), tạo ảnh cảnh và dựng thành video MP4 hoàn chỉnh kèm hiệu ứng Zoom/Pan & phụ đề.
+                Hệ thống chia phân cảnh theo phụ đề SRT (25–35s), tạo ảnh/video chất lượng cao qua Google Flow và dựng thành video MP4 hoàn chỉnh.
               </div>
             </div>
             <button
@@ -1576,86 +1630,261 @@ export default function Settings({
               onClick={handleSaveImageGeneration}
               disabled={Boolean(savingSection) || activeVersionLocked}
             >
-              💾 Lưu cấu hình ảnh
+              💾 Lưu cấu hình media
             </button>
           </div>
-          <div className="production-settings-grid" style={{ marginBottom: 12 }}>
-            <label>
-              Model tạo ảnh Google Flow
-              <select
-                className="version-select"
-                value={currentImageGeneration.model || 'nano_banana_pro'}
-                onChange={event => handlePromptSettingChange(
-                  'image_generation_settings', 'model', event.target.value
-                )}
-                disabled={activeVersionLocked}
-              >
-                {GOOGLE_FLOW_MODELS.map(m => (
-                  <option key={m.id} value={m.id}>
-                    {m.name} [{m.badge}]
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Thumbnail dùng để upload
-              <select
-                className="version-select"
-                value={currentImageGeneration.thumbnail_variant}
-                onChange={event => handleThumbnailVariantChange(event.target.value)}
-                disabled={activeVersionLocked}
-              >
-                <option value="without_text">Không chữ</option>
-                <option value="with_text">Có chữ</option>
-              </select>
-            </label>
-            {[
-              ['scene_duration_min_seconds', 'Tối thiểu (giây)'],
-              ['scene_duration_target_seconds', 'Mục tiêu (giây)'],
-              ['scene_duration_max_seconds', 'Tối đa (giây)']
-            ].map(([key, label]) => (
-              <label key={key}>
-                {label}
-                <input
-                  type="number"
-                  min="10"
-                  max="90"
-                  value={currentImageGeneration[key]}
+
+          {/* Agent Settings Pro-tip Banner */}
+          <div
+            style={{
+              background: 'linear-gradient(135deg, rgba(59, 130, 246, 0.12), rgba(16, 185, 129, 0.08))',
+              border: '1px solid rgba(59, 130, 246, 0.25)',
+              borderRadius: 8,
+              padding: '12px 16px',
+              marginBottom: 16,
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: 12
+            }}
+          >
+            <span style={{ fontSize: '1.2rem', lineHeight: 1 }}>💡</span>
+            <div style={{ fontSize: '0.85rem', color: '#e2e8f0', lineHeight: 1.5 }}>
+              <strong style={{ color: '#93c5fd' }}>Mẹo tự động hóa mượt mà:</strong> Trên tài khoản Google Flow, bạn hãy vào <em>Cài đặt tác nhân (Agent settings)</em> &rarr; mục <em>Xác nhận trước khi tạo</em> &rarr; chọn <strong>"Không bao giờ"</strong> (Tác nhân sẽ tự động tạo nội dung nghe nhìn và trừ tín dụng). Thao tác này giúp bot sinh ảnh/video liên tục mà không bị dừng chờ duyệt popup.
+            </div>
+          </div>
+
+          {/* Section 1: Image Generation Configuration */}
+          <div style={{ marginBottom: 18 }}>
+            <h4 style={{ margin: '0 0 10px 0', fontSize: '0.95rem', color: '#6ee7b7', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span>📸</span> 1. Cấu hình Tạo Hình Ảnh (Image Models)
+            </h4>
+            <div className="production-settings-grid" style={{ marginBottom: 10 }}>
+              <label>
+                Model tạo ảnh
+                <select
+                  className="version-select"
+                  value={currentImageGeneration.model || 'nano_banana_2'}
                   onChange={event => handlePromptSettingChange(
-                    'image_generation_settings', key, Number(event.target.value)
+                    'image_generation_settings', 'model', event.target.value
+                  )}
+                  disabled={activeVersionLocked}
+                >
+                  {GOOGLE_FLOW_IMAGE_MODELS.map(m => (
+                    <option key={m.id} value={m.id}>
+                      {m.name} [{m.badge}]
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Tỉ lệ khung hình (Aspect)
+                <select
+                  className="version-select"
+                  value={currentImageGeneration.aspect_ratio || '16:9'}
+                  onChange={event => handlePromptSettingChange(
+                    'image_generation_settings', 'aspect_ratio', event.target.value
+                  )}
+                  disabled={activeVersionLocked}
+                >
+                  <option value="16:9">16:9 (YouTube Ngang)</option>
+                  <option value="9:16">9:16 (Shorts / Dọc)</option>
+                  <option value="1:1">1:1 (Vuông)</option>
+                  <option value="4:3">4:3 (Truyền thống)</option>
+                  <option value="3:4">3:4 (Dọc cổ điển)</option>
+                </select>
+              </label>
+
+              <label>
+                Số lượng ảnh / lần (Outputs)
+                <select
+                  className="version-select"
+                  value={currentImageGeneration.output_count || 2}
+                  onChange={event => handlePromptSettingChange(
+                    'image_generation_settings', 'output_count', Number(event.target.value)
+                  )}
+                  disabled={activeVersionLocked}
+                >
+                  <option value="1">x1 (1 ảnh)</option>
+                  <option value="2">x2 (2 ảnh - Mặc định Flow)</option>
+                  <option value="3">x3 (3 ảnh)</option>
+                  <option value="4">x4 (4 ảnh)</option>
+                </select>
+              </label>
+
+              <label>
+                Thumbnail dùng để upload
+                <select
+                  className="version-select"
+                  value={currentImageGeneration.thumbnail_variant}
+                  onChange={event => handleThumbnailVariantChange(event.target.value)}
+                  disabled={activeVersionLocked}
+                >
+                  <option value="without_text">Không chữ</option>
+                  <option value="with_text">Có chữ</option>
+                </select>
+              </label>
+
+              {[
+                ['scene_duration_min_seconds', 'Tối thiểu (giây)'],
+                ['scene_duration_target_seconds', 'Mục tiêu (giây)'],
+                ['scene_duration_max_seconds', 'Tối đa (giây)']
+              ].map(([key, label]) => (
+                <label key={key}>
+                  {label}
+                  <input
+                    type="number"
+                    min="10"
+                    max="90"
+                    value={currentImageGeneration[key]}
+                    onChange={event => handlePromptSettingChange(
+                      'image_generation_settings', key, Number(event.target.value)
+                    )}
+                    disabled={activeVersionLocked}
+                  />
+                </label>
+              ))}
+            </div>
+
+            {/* Selected Image Model Info Card */}
+            {(() => {
+              const selectedImgModel = GOOGLE_FLOW_IMAGE_MODELS.find(
+                m => m.id === (currentImageGeneration.model || 'nano_banana_2')
+              ) || GOOGLE_FLOW_IMAGE_MODELS[0];
+              return (
+                <div
+                  style={{
+                    background: 'rgba(255, 255, 255, 0.03)',
+                    border: '1px solid rgba(255, 255, 255, 0.08)',
+                    borderRadius: 8,
+                    padding: '8px 12px',
+                    fontSize: '0.82rem'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
+                    <strong style={{ color: '#6ee7b7' }}>{selectedImgModel.name}</strong>
+                    <span style={{ fontSize: '0.76rem', color: '#93c5fd' }}>({selectedImgModel.creditLabel} • {selectedImgModel.speed})</span>
+                  </div>
+                  <div style={{ color: '#cbd5e1', lineHeight: 1.4 }}>
+                    {selectedImgModel.description}
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* Section 2: AI Video Intro Configuration */}
+          <div style={{ marginBottom: 18, borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: 14 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+              <h4 style={{ margin: 0, fontSize: '0.95rem', color: '#a78bfa', display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span>🎬</span> 2. Cấu hình Tạo Video Intro (AI Video Models)
+              </h4>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: '0.88rem', color: '#f1f5f9' }}>
+                <input
+                  type="checkbox"
+                  checked={currentImageGeneration.enable_intro_video !== false}
+                  onChange={event => handlePromptSettingChange(
+                    'image_generation_settings', 'enable_intro_video', event.target.checked
                   )}
                   disabled={activeVersionLocked}
                 />
+                Bật sinh Video AI cho cảnh mở đầu
               </label>
-            ))}
+            </div>
+
+            {currentImageGeneration.enable_intro_video !== false && (
+              <>
+                <div className="production-settings-grid" style={{ marginBottom: 10 }}>
+                  <label>
+                    Model Video Google Flow
+                    <select
+                      className="version-select"
+                      value={currentImageGeneration.video_model || 'omni_1_1_flash'}
+                      onChange={event => handlePromptSettingChange(
+                        'image_generation_settings', 'video_model', event.target.value
+                      )}
+                      disabled={activeVersionLocked}
+                    >
+                      {GOOGLE_FLOW_VIDEO_MODELS.map(m => (
+                        <option key={m.id} value={m.id}>
+                          {m.name} [{m.badge}]
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label>
+                    Tỉ lệ Video Intro
+                    <select
+                      className="version-select"
+                      value={currentImageGeneration.video_aspect_ratio || '16:9'}
+                      onChange={event => handlePromptSettingChange(
+                        'image_generation_settings', 'video_aspect_ratio', event.target.value
+                      )}
+                      disabled={activeVersionLocked}
+                    >
+                      <option value="16:9">16:9 (Widescreen Ngang)</option>
+                      <option value="9:16">9:16 (Vertical Dọc)</option>
+                    </select>
+                  </label>
+
+                  <label>
+                    Thời lượng Intro mục tiêu (giây)
+                    <input
+                      type="number"
+                      min="4"
+                      max="15"
+                      step="0.5"
+                      value={currentImageGeneration.intro_scene_target_seconds || 8.0}
+                      onChange={event => handlePromptSettingChange(
+                        'image_generation_settings', 'intro_scene_target_seconds', Number(event.target.value)
+                      )}
+                      disabled={activeVersionLocked}
+                    />
+                  </label>
+
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 22, cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={currentImageGeneration.intro_crop_watermark !== false}
+                      onChange={event => handlePromptSettingChange(
+                        'image_generation_settings', 'intro_crop_watermark', event.target.checked
+                      )}
+                      disabled={activeVersionLocked}
+                    />
+                    <span>Cắt watermark SynthID</span>
+                  </label>
+                </div>
+
+                {/* Selected Video Model Info Card */}
+                {(() => {
+                  const selectedVidModel = GOOGLE_FLOW_VIDEO_MODELS.find(
+                    m => m.id === (currentImageGeneration.video_model || 'omni_1_1_flash')
+                  ) || GOOGLE_FLOW_VIDEO_MODELS[0];
+                  return (
+                    <div
+                      style={{
+                        background: 'rgba(255, 255, 255, 0.03)',
+                        border: '1px solid rgba(255, 255, 255, 0.08)',
+                        borderRadius: 8,
+                        padding: '8px 12px',
+                        fontSize: '0.82rem'
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
+                        <strong style={{ color: '#a78bfa' }}>{selectedVidModel.name}</strong>
+                        <span style={{ fontSize: '0.76rem', color: '#93c5fd' }}>({selectedVidModel.creditLabel} • {selectedVidModel.speed})</span>
+                      </div>
+                      <div style={{ color: '#cbd5e1', lineHeight: 1.4 }}>
+                        {selectedVidModel.description}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </>
+            )}
           </div>
 
-          {/* Model Info Card */}
-          {(() => {
-            const selectedModel = GOOGLE_FLOW_MODELS.find(
-              m => m.id === (currentImageGeneration.model || 'nano_banana_pro')
-            ) || GOOGLE_FLOW_MODELS[0];
-            return (
-              <div
-                style={{
-                  background: 'rgba(255, 255, 255, 0.04)',
-                  border: '1px solid rgba(255, 255, 255, 0.12)',
-                  borderRadius: 8,
-                  padding: '10px 14px',
-                  marginBottom: 14,
-                  fontSize: '0.85rem'
-                }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                  <strong style={{ color: '#6ee7b7' }}>{selectedModel.name}</strong>
-                  <span style={{ fontSize: '0.78rem', color: '#93c5fd' }}>({selectedModel.creditLabel} • {selectedModel.speed})</span>
-                </div>
-                <div style={{ color: '#d1d5db', lineHeight: 1.4 }}>
-                  {selectedModel.description}
-                </div>
-              </div>
-            );
-          })()}
           <div className="help-text" style={{ marginBottom: 12 }}>
             Hệ thống ưu tiên biên câu trong khoảng 25–35 giây, rồi dùng ChatGPT qua
             Playwright để tạo visual bible và prompt riêng cho từng cảnh.

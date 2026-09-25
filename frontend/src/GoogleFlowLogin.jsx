@@ -173,9 +173,9 @@ export default function GoogleFlowLogin() {
 
   return (
     <div className="auto-login-container">
-      <h1 className="hero-title">Google Flow (Veo3) Login</h1>
+      <h1 className="hero-title">Google Flow (Nano Banana 2 / Omni / Veo 3.1) Login</h1>
       <p className="hero-subtitle">
-        Quản lý tài khoản Google để tạo ảnh/video bằng Google Flow thay thế ComfyUI.
+        Quản lý tài khoản Google để tạo ảnh/video bằng Google Flow thế hệ mới.
       </p>
 
       {/* Browser Status */}

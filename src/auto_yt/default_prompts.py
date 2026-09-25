@@ -24,7 +24,12 @@ DEFAULT_PROMPTS_DATA = {
             },
             "image_generation_settings": {
                 "provider": "google_flow",
-                "model": "nano_banana_pro",
+                "model": "nano_banana_2",
+                "aspect_ratio": "16:9",
+                "output_count": 2,
+                "video_model": "omni_1_1_flash",
+                "video_aspect_ratio": "16:9",
+                "video_output_count": 1,
                 "workflow_profile_id": "",
                 "style_prompt": "",
                 "negative_prompt": "",

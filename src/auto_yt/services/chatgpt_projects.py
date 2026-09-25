@@ -29,22 +29,41 @@ DEFAULT_PROMPT_PIPELINE = {
 }
 
 THUMBNAIL_VARIANTS = {"with_text", "without_text"}
-DEFAULT_IMAGE_MODEL = "nano_banana_pro"
-GOOGLE_FLOW_MODELS = {
+DEFAULT_IMAGE_MODEL = "nano_banana_2"
+DEFAULT_VIDEO_MODEL = "omni_1_1_flash"
+
+SUPPORTED_ASPECT_RATIOS = {"16:9", "4:3", "1:1", "3:4", "9:16"}
+SUPPORTED_VIDEO_ASPECT_RATIOS = {"16:9", "9:16"}
+SUPPORTED_OUTPUT_COUNTS = {1, 2, 3, 4}
+
+GOOGLE_FLOW_IMAGE_MODELS = {
+    "nano_banana_2": {
+        "id": "nano_banana_2",
+        "name": "🍌 Nano Banana 2",
+        "provider": "google_flow",
+        "badge": "🟢 Chuẩn Google Flow",
+        "credit_tier": "low",
+        "credit_label": "🟢 Tiết kiệm (~1 credit/ảnh)",
+        "speed": "⚡ 3–5s",
+        "description": "⭐ Model tạo ảnh mặc định mới nhất trên Google Flow. Tốc độ sinh nhanh, màu sắc chân thực, chi tiết sắc nét, phù hợp tạo 30–50 cảnh visual cho video dài.",
+        "is_default": True,
+    },
     "nano_banana_pro": {
         "id": "nano_banana_pro",
         "name": "Nano Banana Pro (Imagen 3 Fast)",
         "provider": "google_flow",
+        "badge": "🟢 Tiết kiệm Credit",
         "credit_tier": "low",
         "credit_label": "🟢 Thấp nhất (~1 credit/ảnh)",
         "speed": "⚡ 3–5s",
-        "description": "⭐ Khuyên dùng mặc định để tiết kiệm credit tối đa. Tốc độ sinh nhanh, màu sắc chân thực, phù hợp tạo 30–50 cảnh visual cho video dài.",
-        "is_default": True,
+        "description": "Model thế hệ tiền nhiệm, tương thích hoàn toàn với các prompt version cũ.",
+        "is_default": False,
     },
     "imagen_3_standard": {
         "id": "imagen_3_standard",
         "name": "Google Imagen 3 (High-Fidelity)",
         "provider": "google_flow",
+        "badge": "🟡 Chất lượng cao",
         "credit_tier": "medium",
         "credit_label": "🟡 Trung bình (~2–3 credit/ảnh)",
         "speed": "⏳ 8–12s",
@@ -55,26 +74,83 @@ GOOGLE_FLOW_MODELS = {
         "id": "imagen_3_photoreal",
         "name": "Google Imagen 3 (Photorealistic / 35mm)",
         "provider": "google_flow",
+        "badge": "🟡 Tư liệu thực tế",
         "credit_tier": "standard",
         "credit_label": "🟡 Tiêu chuẩn (~2 credit/ảnh)",
         "speed": "⏳ 6–10s",
         "description": "Phong cách ảnh tư liệu / Điện ảnh thực tế. Tối ưu đặc biệt cho video kể chuyện, phim tài liệu, hạn chế cảm giác bóng bẩy 3D/CGI.",
         "is_default": False,
     },
+}
+
+GOOGLE_FLOW_VIDEO_MODELS = {
+    "omni_1_1_flash": {
+        "id": "omni_1_1_flash",
+        "name": "Omni 1.1 Flash",
+        "provider": "google_flow",
+        "badge": "⚡ Mặc định / Siêu tốc",
+        "credit_tier": "medium",
+        "credit_label": "🟡 Tiêu chuẩn (~10 credit/clip)",
+        "speed": "⚡ 15–25s",
+        "description": "⭐ Model tạo video AI mặc định mới nhất của Google Flow. Tốc độ sinh siêu nhanh, chuyển động mượt mà và phối cảnh nhất quán.",
+        "is_default": True,
+    },
+    "veo_3_1_lite": {
+        "id": "veo_3_1_lite",
+        "name": "Veo 3.1 – Lite",
+        "provider": "google_flow",
+        "badge": "🟢 Tiết kiệm Credit",
+        "credit_tier": "low",
+        "credit_label": "🟢 Thấp (~8 credit/clip)",
+        "speed": "⏳ 20–30s",
+        "description": "Bản rút gọn của Veo 3.1, tối ưu chi phí credit cho các cảnh intro ngắn.",
+        "is_default": False,
+    },
+    "veo_3_1_fast": {
+        "id": "veo_3_1_fast",
+        "name": "Veo 3.1 – Fast",
+        "provider": "google_flow",
+        "badge": "🟡 Tốc độ cao",
+        "credit_tier": "medium",
+        "credit_label": "🟡 Trung bình (~12 credit/clip)",
+        "speed": "⏳ 25–40s",
+        "description": "Veo 3.1 phiên bản tối ưu tốc độ, cân bằng chuyển động điện ảnh và thời gian chờ.",
+        "is_default": False,
+    },
+    "veo_3_1_quality": {
+        "id": "veo_3_1_quality",
+        "name": "Veo 3.1 – Quality",
+        "provider": "google_flow",
+        "badge": "🔴 Chất lượng Điện ảnh",
+        "credit_tier": "high",
+        "credit_label": "🔴 Cao (~15–20 credit/clip)",
+        "speed": "🐌 45–75s",
+        "description": "Veo 3.1 chất lượng cao nhất với độ sâu trường ảnh và ánh sáng chân thực tối đa.",
+        "is_default": False,
+    },
     "google_veo_intro": {
         "id": "google_veo_intro",
         "name": "Google Veo (Intro Video Generator)",
         "provider": "google_flow",
+        "badge": "🔴 Video AI Legacy",
         "credit_tier": "high",
         "credit_label": "🔴 Cao (~10–20 credit/clip)",
         "speed": "🐌 30–60s",
-        "description": "Sinh video chuyển động AI 4–8 giây cho cảnh mở đầu để giữ chân người xem. (Chỉ nên bật cho cảnh đầu tiên để bảo toàn credit).",
+        "description": "Sinh video chuyển động AI 4–8 giây cho cảnh mở đầu để giữ chân người xem (Legacy ID).",
         "is_default": False,
     },
 }
+
+GOOGLE_FLOW_MODELS = {**GOOGLE_FLOW_IMAGE_MODELS, **GOOGLE_FLOW_VIDEO_MODELS}
+
 DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "provider": "google_flow",
     "model": DEFAULT_IMAGE_MODEL,
+    "aspect_ratio": "16:9",
+    "output_count": 2,
+    "video_model": DEFAULT_VIDEO_MODEL,
+    "video_aspect_ratio": "16:9",
+    "video_output_count": 1,
     "style_prompt": "",
     "avoid_prompt": "",
     "negative_prompt": "",  # alias for avoid_prompt, kept for frontend compatibility
@@ -195,12 +271,47 @@ def normalize_image_generation_settings(value: object) -> dict:
     settings = value if isinstance(value, dict) else {}
     normalized = dict(DEFAULT_IMAGE_GENERATION_SETTINGS)
 
-    # Model and Provider normalization
+    # Image Model normalization with migration mapping
     model = str(settings.get("model") or "").strip()
-    if model in GOOGLE_FLOW_MODELS:
+    # Migration aliases for legacy models
+    if model in ("nano_banana_pro", "imagen_3_standard", "imagen_3_photoreal"):
+        normalized["model"] = "nano_banana_2"
+    elif model in GOOGLE_FLOW_IMAGE_MODELS:
         normalized["model"] = model
+    elif model == "google_veo_intro":
+        normalized["model"] = DEFAULT_IMAGE_MODEL
+        normalized["video_model"] = "omni_1_1_flash"
     else:
         normalized["model"] = DEFAULT_IMAGE_MODEL
+
+    # Video Model normalization
+    video_model = str(settings.get("video_model") or "").strip()
+    if video_model == "google_veo_intro":
+        normalized["video_model"] = "omni_1_1_flash"
+    elif video_model in GOOGLE_FLOW_VIDEO_MODELS:
+        normalized["video_model"] = video_model
+    else:
+        normalized["video_model"] = DEFAULT_VIDEO_MODEL
+
+    # Aspect Ratio & Output Count (Image)
+    aspect_ratio = str(settings.get("aspect_ratio") or "").strip()
+    normalized["aspect_ratio"] = aspect_ratio if aspect_ratio in SUPPORTED_ASPECT_RATIOS else "16:9"
+
+    try:
+        output_count = int(settings.get("output_count", 2))
+        normalized["output_count"] = output_count if output_count in SUPPORTED_OUTPUT_COUNTS else 2
+    except (TypeError, ValueError):
+        normalized["output_count"] = 2
+
+    # Aspect Ratio & Output Count (Video)
+    video_aspect_ratio = str(settings.get("video_aspect_ratio") or "").strip()
+    normalized["video_aspect_ratio"] = video_aspect_ratio if video_aspect_ratio in SUPPORTED_VIDEO_ASPECT_RATIOS else "16:9"
+
+    try:
+        video_output_count = int(settings.get("video_output_count", 1))
+        normalized["video_output_count"] = video_output_count if video_output_count in SUPPORTED_OUTPUT_COUNTS else 1
+    except (TypeError, ValueError):
+        normalized["video_output_count"] = 1
 
     provider = str(settings.get("provider") or "").strip()
     normalized["provider"] = provider if provider else "google_flow"

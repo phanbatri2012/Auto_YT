@@ -319,30 +319,52 @@ function Start-OmniVoiceWorker {
     }
 }
 
-function Test-BrowserServicesReady {
+function Test-ChatGPTBrowserReady {
     $chatgptStateFile = Join-Path $dataRoot "chatgpt_browser_service.json"
+    if (-not (Test-Path -LiteralPath $chatgptStateFile -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $data = Get-Content -LiteralPath $chatgptStateFile -Raw | ConvertFrom-Json
+        if (-not [bool]$data.ready) {
+            return $false
+        }
+        $cdpUrl = [string]$data.cdp_url
+        if ($cdpUrl -match ":(\d+)") {
+            $port = [int]$Matches[1]
+            return (Test-PortInUse $port)
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Test-GoogleFlowBrowserReady {
     $flowStateFile = Join-Path $dataRoot "google_flow_browser_service.json"
-    
-    $chatgptReady = $false
-    $flowReady = $false
-    
-    if (Test-Path -LiteralPath $chatgptStateFile -PathType Leaf) {
-        try {
-            $data = Get-Content -LiteralPath $chatgptStateFile -Raw | ConvertFrom-Json
-            $chatgptReady = [bool]$data.ready
-        } catch {}
+    if (-not (Test-Path -LiteralPath $flowStateFile -PathType Leaf)) {
+        return $false
     }
-    
-    if (Test-Path -LiteralPath $flowStateFile -PathType Leaf) {
-        try {
-            $data = Get-Content -LiteralPath $flowStateFile -Raw | ConvertFrom-Json
-            $flowReady = [bool]$data.ready
-        } catch {}
+    try {
+        $data = Get-Content -LiteralPath $flowStateFile -Raw | ConvertFrom-Json
+        if (-not [bool]$data.ready) {
+            return $false
+        }
+        $cdpUrl = [string]$data.cdp_url
+        if ($cdpUrl -match ":(\d+)") {
+            $port = [int]$Matches[1]
+            return (Test-PortInUse $port)
+        }
+        return $true
+    } catch {
+        return $false
     }
-    
+}
+
+function Test-BrowserServicesReady {
     return @{
-        ChatGPT = $chatgptReady
-        GoogleFlow = $flowReady
+        ChatGPT = (Test-ChatGPTBrowserReady)
+        GoogleFlow = (Test-GoogleFlowBrowserReady)
     }
 }
 
@@ -634,12 +656,14 @@ try {
     $backendReady = Test-BackendReady
     $frontendReady = Test-FrontendReady
     $omniVoiceReady = Test-OmniVoiceReady
+    $chatgptReady = Test-ChatGPTBrowserReady
+    $flowReady = Test-GoogleFlowBrowserReady
 
-    if ($backendReady -and $frontendReady -and $omniVoiceReady) {
-        Write-Step "All core services are already running."
+    if ($backendReady -and $frontendReady -and $omniVoiceReady -and $chatgptReady -and $flowReady) {
+        Write-Step "All core services and browser automations are already running."
     }
     else {
-        # 1. Start Backend (which also triggers ChatGPT & Google Flow browser services)
+        # --- 1. PARALLEL DISPATCH (All services are launched simultaneously) ---
         if (-not $backendReady) {
             Protect-DataDirectory
             if (Test-PortInUse 8080) {
@@ -649,97 +673,78 @@ try {
             else {
                 Ensure-PythonEnvironment
                 $backendProcess = Start-Backend
-                try {
-                    Wait-ForService "Backend (8080)" ${function:Test-BackendReady} $ReadyTimeoutSeconds
-                    $backendReady = $true
-                }
-                catch {
-                    $backendProcess.Refresh()
-                    if ($backendProcess.HasExited) {
-                        throw "Backend exited during startup. See data/logs/backend.current.stderr.log."
-                    }
-                    throw
-                }
             }
         }
 
-        # 2. Start Frontend UI on port 5173 (runs concurrently while background workers initialize)
         if (-not $frontendReady) {
-            if (Test-PortInUse 5173) {
-                Wait-ForService "Frontend (5173)" ${function:Test-FrontendReady} 10
-                $frontendReady = $true
-            }
-            else {
+            if (-not (Test-PortInUse 5173)) {
                 $npmPath = Ensure-FrontendEnvironment
                 $frontendProcess = Start-Frontend $npmPath
-                try {
-                    Wait-ForService "Frontend (5173)" ${function:Test-FrontendReady} $ReadyTimeoutSeconds
-                    $frontendReady = $true
-                }
-                catch {
-                    $frontendProcess.Refresh()
-                    if ($frontendProcess.HasExited) {
-                        $frontendErrLog = Join-Path $logsRoot "frontend.current.stderr.log"
-                        $errText = if (Test-Path -LiteralPath $frontendErrLog -PathType Leaf) { Get-Content -LiteralPath $frontendErrLog -Raw -ErrorAction SilentlyContinue } else { "" }
-                        if ($errText -match "EPERM" -and ($errText -match "\.vite" -or $errText -match "unlink")) {
-                            Write-Step "Detected locked or restricted Vite cache. Self-healing by resetting .vite cache..."
-                            $viteDir = Join-Path $frontendRoot "node_modules\.vite"
-                            if (Test-Path -LiteralPath $viteDir) {
-                                $backupViteName = ".vite_stale_" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
-                                try { Rename-Item -LiteralPath $viteDir -NewName $backupViteName -Force -ErrorAction SilentlyContinue } catch {}
-                            }
-                            Write-Step "Retrying frontend startup with clean cache..."
-                            $frontendProcess = Start-Frontend $npmPath
-                            Wait-ForService "Frontend (5173)" ${function:Test-FrontendReady} $ReadyTimeoutSeconds
-                            $frontendReady = $true
-                        }
-                        else {
-                            throw "Frontend exited during startup. See data/logs/frontend.current.stderr.log."
-                        }
-                    }
-                    else {
-                        throw
-                    }
-                }
             }
         }
 
-        # 3. Verify OmniVoice Worker readiness on port 8011
         if (-not $omniVoiceReady) {
-            try {
-                Wait-ForService "OmniVoice TTS Worker (8011)" ${function:Test-OmniVoiceReady} 10
-                $omniVoiceReady = $true
-            }
-            catch {
+            if (-not (Test-PortInUse 8011)) {
                 Start-OmniVoiceWorker
-                try {
-                    Wait-ForService "OmniVoice TTS Worker (8011)" ${function:Test-OmniVoiceReady} 15
-                    $omniVoiceReady = $true
-                }
-                catch {
-                    Write-Warning "OmniVoice worker did not respond within timeout. Audio generation will fallback to remote/Genmax if configured."
-                    $omniVoiceReady = $false
-                }
             }
         }
-    }
 
-    if (-not $backendReady -or -not $frontendReady) {
-        throw "The core Auto_YT system is not ready."
-    }
+        # --- 2. UI-LAST BARRIER SYNCHRONIZATION ---
+        # Wait until ALL 5 services are 100% ready before opening the UI
+        Write-Step "Waiting for all 5 services to be ready (Backend, Frontend, OmniVoice, ChatGPT, Google Flow)..."
+        $barrierTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        $reported = @{}
 
-    # 4. Check Browser Services readiness (ChatGPT & Google Flow)
-    Write-Step "Checking browser automation services (ChatGPT & Google Flow)..."
-    $browserDeadline = (Get-Date).AddSeconds(3)
-    do {
-        $bs = Test-BrowserServicesReady
-        if ($bs.ChatGPT -and $bs.GoogleFlow) {
-            break
+        while ($barrierTimer.Elapsed.TotalSeconds -lt $ReadyTimeoutSeconds) {
+            if (-not $backendReady -and (Test-BackendReady)) {
+                $backendReady = $true
+                if (-not $reported.ContainsKey("backend")) {
+                    $reported["backend"] = $true
+                    Write-Step "Backend API (8080) is ready ($([math]::Round($barrierTimer.Elapsed.TotalSeconds, 1)) s)."
+                }
+            }
+            if (-not $frontendReady -and (Test-FrontendReady)) {
+                $frontendReady = $true
+                if (-not $reported.ContainsKey("frontend")) {
+                    $reported["frontend"] = $true
+                    Write-Step "Frontend Web UI (5173) is ready ($([math]::Round($barrierTimer.Elapsed.TotalSeconds, 1)) s)."
+                }
+            }
+            if (-not $omniVoiceReady -and (Test-OmniVoiceReady)) {
+                $omniVoiceReady = $true
+                if (-not $reported.ContainsKey("omnivoice")) {
+                    $reported["omnivoice"] = $true
+                    Write-Step "OmniVoice TTS Worker (8011) is ready ($([math]::Round($barrierTimer.Elapsed.TotalSeconds, 1)) s)."
+                }
+            }
+            if (-not $chatgptReady -and (Test-ChatGPTBrowserReady)) {
+                $chatgptReady = $true
+                if (-not $reported.ContainsKey("chatgpt")) {
+                    $reported["chatgpt"] = $true
+                    Write-Step "ChatGPT Automation (CDP) is ready ($([math]::Round($barrierTimer.Elapsed.TotalSeconds, 1)) s)."
+                }
+            }
+            if (-not $flowReady -and (Test-GoogleFlowBrowserReady)) {
+                $flowReady = $true
+                if (-not $reported.ContainsKey("flow")) {
+                    $reported["flow"] = $true
+                    Write-Step "Google Flow Automation (CDP) is ready ($([math]::Round($barrierTimer.Elapsed.TotalSeconds, 1)) s)."
+                }
+            }
+
+            if ($backendReady -and $frontendReady -and $omniVoiceReady -and $chatgptReady -and $flowReady) {
+                break
+            }
+            Start-Sleep -Milliseconds 300
         }
-        Start-Sleep -Milliseconds 250
-    } while ((Get-Date) -lt $browserDeadline)
+
+        if (-not $backendReady -or -not $frontendReady) {
+            throw "The core Auto_YT system did not become ready within $ReadyTimeoutSeconds seconds."
+        }
+    }
 
     $finalBrowserState = Test-BrowserServicesReady
+    $omniVoiceReady = Test-OmniVoiceReady
 
     Write-Host ""
     Write-Host "=================================================================" -ForegroundColor Green
@@ -766,6 +771,7 @@ try {
     Write-Host "=================================================================" -ForegroundColor Green
     Write-Host ""
 
+    # UI OPENS LAST: Only after all services have completed synchronization
     if (-not $NoBrowser) {
         Start-Process $frontendUrl
     }

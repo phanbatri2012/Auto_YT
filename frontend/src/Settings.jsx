@@ -36,6 +36,24 @@ const DEFAULT_PUBLISHING_SETTINGS = {
   description_template: ''
 };
 
+const YOUTUBE_CATEGORIES = [
+  { id: '22', name: '22 - Mọi người & Blog (People & Blogs - Mặc định)' },
+  { id: '24', name: '24 - Giải trí (Entertainment)' },
+  { id: '27', name: '27 - Giáo dục (Education)' },
+  { id: '28', name: '28 - Khoa học & Công nghệ (Science & Technology)' },
+  { id: '10', name: '10 - Âm nhạc (Music)' },
+  { id: '20', name: '20 - Trò chơi (Gaming)' },
+  { id: '1', name: '1 - Phim & Hoạt hình (Film & Animation)' },
+  { id: '2', name: '2 - Ô tô & Xe cộ (Autos & Vehicles)' },
+  { id: '15', name: '15 - Thú cưng & Động vật (Pets & Animals)' },
+  { id: '17', name: '17 - Thể thao (Sports)' },
+  { id: '19', name: '19 - Du lịch & Sự kiện (Travel & Events)' },
+  { id: '23', name: '23 - Hài kịch (Comedy)' },
+  { id: '25', name: '25 - Tin tức & Chính trị (News & Politics)' },
+  { id: '26', name: '26 - Hướng dẫn & Phong cách (Howto & Style)' },
+  { id: '29', name: '29 - Hoạt động xã hội & Phi lợi nhuận (Nonprofits & Activism)' }
+];
+
 const PIPELINE_STEPS = [
   {
     key: 'title',
@@ -1734,13 +1752,21 @@ export default function Settings({
               YouTube Category ID
               <input
                 className="version-select"
+                list="youtube-category-options"
                 value={currentPublishing.category_id}
                 onChange={event => handlePromptSettingChange(
                   'publishing_settings', 'category_id', event.target.value
                 )}
-                placeholder="Ví dụ: 22"
+                placeholder="Mặc định: 22 (People & Blogs)"
                 disabled={activeVersionLocked}
               />
+              <datalist id="youtube-category-options">
+                {YOUTUBE_CATEGORIES.map(cat => (
+                  <option key={cat.id} value={cat.id}>
+                    {cat.name}
+                  </option>
+                ))}
+              </datalist>
             </label>
             <label>
               Ngôn ngữ
@@ -1771,6 +1797,9 @@ export default function Settings({
                 <option value="true">Dành cho trẻ em</option>
               </select>
             </label>
+          </div>
+          <div className="help-text" style={{ marginTop: 8, fontSize: '0.84rem', color: '#94a3b8', lineHeight: 1.5 }}>
+            💡 <strong>YouTube Category ID:</strong> Nếu để trống, hệ thống sẽ tự động dùng mặc định là <strong>22 (People & Blogs / Mọi người & Blog)</strong>. Bạn có thể chọn nhanh từ danh sách gợi ý hoặc nhập ID tùy chỉnh (VD: <code>22</code>: Blogs, <code>24</code>: Giải trí, <code>27</code>: Giáo dục, <code>28</code>: Khoa học & CN, <code>10</code>: Âm nhạc, <code>20</code>: Trò chơi, <code>1</code>: Phim).
           </div>
           <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 12 }}>
             <label>

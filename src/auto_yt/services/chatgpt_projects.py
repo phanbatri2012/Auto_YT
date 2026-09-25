@@ -38,6 +38,9 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "density": 30,
     "outputs_per_scene": 1,
     "thumbnail_variant": "without_text",
+    "enable_intro_video": True,
+    "intro_scene_target_seconds": 8.0,
+    "intro_crop_watermark": True,
 }
 DEFAULT_PUBLISHING_SETTINGS = {
     "category_id": "",
@@ -166,6 +169,12 @@ def normalize_image_generation_settings(value: object) -> dict:
         if settings.get("thumbnail_variant") in THUMBNAIL_VARIANTS
         else "without_text"
     )
+    normalized["enable_intro_video"] = bool(settings.get("enable_intro_video", True))
+    try:
+        normalized["intro_scene_target_seconds"] = max(4.0, min(15.0, float(settings.get("intro_scene_target_seconds", 8.0) or 8.0)))
+    except (TypeError, ValueError):
+        normalized["intro_scene_target_seconds"] = 8.0
+    normalized["intro_crop_watermark"] = bool(settings.get("intro_crop_watermark", True))
     return normalized
 
 

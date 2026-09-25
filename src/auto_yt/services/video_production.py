@@ -153,6 +153,54 @@ def parse_srt_segments(srt_path: Path) -> list[dict]:
     return segments
 
 
+def extract_intro_boundary(
+    generated_script: str,
+    captions: list[dict],
+    duration_seconds: float,
+) -> float:
+    """Extract the ending timestamp (in seconds) of the intro/hook section from script and captions."""
+    if not generated_script:
+        return 0.0
+
+    # 1. Try finding ### [INTRO] section text
+    intro_match = re.search(
+        r"### \[(?:INTRO|MỞ ĐẦU|PHẦN 1: MỞ ĐẦU|MO DAU)\]\s*\n(.*?)(?=\n### \[|\Z)",
+        generated_script,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if intro_match:
+        intro_text = re.sub(r"\s+", " ", intro_match.group(1)).strip().lower()
+        if len(intro_text) >= 20 and captions:
+            intro_words = [w for w in re.findall(r"\w+", intro_text) if len(w) > 1]
+            last_matching_words = intro_words[-6:] if len(intro_words) >= 6 else intro_words
+            best_time = 0.0
+            
+            for cap in captions:
+                cap_text = cap.get("text", "").lower()
+                if any(w in cap_text for w in last_matching_words):
+                    best_time = float(cap.get("end") or 0.0)
+                if float(cap.get("end") or 0.0) > min(180.0, duration_seconds * 0.5):
+                    break
+            if 6.0 <= best_time <= min(180.0, duration_seconds * 0.5):
+                return best_time
+
+    # 2. Try finding chapter 1 timestamp from ### [CHAPTERS]
+    try:
+        chapters = extract_chapters(generated_script, duration_seconds)
+        if len(chapters) >= 2:
+            ch1_start = float(chapters[1]["start"])
+            if 6.0 <= ch1_start <= min(180.0, duration_seconds * 0.5):
+                for cap in captions:
+                    if float(cap.get("end") or 0.0) >= ch1_start - 2.0:
+                        return float(cap.get("end") or ch1_start)
+                return ch1_start
+    except Exception:
+        pass
+
+    # 3. Default fallback if intro couldn't be definitively matched
+    return min(24.0, max(8.0, duration_seconds * 0.15))
+
+
 def build_scene_windows(
     captions: list[dict],
     duration_seconds: float,
@@ -160,30 +208,43 @@ def build_scene_windows(
     minimum_seconds: float = 25,
     target_seconds: float = 30,
     maximum_seconds: float = 35,
+    intro_end_seconds: float = 0.0,
+    intro_target_seconds: float = 8.0,
+    enable_intro_video: bool = True,
 ) -> list[dict]:
-    """Group real caption timestamps into bounded visual-planning windows."""
+    """Group real caption timestamps into bounded visual-planning windows,
+    allocating ~8s video scenes for the intro section and ~30s image scenes for the body.
+    """
     if not 1 <= minimum_seconds <= target_seconds <= maximum_seconds:
         raise ValueError("Scene duration settings are inconsistent.")
     windows: list[dict] = []
     cursor = 0
+    use_intro = enable_intro_video and intro_end_seconds >= 5.0
+
     while cursor < len(captions):
         start = max(0.0, float(captions[cursor]["start"]))
+        in_intro = use_intro and start < (intro_end_seconds - 2.0)
+        
+        cur_target = intro_target_seconds if in_intro else target_seconds
+        cur_min = max(4.0, intro_target_seconds * 0.75) if in_intro else minimum_seconds
+        cur_max = min(14.0, intro_target_seconds * 1.35) if in_intro else maximum_seconds
+
         best_end_index = cursor
         best_distance = float("inf")
         scan = cursor
         while scan < len(captions):
             candidate_end = min(duration_seconds, float(captions[scan]["end"]))
             candidate_duration = candidate_end - start
-            if candidate_duration > maximum_seconds and scan > cursor:
+            if candidate_duration > cur_max and scan > cursor:
                 break
-            if candidate_duration >= minimum_seconds:
-                distance = abs(candidate_duration - target_seconds)
+            if candidate_duration >= cur_min:
+                distance = abs(candidate_duration - cur_target)
                 sentence_end = bool(re.search(r"[.!?…][\"')\]]?$", captions[scan]["text"]))
                 score = distance - (2.0 if sentence_end else 0.0)
                 if score < best_distance:
                     best_distance = score
                     best_end_index = scan
-                if candidate_duration >= target_seconds and sentence_end:
+                if candidate_duration >= cur_target and sentence_end:
                     break
             elif scan == len(captions) - 1:
                 best_end_index = scan
@@ -205,6 +266,8 @@ def build_scene_windows(
                 "end": end,
                 "duration": max(0.1, end - start),
                 "transcript": transcript,
+                "is_video": in_intro,
+                "media_type": "video" if in_intro else "image",
             }
         )
         cursor = best_end_index + 1
@@ -239,6 +302,8 @@ def validate_visual_scene_plan(payload: dict, windows: list[dict]) -> dict:
         normalized.append(
             {
                 **window,
+                "is_video": window.get("is_video", False),
+                "media_type": window.get("media_type", "image"),
                 "subject": str(scene.get("subject") or "").strip(),
                 "action": str(scene.get("action") or "").strip(),
                 "setting": str(scene.get("setting") or "").strip(),
@@ -316,9 +381,9 @@ def _scene_hash(
 
 
 def cleanup_duplicate_scene_artifacts(video_id: int) -> int:
-    """Find and remove any cached scene artifacts that have duplicate image files or duplicate hashes.
+    """Find and remove any cached scene artifacts that have duplicate files or duplicate hashes.
     Ensures that retrying video generation will self-heal and re-generate unique scenes instead of getting stuck."""
-    artifacts = db.list_video_artifacts(video_id, "scene:")
+    artifacts = list(db.list_video_artifacts(video_id, "scene:")) + list(db.list_video_artifacts(video_id, "scene_video:"))
     seen_hashes: dict[str, str] = {}
     removed_count = 0
     for art in artifacts:
@@ -355,7 +420,7 @@ def cleanup_duplicate_scene_artifacts(video_id: int) -> int:
 
 def purge_all_scene_artifacts(video_id: int) -> int:
     """Purge all scene artifacts from DB and disk when recreating from scratch."""
-    artifacts = db.list_video_artifacts(video_id, "scene:")
+    artifacts = list(db.list_video_artifacts(video_id, "scene:")) + list(db.list_video_artifacts(video_id, "scene_video:"))
     removed_count = 0
     for art in artifacts:
         art_path = art.get("path")
@@ -629,6 +694,224 @@ def generate_scene_images(
         if reference_id and reference_id not in references:
             references[reference_id] = image_path
     return completed_paths
+
+
+def _generate_scene_video(
+    *,
+    video_id: int,
+    scene: dict,
+    scene_count: int,
+    start_frame_path: Path,
+    end_frame_path: Path | None = None,
+    profile: dict | None = None,
+    settings: dict | None = None,
+    progress,
+    cancel_check,
+    force_new_project: bool = False,
+) -> Path:
+    settings = settings or {}
+    negative_prompt = str(settings.get("avoid_prompt") or settings.get("negative_prompt") or "")
+    fixed_seed = int(_sha256_bytes(str(video_id).encode("utf-8"))[:15], 16)
+    cancel_check()
+    start_hash = _sha256_file(start_frame_path) if start_frame_path and start_frame_path.is_file() else ""
+    end_hash = _sha256_file(end_frame_path) if end_frame_path and end_frame_path.is_file() else ""
+    
+    content_hash = _scene_hash(
+        video_id, scene, profile, negative_prompt, f"{start_hash}:{end_hash}"
+    )
+    artifact_type = f"scene_video:{scene['index']}"
+    existing = db.get_latest_video_artifact(video_id, artifact_type)
+
+    if not force_new_project and existing and existing.get("status") == "completed":
+        artifact_path = Path(existing["path"])
+        if artifact_path.exists() and artifact_path.stat().st_size > 1000:
+            return artifact_path
+
+    target = SCENES_DIR / f"{video_id}_{scene['index']}_video_{content_hash[:8]}.mp4"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    generation_attempt = existing.get("metadata", {}).get("generation_attempt", 0) + 1 if existing else 1
+    
+    progress(
+        f"Đang tạo video intro {scene['index'] + 1}/{scene_count} bằng Google Flow Veo",
+        f"generating_flow_video {scene['index'] + 1}/{scene_count}",
+    )
+    
+    db.upsert_video_artifact(
+        video_id=video_id,
+        artifact_type=artifact_type,
+        path=str(target),
+        content_hash=content_hash,
+        status="processing",
+        mime_type="video/mp4",
+        metadata={
+            **scene,
+            "seed": fixed_seed,
+            "generation_attempt": generation_attempt,
+            "start_hash": start_hash,
+            "end_hash": end_hash,
+        },
+    )
+
+    import os
+    import asyncio
+    from auto_yt.services import google_flow_browser_service
+    
+    endpoint = google_flow_browser_service.get_browser_service_endpoint()
+    if not endpoint:
+        google_flow_browser_service.start_browser_service()
+        import time
+        time.sleep(5)
+        endpoint = google_flow_browser_service.get_browser_service_endpoint()
+        
+    async def _do_flow_video():
+        from playwright.async_api import async_playwright
+        from auto_yt.services.google_flow_worker import GoogleFlowWorker
+        
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(endpoint)
+            context = browser.contexts[0]
+            page = None
+            for p_curr in context.pages:
+                url_lower = str(p_curr.url or "").lower()
+                if "flow.google.com" in url_lower or "labs.google" in url_lower:
+                    page = p_curr
+                    break
+            if page is None:
+                page = context.pages[0] if context.pages else await context.new_page()
+
+            worker = GoogleFlowWorker(page)
+            project_name = f"auto_yt_{video_id}"
+            await worker.ensure_project(project_name, force_new=force_new_project)
+            
+            prompt = scene.get("prompt", "")
+            avoid = negative_prompt
+            
+            ref_ids = []
+            if scene.get("primary_reference_id"):
+                ref_ids.append(str(scene["primary_reference_id"]))
+                
+            video_url = await worker.generate_scene_video(
+                prompt=prompt,
+                avoid_prompt=avoid,
+                start_frame_path=start_frame_path,
+                end_frame_path=end_frame_path,
+                reference_ids=ref_ids,
+            )
+            await worker.download_video(video_url, str(target))
+            
+            if not target.exists() or target.stat().st_size < 1000:
+                raise RuntimeError(f"Video tạo từ Google Flow Veo không hợp lệ hoặc quá nhỏ: {target}")
+
+    is_mock = (
+        os.environ.get("YOUTUBE_UPLOAD", "true") == "false"
+        or os.environ.get("FLOW_MOCK_GENERATION", "false") == "true"
+        or not endpoint
+    )
+    if is_mock:
+        # Create a mock video segment for testing using ffmpeg from the start frame
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        mock_duration = float(scene.get("duration", 8.0))
+        subprocess.run(
+            [
+                ffmpeg_exe, "-hide_banner", "-y",
+                "-loop", "1", "-i", str(start_frame_path),
+                "-t", f"{mock_duration:.3f}",
+                "-vf", f"scale={TARGET_WIDTH}:{TARGET_HEIGHT},fps={TARGET_FPS}",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                str(target)
+            ],
+            capture_output=True,
+            check=True,
+        )
+    else:
+        asyncio.run(_do_flow_video())
+
+    progress(f"Đã tải video {scene['index'] + 1}/{scene_count}", "downloading_flow_video")
+    db.upsert_video_artifact(
+        video_id=video_id,
+        artifact_type=artifact_type,
+        path=str(target),
+        content_hash=content_hash,
+        status="completed",
+        mime_type="video/mp4",
+        metadata={
+            **scene,
+            "generation_attempt": generation_attempt,
+        },
+    )
+    return target
+
+
+def generate_scene_media(
+    *,
+    video_id: int,
+    scenes: list[dict],
+    profile: dict | None = None,
+    reference_profile: dict | None = None,
+    settings: dict | None = None,
+    progress,
+    cancel_check,
+    force_new_project: bool = False,
+) -> list[Path]:
+    """Generate media assets for all scenes.
+    
+    1. Phase 1: Generates base images for all scenes (Image 0..N).
+    2. Phase 2: For intro scenes (is_video=True), animates Image[i] -> Image[i+1] into video clips.
+       If video generation fails, falls back safely to Image[i].
+    """
+    settings = settings or {}
+    enable_intro_video = bool(settings.get("enable_intro_video", True))
+    
+    # Phase 1: Generate all base images
+    base_image_paths = generate_scene_images(
+        video_id=video_id,
+        scenes=scenes,
+        profile=profile,
+        reference_profile=reference_profile,
+        settings=settings,
+        progress=progress,
+        cancel_check=cancel_check,
+        force_new_project=force_new_project,
+    )
+    
+    if not enable_intro_video:
+        return base_image_paths
+
+    # Phase 2: Animate intro scenes into video clips
+    media_paths: list[Path] = []
+    for idx, scene in enumerate(scenes):
+        cancel_check()
+        is_video = bool(scene.get("is_video") or scene.get("media_type") == "video")
+        if not is_video:
+            media_paths.append(base_image_paths[idx])
+            continue
+            
+        start_frame = base_image_paths[idx]
+        end_frame = base_image_paths[idx + 1] if idx + 1 < len(base_image_paths) else None
+        
+        try:
+            video_path = _generate_scene_video(
+                video_id=video_id,
+                scene=scene,
+                scene_count=len(scenes),
+                start_frame_path=start_frame,
+                end_frame_path=end_frame,
+                profile=profile or {},
+                settings=settings,
+                progress=progress,
+                cancel_check=cancel_check,
+                force_new_project=False,
+            )
+            media_paths.append(video_path)
+        except Exception as video_exc:
+            logger.warning(
+                "Tạo video Veo cho scene %d thất bại (%s). Tự động fallback sang ảnh tĩnh zoompan...",
+                idx,
+                video_exc,
+            )
+            media_paths.append(start_frame)
+            
+    return media_paths
 
 
 def _format_srt_time(seconds: float) -> str:
@@ -972,29 +1255,29 @@ def _segment_filter(
 
     if mode == 0:
         # Mode 0: Zoom In Center
-        z_expr = f"1.0+{zoom_in_factor}*(on/d)"
+        z_expr = f"1.0+{zoom_in_factor}*(on/{frames})"
         x_expr = "(iw-iw/zoom)/2"
         y_expr = "(ih-ih/zoom)/2"
     elif mode == 1:
         # Mode 1: Pan Left -> Right with gentle Zoom In
-        z_expr = f"1.0+{zoom_in_factor * 0.8:.3f}*(on/d)"
-        x_expr = "(iw-iw/zoom)*(on/d)"
+        z_expr = f"1.0+{zoom_in_factor * 0.8:.3f}*(on/{frames})"
+        x_expr = f"(iw-iw/zoom)*(on/{frames})"
         y_expr = "(ih-ih/zoom)/2"
     elif mode == 2:
         # Mode 2: Zoom Out Center (reveal to wide shot)
-        z_expr = f"{1.0 + zoom_out_factor:.2f}-{zoom_out_factor}*(on/d)"
+        z_expr = f"{1.0 + zoom_out_factor:.2f}-{zoom_out_factor}*(on/{frames})"
         x_expr = "(iw-iw/zoom)/2"
         y_expr = "(ih-ih/zoom)/2"
     elif mode == 3:
         # Mode 3: Pan Right -> Left with gentle Zoom In
-        z_expr = f"1.0+{zoom_in_factor * 0.8:.3f}*(on/d)"
-        x_expr = "(iw-iw/zoom)*(1.0-on/d)"
+        z_expr = f"1.0+{zoom_in_factor * 0.8:.3f}*(on/{frames})"
+        x_expr = f"(iw-iw/zoom)*(1.0-on/{frames})"
         y_expr = "(ih-ih/zoom)/2"
     else:
         # Mode 4: Diagonal Pan (Bottom-Left to Top-Right)
-        z_expr = f"1.0+{zoom_in_factor * 0.8:.3f}*(on/d)"
-        x_expr = "(iw-iw/zoom)*(on/d)"
-        y_expr = "(ih-ih/zoom)*(on/d)"
+        z_expr = f"1.0+{zoom_in_factor * 0.8:.3f}*(on/{frames})"
+        x_expr = f"(iw-iw/zoom)*(on/{frames})"
+        y_expr = f"(ih-ih/zoom)*(on/{frames})"
 
     filters = [
         f"[0:v]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase,"
@@ -1014,23 +1297,66 @@ def _segment_filter(
     return ";".join(filters), output_label
 
 
+def _video_segment_filter(
+    *,
+    scene: dict,
+    subtitle_path: Path | None,
+    crop_watermark: bool = True,
+) -> tuple[str, str]:
+    duration = float(scene["duration"])
+    fade_duration = min(0.35, max(0.1, duration / 4))
+    fade_out_start = max(0.0, duration - fade_duration)
+
+    filters = []
+    if crop_watermark:
+        # Smart Edge Crop: Crop 5% from bottom-right where Veo watermark appears, then scale back with Lanczos
+        filters.append(
+            f"[0:v]crop=iw*0.95:ih*0.95:0:0,"
+            f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},"
+            f"fps={TARGET_FPS},"
+            f"trim=duration={duration:.3f},setpts=PTS-STARTPTS,"
+            f"fade=t=in:st=0:d={fade_duration:.3f},"
+            f"fade=t=out:st={fade_out_start:.3f}:d={fade_duration:.3f}[v_clean]"
+        )
+    else:
+        filters.append(
+            f"[0:v]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},"
+            f"fps={TARGET_FPS},"
+            f"trim=duration={duration:.3f},setpts=PTS-STARTPTS,"
+            f"fade=t=in:st=0:d={fade_duration:.3f},"
+            f"fade=t=out:st={fade_out_start:.3f}:d={fade_duration:.3f}[v_clean]"
+        )
+    output_label = "v_clean"
+    if subtitle_path is not None:
+        filters.append(
+            f"[{output_label}]subtitles=filename='{_escape_subtitle_path(subtitle_path)}'[out]"
+        )
+        output_label = "out"
+    return ";".join(filters), output_label
+
+
 def _render_segments(
     *,
     ffmpeg_exe: str,
     encoder: str,
     video_id: int,
     scenes: list[dict],
-    image_paths: list[Path],
+    media_paths: list[Path] | None = None,
+    image_paths: list[Path] | None = None,
     srt_path: Path,
     input_hash: str,
     progress,
     cancel_check,
+    crop_watermark: bool = True,
 ) -> list[Path]:
+    paths = media_paths if media_paths is not None else (image_paths or [])
     segment_root = SEGMENTS_DIR / str(video_id) / input_hash[:16]
     segment_root.mkdir(parents=True, exist_ok=True)
     captions = parse_srt_segments(srt_path)
     results: list[Path] = []
-    for index, (scene, image_path) in enumerate(zip(scenes, image_paths)):
+    for index, (scene, media_path) in enumerate(zip(scenes, paths)):
         cancel_check()
         segment_path = segment_root / f"segment_{index:04d}_{encoder}.mp4"
         if segment_path.is_file() and segment_path.stat().st_size > 0:
@@ -1038,14 +1364,28 @@ def _render_segments(
             continue
         subtitle_path = segment_root / f"segment_{index:04d}.srt"
         has_subtitles = _write_segment_srt(captions, scene, subtitle_path)
+        
+        is_video_input = media_path.suffix.lower() == ".mp4"
         command = [ffmpeg_exe, "-hide_banner", "-y"]
-        command.extend(["-loop", "1", "-i", str(image_path)])
-        filter_graph, output_label = _segment_filter(
-            scene=scene,
-            scene_index=index,
-            subtitle_path=subtitle_path if has_subtitles else None,
-            has_previous_image=False,
-        )
+        
+        if is_video_input:
+            # Video input: stream loop to match exact scene duration
+            command.extend(["-stream_loop", "-1", "-i", str(media_path)])
+            filter_graph, output_label = _video_segment_filter(
+                scene=scene,
+                subtitle_path=subtitle_path if has_subtitles else None,
+                crop_watermark=crop_watermark,
+            )
+        else:
+            # Image input: loop image with zoompan
+            command.extend(["-loop", "1", "-i", str(media_path)])
+            filter_graph, output_label = _segment_filter(
+                scene=scene,
+                scene_index=index,
+                subtitle_path=subtitle_path if has_subtitles else None,
+                has_previous_image=False,
+            )
+            
         temporary = segment_path.with_suffix(".mp4.tmp")
         command.extend(
             [
@@ -1068,7 +1408,7 @@ def _render_segments(
             ]
         )
         progress(
-            f"Đang dựng segment {index + 1}/{len(scenes)}",
+            f"Đang dựng segment {index + 1}/{len(scenes)}" + (" (Video Intro)" if is_video_input else ""),
             "video_render_segment",
         )
         result = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -1168,11 +1508,14 @@ def render_video(
     audio_path: Path,
     srt_path: Path,
     scenes: list[dict],
-    image_paths: list[Path],
+    media_paths: list[Path] | None = None,
+    image_paths: list[Path] | None = None,
     input_hash: str,
     progress,
     cancel_check=lambda: None,
+    crop_watermark: bool = True,
 ) -> dict:
+    paths = media_paths if media_paths is not None else (image_paths or [])
     existing = db.get_latest_video_artifact(video_id, "final_mp4")
     if (
         existing
@@ -1181,8 +1524,8 @@ def render_video(
         and Path(existing.get("path") or "").is_file()
     ):
         return existing
-    if len(scenes) != len(image_paths) or not scenes:
-        raise VideoProductionError("Scene plan và ảnh không đồng bộ.")
+    if len(scenes) != len(paths) or not scenes:
+        raise VideoProductionError("Scene plan và media không đồng bộ.")
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     encoder = _select_encoder(ffmpeg_exe)
     video = db.get_video(video_id)
@@ -1201,11 +1544,12 @@ def render_video(
             encoder=encoder,
             video_id=video_id,
             scenes=scenes,
-            image_paths=image_paths,
+            media_paths=paths,
             srt_path=srt_path,
             input_hash=input_hash,
             progress=progress,
             cancel_check=cancel_check,
+            crop_watermark=crop_watermark,
         )
     except VideoProductionError:
         if encoder == "libx264":
@@ -1220,11 +1564,12 @@ def render_video(
             encoder="libx264",
             video_id=video_id,
             scenes=scenes,
-            image_paths=image_paths,
+            media_paths=paths,
             srt_path=srt_path,
             input_hash=input_hash,
             progress=progress,
             cancel_check=cancel_check,
+            crop_watermark=crop_watermark,
         )
     cancel_check()
     _concat_segments(
@@ -1272,12 +1617,25 @@ def prepare_visual_plan_inputs(video_id: int, snapshot: dict, progress) -> dict:
         db.update_audio_duration(video_id, duration)
     srt_path, caption_hash = create_srt(audio_path, video_id, progress)
     settings = snapshot.get("image_generation_settings") or {}
+    enable_intro_video = bool(settings.get("enable_intro_video", True))
+    intro_target_seconds = float(settings.get("intro_scene_target_seconds", 8.0) or 8.0)
+
+    captions = parse_srt_segments(srt_path)
+    intro_end_seconds = (
+        extract_intro_boundary(video.get("generated_script", ""), captions, duration)
+        if enable_intro_video
+        else 0.0
+    )
+
     windows = build_scene_windows(
-        parse_srt_segments(srt_path),
+        captions,
         duration,
         minimum_seconds=float(settings.get("scene_duration_min_seconds") or 25),
         target_seconds=float(settings.get("scene_duration_target_seconds") or 30),
         maximum_seconds=float(settings.get("scene_duration_max_seconds") or 35),
+        intro_end_seconds=intro_end_seconds,
+        intro_target_seconds=intro_target_seconds,
+        enable_intro_video=enable_intro_video,
     )
     plan_hash = _sha256_bytes(
         json.dumps(
@@ -1286,6 +1644,7 @@ def prepare_visual_plan_inputs(video_id: int, snapshot: dict, progress) -> dict:
                 "windows": windows,
                 "title": video.get("generated_title") or video.get("title") or "",
                 "style": settings.get("style_prompt") or "",
+                "intro_end_seconds": intro_end_seconds,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -1298,6 +1657,7 @@ def prepare_visual_plan_inputs(video_id: int, snapshot: dict, progress) -> dict:
         "caption_hash": caption_hash,
         "windows": windows,
         "plan_hash": plan_hash,
+        "intro_end_seconds": intro_end_seconds,
     }
 
 
@@ -1370,8 +1730,28 @@ def _sanitize_scene_prompt_context(text: str, max_chars: int = 140) -> str:
     return clean
 
 
+def _sanitize_thumbnail_concept_for_scene0(raw_text: str, max_chars: int = 300) -> str:
+    if not raw_text:
+        return ""
+    cleaned = re.sub(
+        r"(?i)^(?:prompt(?:\s*(?:tiếng anh|chi tiết|hình ảnh))?|ý tưởng(?: thiết kế)?|mô tả)\s*[:：\-–—]\s*",
+        "",
+        raw_text.strip(),
+    )
+    cleaned = re.sub(
+        r"(?i)\b(?:thumbnail|font chữ|màu chữ|clickbait|tiêu đề|chữ to|dòng chữ|không có chữ|có chữ|chữ nổi bật|tỷ lệ khung hình 16:9)\b",
+        "",
+        cleaned,
+    )
+    return _sanitize_scene_prompt_context(cleaned, max_chars=max_chars)
+
+
 def build_default_visual_scene_plan(
-    windows: list[dict], title: str, style_prompt: str = "", prompt_version: str = ""
+    windows: list[dict],
+    title: str,
+    style_prompt: str = "",
+    prompt_version: str = "",
+    generated_script: str = "",
 ) -> dict:
     from auto_yt.services import prompt_assets
     assets = []
@@ -1395,6 +1775,17 @@ def build_default_visual_scene_plan(
         first_para = first_para[:250].rsplit(" ", 1)[0]
     style = first_para or "Cinematic documentary visual style, photorealistic, 8k resolution"
 
+    # Extract thumbnail concept without text for Scene 0
+    clean_thumb_concept = ""
+    if generated_script:
+        thumb_match = re.search(
+            r"### \[(?:THUMBNAIL KHÔNG CHỮ|THUMBNAIL_WITHOUT_TEXT|THUMBNAIL NOTEXT|THUMBNAIL)\]\s*\n(.*?)(?=\n### \[|\Z)",
+            generated_script,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if thumb_match:
+            clean_thumb_concept = _sanitize_thumbnail_concept_for_scene0(thumb_match.group(1))
+
     scenes = []
     for w in windows:
         transcript_snippet = w.get("transcript", "").strip()
@@ -1411,16 +1802,50 @@ def build_default_visual_scene_plan(
         clean_context = _sanitize_scene_prompt_context(transcript_snippet, max_chars=120)
         context_part = f"Narrative scene: {clean_context}. " if clean_context else ""
 
-        prompt = (
-            f"A still photograph: {style}, scene {w['index'] + 1}. "
-            f"{ref_note}"
-            f"{context_part}"
-            "16:9 widescreen still photograph, authentic documentary realism, natural lighting."
-        ).replace("  ", " ").strip()
+        is_video = bool(w.get("is_video") or w.get("media_type") == "video")
+
+        if w["index"] == 0:
+            # Scene 0: Use Clean Thumbnail concept if available, otherwise story hook
+            if clean_thumb_concept and len(clean_thumb_concept) >= 20:
+                prompt = (
+                    f"A cinematic movie still: {style}, opening scene hook. "
+                    f"{ref_note}"
+                    f"Story visual core: {clean_thumb_concept}. "
+                    f"16:9 widescreen, photorealistic 8k, authentic documentary realism, clean framing without text."
+                ).replace("  ", " ").strip()
+            else:
+                prompt = (
+                    f"A cinematic movie still: {style}, dramatic opening scene hook for '{title}'. "
+                    f"{ref_note}"
+                    f"{context_part}"
+                    f"16:9 widescreen, photorealistic 8k, authentic documentary realism."
+                ).replace("  ", " ").strip()
+        elif is_video:
+            # Subsequent intro video scenes: Story-aware dynamic continuation
+            prompt = (
+                f"A cinematic movie scene: {style}, dramatic intro scene {w['index'] + 1} continuation. "
+                f"{ref_note}"
+                f"{context_part}"
+                f"16:9 widescreen, cinematic dynamic lighting, continuous dramatic motion."
+            ).replace("  ", " ").strip()
+        else:
+            # Standard body/outro scene
+            prompt = (
+                f"A still photograph: {style}, scene {w['index'] + 1}. "
+                f"{ref_note}"
+                f"{context_part}"
+                f"16:9 widescreen still photograph, authentic documentary realism, natural lighting."
+            ).replace("  ", " ").strip()
 
         scenes.append(
             {
                 "index": w["index"],
+                "start": w["start"],
+                "end": w["end"],
+                "duration": w["duration"],
+                "transcript": transcript_snippet,
+                "is_video": is_video,
+                "media_type": "video" if is_video else "image",
                 "subject": matched["display_name"] if matched else title,
                 "action": clean_context[:100] if clean_context else transcript_snippet[:100],
                 "setting": "cinematic scene",
@@ -1469,14 +1894,21 @@ def produce_video(
         title = video.get("generated_title") or video.get("title") or ""
         style = (snapshot.get("image_generation_settings") or {}).get("style_prompt") or ""
         prompt_version = snapshot.get("prompt_version") or snapshot.get("version") or video.get("prompt_version") or ""
-        plan_payload = build_default_visual_scene_plan(prepared["windows"], title, style, prompt_version=prompt_version)
+        generated_script = video.get("generated_script") or ""
+        plan_payload = build_default_visual_scene_plan(
+            prepared["windows"],
+            title,
+            style,
+            prompt_version=prompt_version,
+            generated_script=generated_script,
+        )
         save_visual_scene_plan(video_id, prepared["plan_hash"], plan_payload)
 
     validated_plan = validate_visual_scene_plan(plan_payload, prepared["windows"])
     scenes = validated_plan["scenes"]
     settings = snapshot.get("image_generation_settings") or {}
     
-    image_paths = generate_scene_images(
+    media_paths = generate_scene_media(
         video_id=video_id,
         scenes=scenes,
         settings=settings,
@@ -1490,7 +1922,7 @@ def produce_video(
             {
                 "audio": _sha256_file(audio_path),
                 "captions": caption_hash,
-                "scenes": [_sha256_file(path) for path in image_paths],
+                "scenes": [_sha256_file(path) for path in media_paths],
                 "plan": scenes,
                 "visual_bible": validated_plan["visual_bible"],
                 "render": {"width": TARGET_WIDTH, "height": TARGET_HEIGHT, "fps": TARGET_FPS},
@@ -1500,15 +1932,17 @@ def produce_video(
         ).encode("utf-8")
     )
     cancel_check()
+    crop_watermark = bool(settings.get("intro_crop_watermark", True))
     artifact = render_video(
         video_id=video_id,
         audio_path=audio_path,
         srt_path=srt_path,
         scenes=scenes,
-        image_paths=image_paths,
+        media_paths=media_paths,
         input_hash=input_hash,
         progress=progress,
         cancel_check=cancel_check,
+        crop_watermark=crop_watermark,
     )
     return {
         "artifact": artifact,

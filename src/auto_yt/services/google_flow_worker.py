@@ -816,6 +816,245 @@ class GoogleFlowWorker:
 
         raise RuntimeError(f"Không thể tải ảnh sau 3 lần thử: {last_error}")
 
+    async def _get_existing_videos(self) -> set[str]:
+        """Snapshot all existing video elements and URLs on the page."""
+        try:
+            vids = await self.page.evaluate('''() => {
+                const results = [];
+                document.querySelectorAll("video, flow-video-player video, a[href*='.mp4'], [data-video-url]").forEach(el => {
+                    const src = el.currentSrc || el.src || el.href || el.getAttribute('data-video-url') || '';
+                    if (src && !src.startsWith('data:')) {
+                        results.push(src);
+                    }
+                });
+                return results;
+            }''')
+            return set(vids) if isinstance(vids, list) else set()
+        except Exception:
+            return set()
+
+    async def generate_scene_video(
+        self,
+        prompt: str,
+        avoid_prompt: str,
+        start_frame_path: Path | None = None,
+        end_frame_path: Path | None = None,
+        reference_ids: list[str] | None = None,
+    ) -> str:
+        """Generate a video clip from start (and optional end) frame using Veo on Google Flow."""
+        existing_vids = await self._get_existing_videos()
+
+        # 1. Upload start frame and end frame if provided
+        upload_refs = []
+        if start_frame_path and Path(start_frame_path).is_file():
+            start_ref = f"start_{Path(start_frame_path).stem}"
+            await self.upload_reference(str(start_frame_path), start_ref)
+            upload_refs.append(start_ref)
+
+        if end_frame_path and Path(end_frame_path).is_file():
+            end_ref = f"end_{Path(end_frame_path).stem}"
+            await self.upload_reference(str(end_frame_path), end_ref)
+            upload_refs.append(end_ref)
+
+        # Merge with other references if any
+        all_refs = upload_refs + [r for r in (reference_ids or []) if r not in upload_refs]
+        await self.sync_reference_ingredients(all_refs)
+
+        # 2. Add strict negative prompt for text/watermarks
+        strict_avoid = "text, letters, words, typography, watermark, logo, headline, caption, subtitle, poster text"
+        combined_avoid = f"{avoid_prompt}, {strict_avoid}" if avoid_prompt else strict_avoid
+        full_prompt = f"{prompt}. Avoid: {combined_avoid}"
+
+        # 3. Locate prompt editor
+        editor = await self.wait_for_editor(timeout=25.0)
+        for click_attempt in range(3):
+            await self.dismiss_blocking_dialogs()
+            try:
+                await editor.click(timeout=4000)
+                break
+            except Exception as e:
+                if click_attempt == 2:
+                    raise
+                await asyncio.sleep(0.5)
+
+        await self.page.keyboard.press("Control+A")
+        await self.page.keyboard.press("Backspace")
+        await asyncio.sleep(0.2)
+
+        try:
+            await editor.fill(full_prompt)
+        except Exception:
+            await self.page.keyboard.insert_text(full_prompt)
+
+        await asyncio.sleep(0.5)
+
+        # Try to switch mode to Video if video mode toggle exists
+        video_mode_selectors = [
+            "mat-button-toggle:has-text('Video')",
+            "button:has-text('Video')",
+            "[aria-label*='video' i]:not(video)",
+            "button.mode-toggle-video",
+        ]
+        for v_sel in video_mode_selectors:
+            try:
+                v_btn = self.page.locator(v_sel).first
+                if await v_btn.is_visible(timeout=500):
+                    await v_btn.click(timeout=1000)
+                    await asyncio.sleep(0.3)
+                    break
+            except Exception:
+                continue
+
+        # Trigger generation: Press Enter
+        try:
+            focus_res = editor.focus()
+            if asyncio.iscoroutine(focus_res):
+                await focus_res
+        except Exception:
+            pass
+        await self.page.keyboard.press("Enter")
+        await asyncio.sleep(1.0)
+
+        gen_btn_selectors = [
+            "button.generate-icon-button",
+            "button[aria-label*='Start generation' i]",
+            "button[aria-label*='Generate' i]",
+            "button:has-text('Generate')",
+            "button:has-text('arrow_forward')",
+        ]
+        stop_btn_selectors = [
+            "button:has-text('Stop')",
+            "button[aria-label*='Stop' i]",
+            "button.stop-icon-button",
+        ]
+
+        generation_started = False
+        for s_sel in stop_btn_selectors:
+            try:
+                if await self.page.locator(s_sel).first.is_visible(timeout=500):
+                    generation_started = True
+                    break
+            except Exception:
+                continue
+
+        if not generation_started:
+            for sel in gen_btn_selectors:
+                try:
+                    candidate = self.page.locator(sel).first
+                    if await candidate.is_visible(timeout=1000):
+                        await self.dismiss_blocking_dialogs()
+                        await candidate.click(timeout=3000, force=True)
+                        generation_started = True
+                        break
+                except Exception:
+                    continue
+
+        if not generation_started:
+            try:
+                focus_res = editor.focus()
+                if asyncio.iscoroutine(focus_res):
+                    await focus_res
+            except Exception:
+                pass
+            await self.page.keyboard.press("Enter")
+
+        # Wait for video generation (up to 180s for Veo video)
+        deadline = asyncio.get_event_loop().time() + 180.0
+        new_video_src = None
+
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(2)
+            await self.handle_confirmation_prompts()
+
+            is_generating = False
+            for s_sel in stop_btn_selectors:
+                try:
+                    if await self.page.locator(s_sel).first.is_visible(timeout=300):
+                        is_generating = True
+                        break
+                except Exception:
+                    continue
+
+            if is_generating:
+                continue
+
+            # Query video elements
+            try:
+                current_videos = await self.page.evaluate('''() => {
+                    const results = [];
+                    document.querySelectorAll("video, flow-video-player video, a[href*='.mp4'], [data-video-url]").forEach(el => {
+                        const src = el.currentSrc || el.src || el.href || el.getAttribute('data-video-url') || '';
+                        if (src && !src.startsWith('data:')) {
+                            results.push(src);
+                        }
+                    });
+                    return results;
+                }''')
+            except Exception:
+                current_videos = []
+
+            if isinstance(current_videos, list):
+                for v_src in current_videos:
+                    if v_src and v_src not in existing_vids:
+                        new_video_src = v_src
+                        break
+
+            if new_video_src:
+                break
+
+        if not new_video_src:
+            await self._save_debug_screenshot("video_generation_timeout")
+            raise RuntimeError("Google Flow Veo không trả về video mới sau 180 giây.")
+
+        return new_video_src
+
+    async def download_video(self, asset_url: str, save_path: str) -> None:
+        """Download generated video file from URL/Blob to local path."""
+        target = Path(save_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        last_error = None
+        for attempt in range(3):
+            try:
+                if asset_url.startswith("blob:"):
+                    # Extract blob data using in-page fetch
+                    base64_data = await self.page.evaluate(
+                        '''async (blobUrl) => {
+                            const response = await fetch(blobUrl);
+                            const blob = await response.blob();
+                            return new Promise((resolve, reject) => {
+                                const reader = new FileReader();
+                                reader.onloadend = () => resolve(reader.result);
+                                reader.onerror = reject;
+                                reader.readAsDataURL(blob);
+                            });
+                        }''',
+                        asset_url,
+                    )
+                    import base64
+                    if base64_data and "base64," in base64_data:
+                        raw_bytes = base64.b64decode(base64_data.split("base64,")[1])
+                        target.write_bytes(raw_bytes)
+                        if target.stat().st_size > 1000:
+                            logger.info("Downloaded video from blob successfully (%d bytes) to %s", len(raw_bytes), target)
+                            return
+                else:
+                    response = await self.page.request.get(asset_url, timeout=60000)
+                    if response.status == 200:
+                        body = await response.body()
+                        if body and len(body) > 1000:
+                            target.write_bytes(body)
+                            logger.info("Downloaded video successfully (%d bytes) to %s", len(body), target)
+                            return
+                        raise RuntimeError(f"Tải video từ Google Flow rỗng hoặc quá nhỏ ({len(body) if body else 0} bytes).")
+                    raise RuntimeError(f"HTTP {response.status} khi tải video từ Google Flow: {asset_url}")
+            except Exception as e:
+                last_error = e
+                logger.warning("Attempt %d/3 download_video failed: %s", attempt + 1, e)
+                await asyncio.sleep(2)
+
+        raise RuntimeError(f"Không thể tải video sau 3 lần thử: {last_error}")
+
     async def _save_debug_screenshot(self, prefix: str):
         """Save a timestamped screenshot to assist in diagnosing UI issues."""
         try:

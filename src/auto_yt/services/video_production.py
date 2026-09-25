@@ -962,16 +962,44 @@ def _segment_filter(
 ) -> tuple[str, str]:
     duration = float(scene["duration"])
     frames = max(1, round(duration * TARGET_FPS))
-    direction = -1 if scene_index % 2 else 1
-    x_expression = "iw/2-(iw/zoom/2)" if direction > 0 else "0"
     fade_duration = min(0.35, max(0.1, duration / 4))
     fade_out_start = max(0.0, duration - fade_duration)
-    max_zoom = 1.065
-    zoom_step = (max_zoom - 1.0) / max(1, frames)
+
+    # 5-way dynamic camera motion engine (distinct zoom and panning)
+    mode = scene_index % 5
+    zoom_in_factor = 0.18
+    zoom_out_factor = 0.18
+
+    if mode == 0:
+        # Mode 0: Zoom In Center
+        z_expr = f"1.0+{zoom_in_factor}*(on/d)"
+        x_expr = "(iw-iw/zoom)/2"
+        y_expr = "(ih-ih/zoom)/2"
+    elif mode == 1:
+        # Mode 1: Pan Left -> Right with gentle Zoom In
+        z_expr = f"1.0+{zoom_in_factor * 0.8:.3f}*(on/d)"
+        x_expr = "(iw-iw/zoom)*(on/d)"
+        y_expr = "(ih-ih/zoom)/2"
+    elif mode == 2:
+        # Mode 2: Zoom Out Center (reveal to wide shot)
+        z_expr = f"{1.0 + zoom_out_factor:.2f}-{zoom_out_factor}*(on/d)"
+        x_expr = "(iw-iw/zoom)/2"
+        y_expr = "(ih-ih/zoom)/2"
+    elif mode == 3:
+        # Mode 3: Pan Right -> Left with gentle Zoom In
+        z_expr = f"1.0+{zoom_in_factor * 0.8:.3f}*(on/d)"
+        x_expr = "(iw-iw/zoom)*(1.0-on/d)"
+        y_expr = "(ih-ih/zoom)/2"
+    else:
+        # Mode 4: Diagonal Pan (Bottom-Left to Top-Right)
+        z_expr = f"1.0+{zoom_in_factor * 0.8:.3f}*(on/d)"
+        x_expr = "(iw-iw/zoom)*(on/d)"
+        y_expr = "(ih-ih/zoom)*(on/d)"
+
     filters = [
         f"[0:v]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase,"
         f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},"
-        f"zoompan=z='min(zoom+{zoom_step:.7f},{max_zoom:.3f})':x='{x_expression}':y='ih/2-(ih/zoom/2)':d={frames}:"
+        f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d={frames}:"
         f"s={TARGET_WIDTH}x{TARGET_HEIGHT}:fps={TARGET_FPS},"
         f"trim=duration={duration:.3f},setpts=PTS-STARTPTS,"
         f"fade=t=in:st=0:d={fade_duration:.3f},"

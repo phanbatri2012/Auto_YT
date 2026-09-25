@@ -693,29 +693,38 @@ class VideoProductionServiceTests(unittest.TestCase):
             self.assertTrue(kwargs.get("force_new_project"))
 
 
-    def test_segment_filter_zoompan_adaptive_speed(self):
-        # 1. Test 30s scene (900 frames at 30 FPS)
+    def test_segment_filter_5way_camera_motion(self):
         scene_30s = {"duration": 30.0, "start": 0.0, "end": 30.0}
-        filter_graph_30s, label_30s = video_production._segment_filter(
-            scene=scene_30s,
-            scene_index=0,
-            subtitle_path=None,
-        )
-        self.assertEqual(label_30s, "current")
-        self.assertIn("d=900", filter_graph_30s)
-        self.assertIn("zoompan=z='min(zoom+0.0000722,1.065)'", filter_graph_30s)
-        self.assertIn("x='iw/2-(iw/zoom/2)'", filter_graph_30s)
 
-        # 2. Test 10s scene (300 frames at 30 FPS) with scene_index=1 (direction drift)
-        scene_10s = {"duration": 10.0, "start": 30.0, "end": 40.0}
-        filter_graph_10s, label_10s = video_production._segment_filter(
-            scene=scene_10s,
-            scene_index=1,
-            subtitle_path=None,
-        )
-        self.assertIn("d=300", filter_graph_10s)
-        self.assertIn("zoompan=z='min(zoom+0.0002167,1.065)'", filter_graph_10s)
-        self.assertIn("x='0'", filter_graph_10s)
+        # Mode 0: Zoom In Center
+        f0, l0 = video_production._segment_filter(scene=scene_30s, scene_index=0, subtitle_path=None)
+        self.assertEqual(l0, "current")
+        self.assertIn("d=900", f0)
+        self.assertIn("zoompan=z='1.0+0.18*(on/d)'", f0)
+        self.assertIn("x='(iw-iw/zoom)/2'", f0)
+        self.assertIn("y='(ih-ih/zoom)/2'", f0)
+
+        # Mode 1: Pan Left -> Right
+        f1, _ = video_production._segment_filter(scene=scene_30s, scene_index=1, subtitle_path=None)
+        self.assertIn("zoompan=z='1.0+0.144*(on/d)'", f1)
+        self.assertIn("x='(iw-iw/zoom)*(on/d)'", f1)
+        self.assertIn("y='(ih-ih/zoom)/2'", f1)
+
+        # Mode 2: Zoom Out Center
+        f2, _ = video_production._segment_filter(scene=scene_30s, scene_index=2, subtitle_path=None)
+        self.assertIn("zoompan=z='1.18-0.18*(on/d)'", f2)
+        self.assertIn("x='(iw-iw/zoom)/2'", f2)
+
+        # Mode 3: Pan Right -> Left
+        f3, _ = video_production._segment_filter(scene=scene_30s, scene_index=3, subtitle_path=None)
+        self.assertIn("zoompan=z='1.0+0.144*(on/d)'", f3)
+        self.assertIn("x='(iw-iw/zoom)*(1.0-on/d)'", f3)
+
+        # Mode 4: Diagonal Pan
+        f4, _ = video_production._segment_filter(scene=scene_30s, scene_index=4, subtitle_path=None)
+        self.assertIn("zoompan=z='1.0+0.144*(on/d)'", f4)
+        self.assertIn("x='(iw-iw/zoom)*(on/d)'", f4)
+        self.assertIn("y='(ih-ih/zoom)*(on/d)'", f4)
 
 
 if __name__ == "__main__":

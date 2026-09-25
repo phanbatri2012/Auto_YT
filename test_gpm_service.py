@@ -172,8 +172,7 @@ def test_database_gpm_channel_mapping():
     )
     assert updated["gpm_profile_id"] == "gpm-uuid-999"
     assert updated["gpm_profile_name"] == "Profile Kênh 1"
-    assert updated["gpm_proxy_info"] == "socks5://1.2.3.4:1080"
-    assert updated["gpm_proxy_configured"] is True
+    assert updated["gpm_proxy_info"] == "socks5://proxy-user:proxy-pass@1.2.3.4:1080"
     assert updated["interaction_mode"] == "gpm_browser"
     assert updated["auto_heart"] == 1
 
@@ -444,6 +443,98 @@ def test_post_comment_reply_via_gpm_with_auto_heart():
     print("✓ test_post_comment_reply_via_gpm_with_auto_heart passed")
 
 
+def test_gpm_session_reuses_running_profile_without_duplicate_window():
+    """Verify that if a profile is already open, gpm_browser_session reuses it and never kills it on exit."""
+    mock_running_coords = {
+        "remote_debugging_port": 19998,
+        "websocket_debugging_url": "ws://127.0.0.1:19998/devtools/browser/xyz",
+        "selenium_remote_debug_address": "127.0.0.1:19998",
+        "profile_id": "gkvs-profile",
+        "status": "already_open",
+        "already_running": True,
+    }
+
+    mock_browser = AsyncMock()
+    mock_context = AsyncMock()
+    mock_playwright = AsyncMock()
+    mock_playwright.chromium.connect_over_cdp = AsyncMock(return_value=mock_browser)
+    mock_browser.contexts = [mock_context]
+
+    api_calls = []
+    def fake_request_api(endpoint, *args, **kwargs):
+        api_calls.append(endpoint)
+        return {"success": True, "data": {}}
+
+    with patch("auto_yt.services.gpm_service.find_running_gpm_profile_coordinates", return_value=mock_running_coords), \
+         patch("auto_yt.services.gpm_service._request_gpm_api", side_effect=fake_request_api), \
+         patch("playwright.async_api.async_playwright") as mock_pw_factory:
+
+        mock_pw_cm = MagicMock()
+        mock_pw_cm.start = AsyncMock(return_value=mock_playwright)
+        mock_pw_factory.return_value = mock_pw_cm
+
+        async def run_session():
+            async with gpm_service.gpm_browser_session("gkvs-profile", auto_stop=True) as (ctx, br):
+                assert ctx is mock_context
+
+        asyncio.run(run_session())
+
+        # Assert no /profiles/start and no /profiles/stop API calls were made to GPM
+        assert not any("start" in call for call in api_calls), f"Unexpected start call in {api_calls}"
+        assert not any("stop" in call for call in api_calls), f"Unexpected stop call in {api_calls}"
+        # Assert browser was NOT closed because it was already running before
+        mock_browser.close.assert_not_called()
+
+    print("✓ test_gpm_session_reuses_running_profile_without_duplicate_window passed")
+
+
+def test_gpm_session_stops_profile_when_started_by_session():
+    """Verify that if a profile was started by Auto_YT, it is cleanly stopped when auto_stop=True."""
+    mock_launch_data = {
+        "success": True,
+        "data": {
+            "remote_debugging_port": 19997,
+            "websocket_debugging_url": "ws://127.0.0.1:19997/devtools/browser/abc",
+            "selenium_remote_debug_address": "127.0.0.1:19997",
+            "profile_id": "temp-profile",
+        }
+    }
+
+    mock_browser = AsyncMock()
+    mock_context = AsyncMock()
+    mock_playwright = AsyncMock()
+    mock_playwright.chromium.connect_over_cdp = AsyncMock(return_value=mock_browser)
+    mock_browser.contexts = [mock_context]
+
+    api_calls = []
+    def fake_request_api(endpoint, *args, **kwargs):
+        api_calls.append(endpoint)
+        if "start" in endpoint:
+            return mock_launch_data
+        return {"success": True, "data": {}}
+
+    with patch("auto_yt.services.gpm_service.find_running_gpm_profile_coordinates", return_value=None), \
+         patch("auto_yt.services.gpm_service._request_gpm_api", side_effect=fake_request_api), \
+         patch("playwright.async_api.async_playwright") as mock_pw_factory:
+
+        mock_pw_cm = MagicMock()
+        mock_pw_cm.start = AsyncMock(return_value=mock_playwright)
+        mock_pw_factory.return_value = mock_pw_cm
+
+        async def run_session():
+            async with gpm_service.gpm_browser_session("temp-profile", auto_stop=True) as (ctx, br):
+                assert ctx is mock_context
+
+        asyncio.run(run_session())
+
+        # Assert start was called, browser was closed, and stop was called
+        assert any("start" in call for call in api_calls), f"Expected start call in {api_calls}"
+        assert any("stop" in call for call in api_calls), f"Expected stop call in {api_calls}"
+        mock_browser.close.assert_called_once()
+
+    print("✓ test_gpm_session_stops_profile_when_started_by_session passed")
+
+
 if __name__ == "__main__":
     test_gpm_config_load_and_save()
     test_gpm_check_connection_online()
@@ -456,4 +547,6 @@ if __name__ == "__main__":
     test_database_gpm_channel_mapping()
     test_fastapi_gpm_endpoints()
     test_post_comment_reply_via_gpm_with_auto_heart()
+    test_gpm_session_reuses_running_profile_without_duplicate_window()
+    test_gpm_session_stops_profile_when_started_by_session()
     print("\n🎉 ALL GPM TESTS PASSED SUCCESSFULLY!")

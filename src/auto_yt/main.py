@@ -3687,6 +3687,7 @@ def _execute_comment_publish_job(job: dict) -> None:
             if video_url:
                 try:
                     db.update_system_job(job["id"], progress="Đang đăng bình luận qua GPM Profile Browser")
+                    has_more_publish_jobs = db.has_claimable_system_jobs("comment_publish")
                     gpm_result = asyncio.run(
                         gpm_youtube_automation.post_comment_reply_via_gpm(
                             gpm_profile_id,
@@ -3694,6 +3695,7 @@ def _execute_comment_publish_job(job: dict) -> None:
                             comment_text=safe_reply,
                             comment_id=comment.get("comment_id") or "",
                             auto_heart=auto_heart,
+                            auto_stop=not has_more_publish_jobs,
                         )
                     )
                     result = {

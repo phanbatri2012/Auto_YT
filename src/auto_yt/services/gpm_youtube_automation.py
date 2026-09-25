@@ -95,6 +95,7 @@ async def post_comment_reply_via_gpm(
     comment_text: str,
     comment_id: str = "",
     auto_heart: bool = True,
+    auto_stop: bool | None = None,
     timeout_seconds: float = 30.0,
 ) -> dict[str, Any]:
     """Post a comment reply (and optionally give Creator Heart) to a video watch page using the channel's GPM profile."""
@@ -105,14 +106,15 @@ async def post_comment_reply_via_gpm(
         target_url = f"{target_url}{delimiter}lc={clean_comment_id}"
 
     logger.info(
-        "Đăng bình luận qua GPM profile %s trên URL %s (comment_id=%s, auto_heart=%s)",
+        "Đăng bình luận qua GPM profile %s trên URL %s (comment_id=%s, auto_heart=%s, auto_stop=%s)",
         profile_id,
         target_url,
         clean_comment_id,
         auto_heart,
+        auto_stop,
     )
     hearted = False
-    async with gpm_browser_session(profile_id, auto_stop=True) as (context, _browser):
+    async with gpm_browser_session(profile_id, auto_stop=auto_stop) as (context, _browser):
         page = await context.new_page()
         try:
             await page.goto(target_url, wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))

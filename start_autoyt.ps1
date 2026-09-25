@@ -619,6 +619,19 @@ function Start-Backend {
     return $process
 }
 
+function Reset-ViteCache {
+    $viteDir = Join-Path $frontendRoot "node_modules\.vite"
+    if (Test-Path -LiteralPath $viteDir) {
+        $backupViteName = ".vite_stale_" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
+        try {
+            Rename-Item -LiteralPath $viteDir -NewName $backupViteName -Force -ErrorAction SilentlyContinue
+        }
+        catch {
+            Remove-Item -LiteralPath $viteDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Start-Frontend {
     param([string]$NpmPath)
 
@@ -696,6 +709,32 @@ try {
         $reported = @{}
 
         while ($barrierTimer.Elapsed.TotalSeconds -lt $ReadyTimeoutSeconds) {
+            # --- Early Failure Detection & Vite Self-Healing ---
+            if ($frontendProcess -and $frontendProcess.HasExited -and -not $frontendReady) {
+                $frontendErrLog = Join-Path $logsRoot "frontend.current.stderr.log"
+                $errText = if (Test-Path -LiteralPath $frontendErrLog -PathType Leaf) {
+                    Get-Content -LiteralPath $frontendErrLog -Raw -ErrorAction SilentlyContinue
+                } else { "" }
+
+                if ($errText -match "EPERM" -and ($errText -match "\.vite" -or $errText -match "unlink")) {
+                    Write-Step "Detected locked Vite cache. Self-healing by resetting .vite cache..."
+                    Reset-ViteCache
+                    Write-Step "Retrying frontend startup with clean cache..."
+                    $frontendProcess = Start-Frontend $npmPath
+                }
+                else {
+                    throw "Frontend process exited unexpectedly. See data/logs/frontend.current.stderr.log: $errText"
+                }
+            }
+
+            if ($backendProcess -and $backendProcess.HasExited -and -not $backendReady) {
+                $backendErrLog = Join-Path $logsRoot "backend.current.stderr.log"
+                $errText = if (Test-Path -LiteralPath $backendErrLog -PathType Leaf) {
+                    Get-Content -LiteralPath $backendErrLog -Raw -ErrorAction SilentlyContinue
+                } else { "" }
+                throw "Backend process exited during startup. See data/logs/backend.current.stderr.log: $errText"
+            }
+
             if (-not $backendReady -and (Test-BackendReady)) {
                 $backendReady = $true
                 if (-not $reported.ContainsKey("backend")) {

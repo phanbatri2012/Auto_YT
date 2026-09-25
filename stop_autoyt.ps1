@@ -333,6 +333,12 @@ try {
             Remove-Item -Force -ErrorAction SilentlyContinue
     }
 
+    $frontendNodeModules = Join-Path (Join-Path $projectRoot "frontend") "node_modules"
+    if (Test-Path -LiteralPath $frontendNodeModules -PathType Container) {
+        Get-ChildItem -LiteralPath $frontendNodeModules -Directory -Filter ".vite_stale_*" -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     Write-Host "[Auto_YT] All services have stopped cleanly. Ports 8080, 5173, and 8011 are free." -ForegroundColor Green
     exit 0
 }

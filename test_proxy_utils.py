@@ -11,8 +11,8 @@ from auto_yt.services import youtube_publisher
 class TestProxyUtils(unittest.TestCase):
     def test_parse_proxy_url_four_parts(self):
         # host:port:user:pass
-        raw = "171.238.21.12:34313:DDPT:DDPT"
-        expected = "http://DDPT:DDPT@171.238.21.12:34313"
+        raw = "192.0.2.100:8080:test_user:test_pass"
+        expected = "http://test_user:test_pass@192.0.2.100:8080"
         self.assertEqual(proxy_utils.parse_proxy_url(raw), expected)
 
     def test_parse_proxy_url_with_special_characters_in_credentials(self):
@@ -26,8 +26,8 @@ class TestProxyUtils(unittest.TestCase):
 
     def test_parse_proxy_url_two_parts(self):
         # host:port
-        raw = "42.114.0.14:35369"
-        expected = "http://42.114.0.14:35369"
+        raw = "198.51.100.50:8080"
+        expected = "http://198.51.100.50:8080"
         self.assertEqual(proxy_utils.parse_proxy_url(raw), expected)
 
     def test_parse_proxy_url_standard_schemes(self):
@@ -48,7 +48,7 @@ class TestProxyUtils(unittest.TestCase):
         self.assertIsNone(proxy_utils.parse_proxy_url("ww://UK-fccc5ee9:True"))
 
     def test_create_proxy_opener_with_proxy(self):
-        opener = proxy_utils.create_proxy_opener("171.238.21.12:34313:DDPT:DDPT")
+        opener = proxy_utils.create_proxy_opener("192.0.2.100:8080:test_user:test_pass")
         self.assertIsNotNone(opener)
         # Verify proxy handler is installed
         handlers = [h.__class__.__name__ for h in opener.handlers]
@@ -87,7 +87,7 @@ class TestYouTubeCommentsProxyRouting(unittest.TestCase):
         mock_opener.open.return_value.__enter__.return_value = mock_response
         mock_create_opener.return_value = mock_opener
 
-        proxy_str = "171.238.21.12:34313:DDPT:DDPT"
+        proxy_str = "192.0.2.100:8080:test_user:test_pass"
         res = youtube_comments._request_json(
             "https://www.googleapis.com/youtube/v3/channels",
             token="fake_token",
@@ -104,7 +104,7 @@ class TestYouTubeCommentsProxyRouting(unittest.TestCase):
         mock_opener.open.return_value.__enter__.return_value = mock_response
         mock_create_opener.return_value = mock_opener
 
-        proxy_str = "42.114.0.14:35369"
+        proxy_str = "198.51.100.50:8080"
         config = {
             "client_id": "test_client",
             "client_secret": "test_secret",
@@ -124,7 +124,7 @@ class TestYouTubeCommentsProxyRouting(unittest.TestCase):
         mock_opener.open.return_value.__enter__.return_value = mock_response
         mock_create_opener.return_value = mock_opener
 
-        proxy_str = "171.238.21.12:34313:DDPT:DDPT"
+        proxy_str = "192.0.2.100:8080:test_user:test_pass"
         config = {
             "client_id": "test_client",
             "client_secret": "test_secret",
@@ -147,7 +147,7 @@ class TestYouTubeCommentsProxyRouting(unittest.TestCase):
         mock_opener.open.return_value.__enter__.return_value = mock_response
         mock_create_opener.return_value = mock_opener
 
-        proxy_str = "171.238.21.12:34313:DDPT:DDPT"
+        proxy_str = "192.0.2.100:8080:test_user:test_pass"
         channels = youtube_comments.get_authenticated_channels(
             "fake_token",
             proxy=proxy_str,
@@ -166,7 +166,7 @@ class TestYouTubePublisherProxyRouting(unittest.TestCase):
         mock_opener.open.return_value.__enter__.return_value = mock_response
         mock_create_opener.return_value = mock_opener
 
-        proxy_str = "1.55.229.171:12068:user:pass"
+        proxy_str = "203.0.113.25:8080:user:pass"
         res = youtube_publisher._api_json(
             "https://www.googleapis.com/youtube/v3/videos",
             "fake_token",

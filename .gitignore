@@ -35,6 +35,7 @@ data/
 /probe_*.py
 /recovered_*.txt
 /scratch_*.py
+/scratch/
 /strip_comfyui_main.py
 /fix_db_close.py
 /list_tables.py

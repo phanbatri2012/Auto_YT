@@ -96,7 +96,7 @@ def test_gpm_list_profiles():
                 {
                     "id": "uuid-1",
                     "name": "Kênh Review Phim",
-                    "raw_proxy": "socks5://103.1.2.3:1080",
+                    "raw_proxy": "socks5://192.0.2.10:1080",
                     "browser": {"name": "chrome", "version": "137.0"},
                     "os": "windows",
                     "note": "Dedicated IP",
@@ -106,7 +106,7 @@ def test_gpm_list_profiles():
                 {
                     "id": "uuid-2",
                     "name": "Kênh Tin Tức",
-                    "raw_proxy": "http://103.4.5.6:8080",
+                    "raw_proxy": "http://198.51.100.20:8080",
                     "browser": {"name": "chrome", "version": "137.0"},
                     "os": "windows",
                     "note": "",
@@ -124,7 +124,7 @@ def test_gpm_list_profiles():
         p1 = result["items"][0]
         assert p1["id"] == "uuid-1"
         assert p1["name"] == "Kênh Review Phim"
-        assert p1["raw_proxy"] == "socks5://103.1.2.3:1080"
+        assert p1["raw_proxy"] == "socks5://192.0.2.10:1080"
     print("✓ test_gpm_list_profiles passed")
 
 

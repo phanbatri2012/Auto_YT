@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 const settingsSource = readFileSync(new URL('./Settings.jsx', import.meta.url), 'utf8');
 const appSource = readFileSync(new URL('./App.jsx', import.meta.url), 'utf8');
 const jobCenterSource = readFileSync(new URL('./JobCenter.jsx', import.meta.url), 'utf8');
+const autoLoginSource = readFileSync(new URL('./AutoLogin.jsx', import.meta.url), 'utf8');
 
 test('Settings exposes a separately saved pipeline for every prompt version', () => {
   assert.match(settingsSource, /\/pipeline`/);
@@ -54,17 +55,13 @@ test('duplicating a prompt version also copies its default YouTube channel', () 
   );
 });
 
-test('Settings exposes hidden ChatGPT jobs and a strict game mode', () => {
-  assert.match(settingsSource, /\/api\/browser-automation/);
-  assert.match(settingsSource, /\/api\/chatgpt-browser-service/);
-  assert.match(settingsSource, /worker_headless/);
-  assert.match(settingsSource, /Chế độ chơi game/);
-  assert.match(settingsSource, /Khởi động trình duyệt nền/);
-  assert.match(settingsSource, /Hiện trình duyệt/);
-  assert.match(settingsSource, /Ẩn trình duyệt/);
-  assert.match(settingsSource, /window_visible/);
-  assert.match(settingsSource, /tự chạy Auto Login một lần/);
-  assert.match(settingsSource, /CAPTCHA, MFA thiếu mã/);
+test('AutoLogin manages ChatGPT browser service while Settings focuses on prompts', () => {
+  assert.match(autoLoginSource, /\/api\/chatgpt-browser-service/);
+  assert.match(autoLoginSource, /Hiện trình duyệt/);
+  assert.match(autoLoginSource, /Ẩn trình duyệt/);
+  assert.match(autoLoginSource, /window_visible/);
+  assert.match(settingsSource, /Prompt Management/);
+  assert.doesNotMatch(settingsSource, /\/api\/browser-automation/);
 });
 
 test('Dashboard and Job Center expose render and YouTube publish artifacts', () => {

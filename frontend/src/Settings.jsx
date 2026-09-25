@@ -319,17 +319,6 @@ export default function Settings({
   const [voicesData, setVoicesData] = useState(null);
   const [youtubeChannels, setYoutubeChannels] = useState([]);
   const [pipelineNotice, setPipelineNotice] = useState('');
-  const [browserAutomation, setBrowserAutomation] = useState({
-    worker_headless: true,
-    game_mode: false
-  });
-  const [browserService, setBrowserService] = useState({
-    connected: false,
-    process_alive: false,
-    window_visible: false,
-    state: 'stopped',
-    message: 'Đang kiểm tra trình duyệt ChatGPT nền...'
-  });
   const [activeVersion, setActiveVersion] = useState('');
   const [loadingMsg, setLoadingMsg] = useState('');
   const [resultMsg, setResultMsg] = useState('');
@@ -432,49 +421,23 @@ export default function Settings({
     }
   };
 
-
-  const fetchBrowserServiceStatus = async () => {
-    try {
-      const response = await fetch(
-        'http://127.0.0.1:8080/api/chatgpt-browser-service'
-      );
-      if (!response.ok) return;
-      setBrowserService(await response.json());
-    } catch (err) {
-      console.error('Lỗi khi kiểm tra Browser Service:', err);
-    }
-  };
-
   useEffect(() => {
     fetchData();
-    const intervalId = window.setInterval(fetchBrowserServiceStatus, 5000);
-    return () => window.clearInterval(intervalId);
   }, []);
 
   const fetchData = async () => {
     try {
-      const [promptsResponse, voicesResponse, channelsResponse, browserResponse, serviceResponse] = await Promise.all([
+      const [promptsResponse, voicesResponse, channelsResponse] = await Promise.all([
         fetch('http://127.0.0.1:8080/api/prompts'),
         fetch('http://127.0.0.1:8080/api/voices'),
-        fetch('http://127.0.0.1:8080/api/youtube-comments/channels'),
-        fetch('http://127.0.0.1:8080/api/browser-automation'),
-        fetch('http://127.0.0.1:8080/api/chatgpt-browser-service')
+        fetch('http://127.0.0.1:8080/api/youtube-comments/channels')
       ]);
       const prompts = await promptsResponse.json();
       const voices = await voicesResponse.json();
       const channels = await channelsResponse.json();
-      const browserSettings = await browserResponse.json();
-      const serviceStatus = await serviceResponse.json();
       setPromptsData(prompts);
       setVoicesData(voices);
       setYoutubeChannels(Array.isArray(channels.items) ? channels.items : []);
-      if (browserResponse.ok) {
-        setBrowserAutomation({
-          worker_headless: browserSettings.worker_headless ?? true,
-          game_mode: browserSettings.game_mode ?? false
-        });
-      }
-      if (serviceResponse.ok) setBrowserService(serviceStatus);
       setActiveVersion(prompts.active_version);
     } catch (err) {
       console.error("Lỗi khi lấy prompts:", err);
@@ -944,48 +907,6 @@ export default function Settings({
     }
   };
 
-  const handleSaveBrowserAutomation = async () => {
-    const result = await saveSection(
-      'browser-automation',
-      'Đang lưu chế độ trình duyệt ChatGPT...',
-      'Đã lưu chế độ trình duyệt ChatGPT.',
-      () => fetch('http://127.0.0.1:8080/api/browser-automation', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(browserAutomation)
-      })
-    );
-    if (result) setBrowserAutomation(result);
-  };
-
-  const handleBrowserServiceAction = async (action) => {
-    const starting = action === 'start';
-    const showing = action === 'show';
-    const hiding = action === 'hide';
-    const result = await saveSection(
-      `browser-service-${action}`,
-      starting
-        ? 'Đang khởi động trình duyệt ChatGPT nền...'
-        : showing
-          ? 'Đang đưa trình duyệt ChatGPT ra màn hình...'
-          : hiding
-            ? 'Đang ẩn trình duyệt ChatGPT...'
-            : 'Đang dừng trình duyệt ChatGPT nền...',
-      starting
-        ? 'Trình duyệt ChatGPT nền đã được khởi động.'
-        : showing
-          ? 'Trình duyệt ChatGPT đang hiển thị trên màn hình.'
-          : hiding
-            ? 'Trình duyệt ChatGPT đã được ẩn.'
-            : 'Trình duyệt ChatGPT nền đã dừng.',
-      () => fetch(
-        `http://127.0.0.1:8080/api/chatgpt-browser-service/${action}`,
-        { method: 'POST' }
-      )
-    );
-    if (result) setBrowserService(result);
-  };
-
   const handleSavePrompt = (promptKey, promptLabel) => {
     const versionId = activeVersion;
     const value = promptsData.versions[versionId].prompts[promptKey] || '';
@@ -1027,21 +948,6 @@ export default function Settings({
       setSavingSection('all');
       setLoadingMsg('Đang lưu thiết lập...');
       setResultMsg('');
-      const browserResponse = await fetch(
-        'http://127.0.0.1:8080/api/browser-automation',
-        {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(browserAutomation)
-        }
-      );
-      const browserResult = await browserResponse.json();
-      if (!browserResponse.ok) {
-        throw new Error(
-          browserResult.detail || 'Không thể lưu chế độ trình duyệt ChatGPT.'
-        );
-      }
-      setBrowserAutomation(browserResult);
 
       const promptsResponse = await fetch('http://127.0.0.1:8080/api/prompts', {
         method: 'POST',
@@ -1279,134 +1185,6 @@ export default function Settings({
         </div>
       )}
 
-      <div className="prompt-item" style={{ marginBottom: '20px' }}>
-        <div className="prompt-header">
-          <div>
-            <label>🕶️ Trình duyệt ChatGPT cho job tự động</label>
-            <div className="help-text" style={{ marginTop: '5px' }}>
-              Hệ thống khởi động Chromium một lần và mọi job dùng lại cùng phiên qua
-              kết nối nội bộ. Khi Playwright xác nhận phiên đăng nhập hết hạn, hệ thống
-              tự chạy Auto Login một lần rồi tiếp tục đúng các job vừa bị tạm dừng.
-              CAPTCHA, MFA thiếu mã và xác minh thiết bị vẫn cần bạn xử lý thủ công.
-            </div>
-          </div>
-          <button
-            className="btn-save section-save-button"
-            onClick={handleSaveBrowserAutomation}
-            disabled={Boolean(savingSection)}
-          >
-            💾 Lưu
-          </button>
-        </div>
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            flexWrap: 'wrap',
-            gap: '10px',
-            marginTop: '12px'
-          }}
-        >
-          <span
-            role="status"
-            style={{
-              color: browserService.connected ? '#4ce0b3' : '#f5b041',
-              fontWeight: 700
-            }}
-          >
-            {browserService.connected ? '● Đã kết nối' : '● Chưa kết nối'}
-          </span>
-          <span className="help-text" style={{ flex: '1 1 280px' }}>
-            {browserService.message}
-          </span>
-          <button
-            className="btn-secondary"
-            onClick={() => handleBrowserServiceAction(
-              browserService.window_visible ? 'hide' : 'show'
-            )}
-            disabled={
-              Boolean(savingSection) ||
-              !browserService.connected
-            }
-          >
-            {browserService.window_visible
-              ? '🙈 Ẩn trình duyệt'
-              : '👁 Hiện trình duyệt'}
-          </button>
-          <button
-            className="btn-secondary"
-            onClick={() => handleBrowserServiceAction('start')}
-            disabled={
-              Boolean(savingSection) ||
-              Boolean(chatGptOperation) ||
-              browserService.connected ||
-              browserService.state === 'starting'
-            }
-          >
-            ▶ Khởi động trình duyệt nền
-          </button>
-          <button
-            className="btn-danger"
-            onClick={() => handleBrowserServiceAction('stop')}
-            disabled={
-              Boolean(savingSection) ||
-              Boolean(chatGptOperation) ||
-              !browserService.process_alive
-            }
-          >
-            ■ Dừng
-          </button>
-        </div>
-        <div className="pipeline-options" style={{ marginTop: '12px' }}>
-          <label className="pipeline-option">
-            <input
-              type="checkbox"
-              checked={browserAutomation.worker_headless}
-              onChange={event => setBrowserAutomation(previous => ({
-                ...previous,
-                worker_headless: event.target.checked
-              }))}
-            />
-            <span>
-              <strong>Chạy job ChatGPT ẩn</strong>
-              <small>Áp dụng ở lần khởi động Browser Service tiếp theo.</small>
-            </span>
-          </label>
-          <label className="pipeline-option">
-            <input
-              type="checkbox"
-              checked={browserAutomation.game_mode}
-              onChange={event => setBrowserAutomation(previous => ({
-                ...previous,
-                game_mode: event.target.checked
-              }))}
-            />
-            <span>
-              <strong>Chế độ chơi game</strong>
-              <small>Giữ Chromium nền ngoài màn hình và không cho job tự bật lại.</small>
-            </span>
-          </label>
-        </div>
-        {!browserAutomation.worker_headless && !browserAutomation.game_mode && (
-          <div className="help-text" style={{ marginTop: '10px', color: '#f5b041' }}>
-            ⚠️ Job ChatGPT có thể mở cửa sổ và làm mất focus ứng dụng đang dùng.
-          </div>
-        )}
-      </div>
-
-      <div className="result-panel" style={{ marginBottom: '20px', padding: '16px', border: '1px solid rgba(139, 92, 246, 0.4)', background: 'rgba(139, 92, 246, 0.08)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px' }}>
-          <div>
-            <strong style={{ color: '#fff', fontSize: '1rem', display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <span>📡 Quản lý Kênh & Cô lập Profile GPM</span>
-            </strong>
-            <div className="help-text" style={{ marginTop: '4px', color: '#cbd5e1' }}>
-              Toàn bộ cấu hình kết nối kênh (YouTube, Facebook) và cô lập Proxy Profile GPM-Login đã được chuyển sang menu riêng <strong>Channel Hub</strong>.
-            </div>
-          </div>
-        </div>
-      </div>
-      
       <div className="version-control">
         <div className="version-editor">
           <label style={{color: '#fff', fontWeight: 'bold'}}>Phiên bản hiện tại:</label>

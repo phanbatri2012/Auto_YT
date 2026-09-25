@@ -129,13 +129,11 @@ test('deleting a dashboard video refreshes every video view and clears stale det
 
 test('expired ChatGPT sessions show automatic login recovery state', async () => {
   const jobCenterSource = await readFile(new URL('./JobCenter.jsx', import.meta.url), 'utf8')
-  const settingsSource = await readFile(new URL('./Settings.jsx', import.meta.url), 'utf8')
   const autoLoginSource = await readFile(new URL('./AutoLogin.jsx', import.meta.url), 'utf8')
 
   assert.match(jobCenterSource, /job\.automatic_login === 'pending'/)
   assert.match(jobCenterSource, /Đang Auto Login/)
   assert.match(jobCenterSource, /sẽ tự tiếp tục đúng job này/)
-  assert.match(settingsSource, /tự chạy Auto Login một lần/)
   assert.match(autoLoginSource, /Job sẽ tự chạy Auto Login một lần/)
 })
 
@@ -177,4 +175,3 @@ test('wires Universal Router engine into App and sub-components for persistent U
   assert.match(crossSource, /import\s*\{\s*useAppRouter\s*\}\s*from\s*['"]\.\/router\.js['"]/)
   assert.match(crossSource, /export default function CrossPoster/)
 })
-

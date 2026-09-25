@@ -4772,6 +4772,7 @@ def _execute_youtube_publish_job(job: dict) -> None:
         ),
         cancel_check=lambda: _raise_if_video_job_canceled(job["id"]),
         resolve_default_channel_id=_get_prompt_default_youtube_channel_id,
+        resolve_publishing_settings=_get_prompt_publishing_settings,
         thumbnails_dir=THUMBNAILS_DIR,
     )
     db.update_system_job(
@@ -7767,6 +7768,19 @@ def _get_prompt_default_youtube_channel_id(version_id: str = "") -> str:
         return str(
             version.get("default_youtube_channel_id", "") or ""
         ).strip()
+
+
+def _get_prompt_publishing_settings(version_id: str = "") -> dict:
+    with _prompts_config_lock:
+        data = _read_prompts_config()
+        resolved_version_id = version_id.strip() or data.get(
+            "active_version",
+            "default",
+        )
+        version = data.get("versions", {}).get(resolved_version_id, {})
+        return chatgpt_projects.normalize_publishing_settings(
+            version.get("publishing_settings")
+        )
 
 
 def _clear_prompt_default_youtube_channel_id(channel_id: str) -> list[str]:

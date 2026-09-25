@@ -741,7 +741,9 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                     )}
                     {job.status === 'paused' && job.attention_required?.startsWith('youtube_') && (
                       <div style={{ color: '#f1c40f', marginTop: '9px', fontSize: '0.84em' }}>
-                        Hãy sửa trong Channel Hub rồi bấm “Tiếp tục”.
+                        {job.missing_configuration?.some(item => ['made_for_kids', 'default_youtube_channel_id'].includes(item))
+                          ? 'Hãy sửa trong Cài đặt (Settings) hoặc Channel Hub rồi bấm “Tiếp tục”.'
+                          : 'Hãy sửa trong Channel Hub rồi bấm “Tiếp tục”.'}
                         {job.missing_configuration?.length > 0 && (
                           <div style={{ marginTop: '4px' }}>
                             Còn thiếu: {job.missing_configuration

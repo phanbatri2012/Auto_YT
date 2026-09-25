@@ -925,6 +925,68 @@ class YouTubePublishPipelineTests(unittest.TestCase):
         self.assertEqual(updated["privacy_status"], "public")
         self.assertEqual(database.get_video(job["video_id"])["is_published"], 1)
 
+    def test_execute_publish_job_resolves_dynamic_publishing_settings(self):
+        job, _channel = self._create_publish_job(schedule=False)
+        payload = dict(job["payload"])
+        payload["snapshot"]["publishing_settings"]["made_for_kids"] = None
+        database.update_system_job(job["id"], payload_json=payload)
+        stale_job = database.get_system_job(job["id"])
+
+        # Without resolve_publishing_settings callback, it raises PublishConfigurationRequired
+        with self.assertRaises(youtube_publish_workflow.PublishConfigurationRequired) as ctx:
+            youtube_publish_workflow.execute_publish_job(
+                stale_job,
+                progress=lambda *args: None,
+                cancel_check=lambda: None,
+                resolve_default_channel_id=lambda _ver: "",
+                thumbnails_dir=self.thumbnails_dir,
+            )
+        self.assertIn("made_for_kids", ctx.exception.missing_configuration)
+
+        # With resolve_publishing_settings callback returning updated settings, preflight succeeds
+        with patch.object(
+            youtube_publish_workflow.youtube_comments,
+            "access_token_for_channel",
+            return_value="access-token",
+        ), patch.object(
+            youtube_publish_workflow.secret_store,
+            "encrypt_secret",
+            side_effect=lambda value: f"encrypted:{value}",
+        ), patch.object(
+            youtube_publish_workflow.secret_store,
+            "decrypt_secret",
+            side_effect=lambda value: str(value).removeprefix("encrypted:"),
+        ), patch.object(
+            youtube_publisher,
+            "start_resumable_upload",
+            return_value="https://www.googleapis.com/upload/session",
+        ), patch.object(
+            youtube_publisher,
+            "upload_video_resumable",
+            return_value={"id": "dyn-yt-id"},
+        ), patch.object(
+            youtube_publisher,
+            "upload_thumbnail",
+        ), patch.object(
+            youtube_publisher,
+            "find_caption_track",
+            return_value="",
+        ), patch.object(
+            youtube_publisher,
+            "upload_caption",
+            return_value={"id": "caption-id"},
+        ):
+            result = youtube_publish_workflow.execute_publish_job(
+                stale_job,
+                progress=lambda *args: None,
+                cancel_check=lambda: None,
+                resolve_default_channel_id=lambda _ver: "",
+                resolve_publishing_settings=lambda _ver: {"made_for_kids": False, "category_id": "25"},
+                thumbnails_dir=self.thumbnails_dir,
+            )
+        self.assertEqual(result["youtube_video_id"], "dyn-yt-id")
+        self.assertEqual(result["stage"], "uploaded_private")
+
 
 if __name__ == "__main__":
     unittest.main()

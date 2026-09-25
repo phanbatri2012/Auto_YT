@@ -266,6 +266,7 @@ def _build_preflight_context(
     job: dict,
     *,
     resolve_default_channel_id,
+    resolve_publishing_settings=None,
     thumbnails_dir: Path,
 ) -> dict:
     payload = job.get("payload") or {}
@@ -324,6 +325,18 @@ def _build_preflight_context(
     publishing_settings = snapshot.get("publishing_settings")
     if not isinstance(publishing_settings, dict):
         publishing_settings = {}
+    if not isinstance(publishing_settings.get("made_for_kids"), bool):
+        if callable(resolve_publishing_settings):
+            live_pub_settings = resolve_publishing_settings(prompt_version)
+            if isinstance(live_pub_settings, dict):
+                merged_pub_settings = dict(live_pub_settings)
+                for k, v in publishing_settings.items():
+                    if v is not None and v != "":
+                        merged_pub_settings[k] = v
+                    elif k == "made_for_kids" and isinstance(v, bool):
+                        merged_pub_settings[k] = v
+                publishing_settings = merged_pub_settings
+                snapshot["publishing_settings"] = publishing_settings
     if not isinstance(publishing_settings.get("made_for_kids"), bool):
         raise PublishConfigurationRequired(
             ["made_for_kids"],
@@ -447,11 +460,13 @@ def execute_publish_job(
     progress,
     cancel_check,
     resolve_default_channel_id,
+    resolve_publishing_settings=None,
     thumbnails_dir: Path,
 ) -> dict:
     context = _build_preflight_context(
         job,
         resolve_default_channel_id=resolve_default_channel_id,
+        resolve_publishing_settings=resolve_publishing_settings,
         thumbnails_dir=thumbnails_dir,
     )
     workflow = context["workflow"]

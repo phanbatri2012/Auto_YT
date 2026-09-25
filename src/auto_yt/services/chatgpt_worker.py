@@ -1286,8 +1286,43 @@ def request_complete_metadata(page, generation_prompt: str) -> str:
     return validate_metadata_response(retry_response)
 
 
+def remove_citation_artifacts(text: str) -> str:
+    """Removes ChatGPT search citations, source pill badges, and search indicators."""
+    if not isinstance(text, str) or not text:
+        return ""
+    # 1. OpenAI internal source markers (e.g. 【4:0†source】, 【12†source】)
+    cleaned = re.sub(r"【\d+(?::\d+)?†[a-zA-Z]+】", "", text)
+    # 2. Web search status/indicator lines
+    cleaned = re.sub(
+        r"(?im)^\s*(?:Searched\s+\d+\s+sites?|Đã tìm kiếm\s+\d+\s+trang web|Tìm kiếm:\s*.+|Search results?|Sources?|Nguồn(?:\s+tham khảo)?)(?::)?\s*$",
+        "",
+        cleaned,
+    )
+    # 3. Citation pill badges: e.g. "Digital Library\n+1" or "Wikipedia\n+2"
+    cleaned = re.sub(
+        r"(?im)(?:(?<=\n)|\s+)[A-Za-z0-9\s.,'’\-–—&/]{1,80}\s*\n\s*\+[0-9]+\s*(?=\n|$)",
+        "",
+        cleaned,
+    )
+    # 4. Isolated line with +N or [+N]
+    cleaned = re.sub(r"(?m)^\s*\[?\+[0-9]+\]?\s*$", "", cleaned)
+    return cleaned
+
+
+def looks_like_citation_artifact(text: str) -> bool:
+    lowered = text.strip().lower()
+    if re.match(r"^\[?\+[0-9]+\]?$", lowered):
+        return True
+    if re.match(r"^(?:searched\s+\d+\s+sites?|đã tìm kiếm\s+\d+\s+trang web|tìm kiếm:|search results?|sources?|nguồn(?:\s+tham khảo)?)\b", lowered):
+        return True
+    return False
+
+
 def clean_text(text: str) -> str:
-    """Removes 'Edit' and common AI conversational fillers from the output."""
+    """Removes 'Edit', citations, search badges, and common AI conversational fillers from the output."""
+    if not isinstance(text, str) or not text:
+        return ""
+    text = remove_citation_artifacts(text)
     lines = text.split('\n')
     cleaned = []
     skip_keywords = ["dưới đây là", "trân trọng gửi", "chắc chắn rồi", "dạ vâng", "vâng,", "đã hoàn thành", "bạn chưa cung cấp", "nội dung hoàn chỉnh", "chào bạn"]
@@ -1332,6 +1367,7 @@ def _is_short_narrative_artifact(block: str) -> tuple[bool, bool]:
         explicit_editorial_note = explicit_editorial_note or (
             has_markdown_heading
             or looks_like_editorial_artifact(lowered_line)
+            or looks_like_citation_artifact(lowered_line)
             or bool(re.match(
                 r"^(?:ghi chú|ý chính|trọng tâm)\b",
                 lowered_line,
@@ -1526,6 +1562,38 @@ def ensure_prompt_editor_integrity(
         )
 
 
+def _extract_clean_markdown_text(node) -> str:
+    try:
+        cleaned = node.evaluate("""(el) => {
+            const clone = el.cloneNode(true);
+            const junkSelectors = [
+                '[data-testid*="citation"]',
+                '[data-testid*="source"]',
+                '[data-testid*="attribution"]',
+                'a[class*="citation"]',
+                'div[class*="citation"]',
+                'span[class*="citation"]',
+                'button[aria-label*="citation" i]',
+                'button[aria-label*="trích dẫn" i]',
+                'button[data-testid*="search"]',
+                '.citation',
+                '[class*="citation-"]',
+                '[class*="attribution-"]',
+                '[data-citation-index]',
+                'sup.citation',
+            ];
+            junkSelectors.forEach((sel) => {
+                clone.querySelectorAll(sel).forEach((badEl) => badEl.remove());
+            });
+            return clone.innerText || clone.textContent || '';
+        }""")
+        if isinstance(cleaned, str) and cleaned.strip():
+            return clean_text(cleaned)
+    except Exception:
+        pass
+    return clean_text(node.inner_text())
+
+
 def _read_assistant_message(message) -> str:
     markdown_nodes = message.locator('.markdown')
     markdown_parts = []
@@ -1539,7 +1607,7 @@ def _read_assistant_message(message) -> str:
                 if markdown_count == 1
                 else markdown_nodes.nth(index)
             )
-            markdown_text = clean_text(markdown_node.inner_text())
+            markdown_text = _extract_clean_markdown_text(markdown_node)
         except Exception:
             continue
         if (
@@ -1550,7 +1618,7 @@ def _read_assistant_message(message) -> str:
             markdown_parts.append(markdown_text)
     if markdown_parts:
         return "\n\n".join(markdown_parts)
-    fallback = clean_text(message.inner_text())
+    fallback = _extract_clean_markdown_text(message)
     if _is_pure_thinking_indicator(fallback):
         return ""
     return fallback

@@ -1273,8 +1273,28 @@ def init_db():
     _migrate_fb_crossposter_queue_composite_unique(conn)
     _migrate_fb_crossposter_meta_state(conn)
     _remove_orphan_video_dependencies(conn)
+    _clean_existing_scripts_with_sanitizer(conn)
     conn.commit()
     conn.close()
+
+
+def _clean_existing_scripts_with_sanitizer(conn: sqlite3.Connection) -> None:
+    try:
+        from auto_yt.services.chatgpt_worker import sanitize_generated_script
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, generated_script FROM videos WHERE length(generated_script) > 0")
+        rows = cursor.fetchall()
+        for video_id, script in rows:
+            cleaned = sanitize_generated_script(script)
+            if cleaned != script:
+                cursor.execute(
+                    "UPDATE videos SET generated_script = ? WHERE id = ?",
+                    (cleaned, video_id),
+                )
+    except Exception as exc:
+        import sys
+        print(f"Warning: could not run script sanitizer migration: {exc}", file=sys.stderr)
+
 
 def _migrate_fb_crossposter_queue_composite_unique(conn: sqlite3.Connection) -> None:
     c = conn.cursor()

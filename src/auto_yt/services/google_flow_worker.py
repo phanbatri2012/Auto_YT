@@ -43,6 +43,27 @@ def _strip_watermark(image_path: Path) -> None:
         logger.warning("Failed to strip watermark from %s: %s", image_path, e)
 
 
+def _is_valid_flow_error_text(text: str) -> bool:
+    """Verify that detected text is an actual system error and not user prompt or UI placeholder."""
+    if not text or len(text.strip()) < 3:
+        return False
+    import unicodedata
+    norm = unicodedata.normalize("NFKD", text).encode("ASCII", "ignore").decode("utf-8").lower()
+    ignored_keywords = [
+        "ban muon tao gi",
+        "keyboard_return",
+        "avoid:",
+        "cinematic",
+        "narrative scene",
+        "documentary realism",
+        "35mm photography",
+        "widescreen still photograph",
+    ]
+    if any(kw in norm for kw in ignored_keywords):
+        return False
+    return True
+
+
 class GoogleFlowWorker:
     _session_uploaded_references: set[str] = set()
     _session_uploaded_image_urls: set[str] = set()
@@ -658,15 +679,14 @@ class GoogleFlowWorker:
                 logger.info("Google Flow generation started (Stop button appeared).")
                 break
 
-        # Fast error selectors for immediate failure detection
-        err_selectors = [
+        # Specific canvas / workspace error tile selectors (excluding sidebar prompt cards and history)
+        canvas_err_selectors = [
             "flow-error-tile",
+            ".canvas flow-error-tile",
+            "flow-media-tile.error",
+            "flow-media-tile[data-error='true']",
+            "[data-tile-state='error']",
             ".error-tile",
-            ".virtual-item-container:has-text('Failed')",
-            "p:has-text('safety filters')",
-            "div:has-text('The agent failed')",
-            "div:has-text('failed to generate')",
-            "div:has-text('Sorry, this image failed')",
         ]
 
         # Wait for generation to complete (Stop button disappears and new image is available)
@@ -679,20 +699,6 @@ class GoogleFlowWorker:
             await asyncio.sleep(2)
             await self.handle_confirmation_prompts()
 
-            # 1. Fast check for Flow error tile / safety filters
-            for err_sel in err_selectors:
-                try:
-                    err_loc = self.page.locator(err_sel).first
-                    if await err_loc.is_visible(timeout=200):
-                        err_text = (await err_loc.inner_text() or "").strip()
-                        logger.error("Google Flow error tile detected immediately: %s", err_text)
-                        await self._save_debug_screenshot("flow_error_tile")
-                        raise RuntimeError(f"Google Flow báo lỗi khi tạo ảnh: {err_text}")
-                except RuntimeError:
-                    raise
-                except Exception:
-                    pass
-
             is_generating = False
             for s_sel in stop_btn_selectors:
                 try:
@@ -703,8 +709,24 @@ class GoogleFlowWorker:
                 except Exception:
                     continue
 
+            # If generation is actively running (Stop button visible), never interrupt on text matches
             if is_generating:
                 continue
+
+            # Check for explicit canvas error tile ONLY when generation is not active
+            for err_sel in canvas_err_selectors:
+                try:
+                    err_loc = self.page.locator(err_sel).first
+                    if await err_loc.is_visible(timeout=200):
+                        err_text = (await err_loc.inner_text() or "").strip()
+                        if _is_valid_flow_error_text(err_text):
+                            logger.error("Google Flow canvas error tile detected: %s", err_text)
+                            await self._save_debug_screenshot("flow_error_tile")
+                            raise RuntimeError(f"Google Flow báo lỗi khi tạo ảnh: {err_text}")
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass
 
             # Query all current images
             try:
@@ -774,12 +796,14 @@ class GoogleFlowWorker:
                     break
 
         if not new_src:
-            # Check for error alert/snackbars on page
+            # Check for error alert/snackbars on page (excluding prompt sidebar)
             error_text = ""
             try:
-                error_loc = self.page.locator(".mat-mdc-snack-bar-container, [role='alert'], .error-message").first
+                error_loc = self.page.locator(".mat-mdc-snack-bar-container [role='alert'], .mat-mdc-snack-bar-container, flow-toast-notification").first
                 if await error_loc.is_visible(timeout=1000):
-                    error_text = (await error_loc.inner_text() or "").strip()
+                    txt = (await error_loc.inner_text() or "").strip()
+                    if _is_valid_flow_error_text(txt):
+                        error_text = txt
             except Exception:
                 pass
 
@@ -1003,7 +1027,19 @@ class GoogleFlowWorker:
                 break
 
         if not new_video_src:
+            error_text = ""
+            try:
+                error_loc = self.page.locator(".mat-mdc-snack-bar-container [role='alert'], .mat-mdc-snack-bar-container, flow-toast-notification").first
+                if await error_loc.is_visible(timeout=1000):
+                    txt = (await error_loc.inner_text() or "").strip()
+                    if _is_valid_flow_error_text(txt):
+                        error_text = txt
+            except Exception:
+                pass
+
             await self._save_debug_screenshot("video_generation_timeout")
+            if error_text:
+                raise RuntimeError(f"Google Flow Veo báo lỗi khi tạo video: {error_text}")
             raise RuntimeError("Google Flow Veo không trả về video mới sau 180 giây.")
 
         return new_video_src

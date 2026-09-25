@@ -700,31 +700,31 @@ class VideoProductionServiceTests(unittest.TestCase):
         f0, l0 = video_production._segment_filter(scene=scene_30s, scene_index=0, subtitle_path=None)
         self.assertEqual(l0, "current")
         self.assertIn("d=900", f0)
-        self.assertIn("zoompan=z='1.0+0.18*(on/d)'", f0)
+        self.assertIn("zoompan=z='1.0+0.18*(on/900)'", f0)
         self.assertIn("x='(iw-iw/zoom)/2'", f0)
         self.assertIn("y='(ih-ih/zoom)/2'", f0)
 
         # Mode 1: Pan Left -> Right
         f1, _ = video_production._segment_filter(scene=scene_30s, scene_index=1, subtitle_path=None)
-        self.assertIn("zoompan=z='1.0+0.144*(on/d)'", f1)
-        self.assertIn("x='(iw-iw/zoom)*(on/d)'", f1)
+        self.assertIn("zoompan=z='1.0+0.144*(on/900)'", f1)
+        self.assertIn("x='(iw-iw/zoom)*(on/900)'", f1)
         self.assertIn("y='(ih-ih/zoom)/2'", f1)
 
         # Mode 2: Zoom Out Center
         f2, _ = video_production._segment_filter(scene=scene_30s, scene_index=2, subtitle_path=None)
-        self.assertIn("zoompan=z='1.18-0.18*(on/d)'", f2)
+        self.assertIn("zoompan=z='1.18-0.18*(on/900)'", f2)
         self.assertIn("x='(iw-iw/zoom)/2'", f2)
 
         # Mode 3: Pan Right -> Left
         f3, _ = video_production._segment_filter(scene=scene_30s, scene_index=3, subtitle_path=None)
-        self.assertIn("zoompan=z='1.0+0.144*(on/d)'", f3)
-        self.assertIn("x='(iw-iw/zoom)*(1.0-on/d)'", f3)
+        self.assertIn("zoompan=z='1.0+0.144*(on/900)'", f3)
+        self.assertIn("x='(iw-iw/zoom)*(1.0-on/900)'", f3)
 
         # Mode 4: Diagonal Pan
         f4, _ = video_production._segment_filter(scene=scene_30s, scene_index=4, subtitle_path=None)
-        self.assertIn("zoompan=z='1.0+0.144*(on/d)'", f4)
-        self.assertIn("x='(iw-iw/zoom)*(on/d)'", f4)
-        self.assertIn("y='(ih-ih/zoom)*(on/d)'", f4)
+        self.assertIn("zoompan=z='1.0+0.144*(on/900)'", f4)
+        self.assertIn("x='(iw-iw/zoom)*(on/900)'", f4)
+        self.assertIn("y='(ih-ih/zoom)*(on/900)'", f4)
 
 
 if __name__ == "__main__":

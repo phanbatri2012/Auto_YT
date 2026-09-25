@@ -413,13 +413,41 @@ def split_outline_parts(
     outline: str,
     max_chars: int = OUTLINE_PART_MAX_CHARS,
 ) -> list[str]:
-    raw_parts = [
-        part.strip()
-        for part in outline.split("[PHAN]")
-        if part.strip()
-    ]
-    if not raw_parts and outline.strip():
-        raw_parts = [outline.strip()]
+    clean_outline = outline.strip()
+    # Priority 1: Tag-based delimiters like [PHAN], [PHẦN], [Phần], [PART]
+    bracket_tag_pattern = re.compile(r"\[\s*(?:phần|phan|part|section)\s*\]", flags=re.IGNORECASE)
+    if bracket_tag_pattern.search(clean_outline):
+        raw_parts = [
+            part.strip()
+            for part in bracket_tag_pattern.split(clean_outline)
+            if part.strip()
+        ]
+    # Priority 2: Line-based numbered headers like PHẦN 1:, PHẦN 2., ### PHẦN 1
+    elif re.search(r"(?:^|\n|\r\n)\s*(?:###?\s*)?(?:phần|phan|part|section)\s*\d+[:.]?", clean_outline, flags=re.IGNORECASE):
+        raw_parts = [
+            part.strip()
+            for part in re.split(r"(?:^|\n|\r\n)\s*(?:###?\s*)?(?:phần|phan|part|section)\s*\d+[:.]?", clean_outline, flags=re.IGNORECASE)
+            if part.strip()
+        ]
+    else:
+        raw_parts = [
+            part.strip()
+            for part in clean_outline.split("[PHAN]")
+            if part.strip()
+        ]
+    
+    # Strip any leading doc artifact markers if separated alone
+    cleaned_raw_parts = []
+    for part in raw_parts:
+        p = part.strip()
+        if p.startswith(":::writing") and "\n" not in p:
+            continue
+        cleaned_raw_parts.append(p)
+    if cleaned_raw_parts:
+        raw_parts = cleaned_raw_parts
+
+    if not raw_parts and clean_outline:
+        raw_parts = [clean_outline]
 
     chunks = []
     for raw_part in raw_parts:
@@ -2395,6 +2423,13 @@ def _run_complete(transcript: str, state: dict) -> dict:
         page = context.pages[0] if context.pages else context.new_page()
         project_url = get_chatgpt_project_url()
         resume_url = state.get("chat_url", "")
+        # Safeguard: Only resume if there's a valid chat url AND existing progress (outline_parts)
+        # If state has no outline_parts, resuming an old chat url is dangerous (might re-send Part 1 into an old chat)
+        if resume_url and not state.get("outline_parts"):
+            print(">>> KHỞI TẠO PHIÊN CHAT MỚI TRONG PROJECT CHO AN TOÀN", file=sys.stderr)
+            resume_url = ""
+            state["chat_url"] = ""
+
         is_resuming = is_chatgpt_conversation_url(resume_url)
         if is_resuming:
             page.goto(
@@ -2458,8 +2493,12 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 )
             print(f"    -> Chat URL: {state['chat_url']}", file=sys.stderr)
 
-            if "[PHAN]" in outline:
-                outline = outline[outline.index("[PHAN]"):]
+            outline_strip = outline
+            for tag in ["[PHAN]", "[PHẦN]", "[Phần]", "[phan]"]:
+                if tag in outline_strip:
+                    outline_strip = outline_strip[outline_strip.index(tag):]
+                    break
+            outline = outline_strip
 
             parts = split_outline_parts(outline)
             if not parts:
@@ -2523,8 +2562,12 @@ def _run_complete(transcript: str, state: dict) -> dict:
 
         body_parts_result = state["body_parts"]
         if len(body_parts_result) > len(parts):
-            raise RuntimeError("Checkpoint contains more BODY parts than the outline.")
+            body_parts_result = body_parts_result[:len(parts)]
+            state["body_parts"] = body_parts_result
+            persist_generation_state(state)
         for i, part in enumerate(parts[len(body_parts_result):], start=len(body_parts_result)):
+            if len(body_parts_result) >= len(parts):
+                break
             print(f">>> BƯỚC 4: VIẾT BODY PHẦN {i+1}/{len(parts)}", file=sys.stderr)
             prompt4 = (
                 prompts.get("body", "").replace("{part}", part)

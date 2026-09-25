@@ -6102,6 +6102,13 @@ def _run_system_job_center_action(
         )
     if action == "retry":
         updated_job = db.retry_system_job(job_id)
+        if str(job.get("job_type")) == "video_generation":
+            v_id = job.get("video_id") or (job.get("payload") or {}).get("video_id")
+            if v_id is not None:
+                try:
+                    clear_checkpoint(int(v_id))
+                except Exception:
+                    pass
         if str(job.get("job_type")) == "fb_crosspost":
             try:
                 from auto_yt.services import fb_crossposter_service

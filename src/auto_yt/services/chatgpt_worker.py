@@ -321,26 +321,61 @@ def select_thumbnail_response_turn_number(
 def get_visible_conversation_turns(page: Page) -> list[tuple[int, str]]:
     visible_turns = []
     turns = page.locator('[data-testid^="conversation-turn-"]')
-    for index in range(turns.count()):
-        turn = turns.nth(index)
-        if not turn.is_visible():
-            continue
-        test_id = turn.get_attribute("data-testid") or ""
-        try:
-            turn_number = int(test_id.rsplit("-", 1)[-1])
-        except ValueError:
-            continue
+    try:
+        turn_count = turns.count()
+    except Exception:
+        turn_count = 0
 
-        role = turn.get_attribute("data-turn") or ""
-        if not role:
-            role_nodes = turn.locator("[data-message-author-role]")
-            if role_nodes.count() > 0:
-                role = (
-                    role_nodes.first.get_attribute("data-message-author-role")
-                    or ""
-                )
-        visible_turns.append((turn_number, role))
-    return visible_turns
+    if turn_count > 0:
+        for index in range(turn_count):
+            turn = turns.nth(index)
+            if not turn.is_visible():
+                continue
+            test_id = turn.get_attribute("data-testid") or ""
+            try:
+                turn_number = int(test_id.rsplit("-", 1)[-1])
+            except ValueError:
+                continue
+
+            role = turn.get_attribute("data-turn") or ""
+            if not role:
+                role_nodes = turn.locator("[data-message-author-role], [data-conversation-role]")
+                if role_nodes.count() > 0:
+                    role = (
+                        role_nodes.first.get_attribute("data-message-author-role")
+                        or role_nodes.first.get_attribute("data-conversation-role")
+                        or ""
+                    )
+            visible_turns.append((turn_number, role))
+        if visible_turns:
+            return visible_turns
+
+    # Modern ChatGPT DOM (or when no numbered conversation-turn elements exist):
+    try:
+        raw_turns = page.evaluate("""() => {
+            const units = [...document.querySelectorAll(
+                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], [data-content-search-unit-key*="user"], [data-content-search-unit-key*="assistant"]'
+            )];
+            const results = [];
+            let currentTurn = 0;
+            for (const unit of units) {
+                const isUser = unit.getAttribute('data-user-message-bubble') === 'true'
+                    || (unit.getAttribute('data-content-search-unit-key') || '').includes('user')
+                    || (unit.getAttribute('data-conversation-role') || '') === 'user';
+                const isAssistant = unit.getAttribute('data-markdown-text-style') === 'assistant-message'
+                    || (unit.getAttribute('data-content-search-unit-key') || '').includes('assistant')
+                    || (unit.getAttribute('data-conversation-role') || '') === 'assistant';
+                if (isUser) {
+                    results.push([currentTurn++, 'user']);
+                } else if (isAssistant) {
+                    results.push([currentTurn++, 'assistant']);
+                }
+            }
+            return results;
+        }""")
+        return [(int(t[0]), str(t[1])) for t in raw_turns]
+    except Exception:
+        return []
 
 
 def get_latest_conversation_turn(page: Page, role: str) -> int:
@@ -354,18 +389,28 @@ def get_latest_conversation_turn(page: Page, role: str) -> int:
 
 def get_assistant_message_count(page: Page) -> int:
     try:
-        return page.locator(
-            '[data-message-author-role="assistant"]'
-        ).count()
+        legacy_count = page.locator('[data-message-author-role="assistant"]').count()
+        if legacy_count > 0:
+            return legacy_count
+        return page.evaluate("""() => {
+            return document.querySelectorAll(
+                '[data-markdown-text-style="assistant-message"], [data-content-search-unit-key*="assistant"]'
+            ).length;
+        }""")
     except Exception:
         return 0
 
 
 def get_user_message_count(page: Page) -> int:
     try:
-        return page.locator(
-            '[data-message-author-role="user"]'
-        ).count()
+        legacy_count = page.locator('[data-message-author-role="user"]').count()
+        if legacy_count > 0:
+            return legacy_count
+        return page.evaluate("""() => {
+            return document.querySelectorAll(
+                '[data-user-message-bubble="true"], [data-content-search-unit-key*="user"]'
+            ).length;
+        }""")
     except Exception:
         return 0
 
@@ -572,7 +617,9 @@ def wait_for_thumbnail_images(
             continue
 
         turn = page.locator(f'[data-testid="conversation-turn-{response_turn}"]')
-        if turn.count() == 1:
+        if turn.count() == 0:
+            turn = page.locator('[data-markdown-text-style="assistant-message"], [data-turn-key]').last
+        if turn.count() >= 1:
             images = turn.locator(THUMBNAIL_IMAGE_SELECTOR)
             try:
                 image_snapshots = images.evaluate_all(
@@ -1020,7 +1067,9 @@ def get_chatgpt_load_state(page: Page) -> dict:
                 );
                 const turns = document.querySelectorAll(
                     '[data-testid^="conversation-turn-"], '
-                    + '[data-message-author-role]'
+                    + '[data-message-author-role], '
+                    + '[data-user-message-bubble="true"], '
+                    + '[data-markdown-text-style="assistant-message"]'
                 );
                 const retryButton = [...document.querySelectorAll(
                     'button, [role="button"]'
@@ -1076,12 +1125,14 @@ def get_chatgpt_load_state(page: Page) -> dict:
 
 def raise_if_chatgpt_attention_required(state: dict) -> None:
     """Stop safely when continuing requires an interactive browser."""
-    if state.get("challenge_present"):
+    if not isinstance(state, dict):
+        return
+    if state.get("challenge_present") is True:
         raise ChatGPTAttentionRequiredError(
             "ChatGPT đang yêu cầu CAPTCHA/Cloudflare. Mở Auto Login hoặc "
             "Open Profile để xác minh, sau đó tiếp tục job trong Trung tâm Job."
         )
-    if state.get("login_required"):
+    if state.get("login_required") is True:
         raise ChatGPTAttentionRequiredError(
             "Phiên đăng nhập ChatGPT đã hết hạn. Mở Auto Login hoặc Open "
             "Profile để đăng nhập, sau đó tiếp tục job trong Trung tâm Job."
@@ -1118,7 +1169,9 @@ def click_chatgpt_full_page_retry(page: Page) -> bool:
                     );
                     const turns = document.querySelectorAll(
                         '[data-testid^="conversation-turn-"], '
-                        + '[data-message-author-role]'
+                        + '[data-message-author-role], '
+                        + '[data-user-message-bubble="true"], '
+                        + '[data-markdown-text-style="assistant-message"]'
                     );
                     if (editor || turns.length > 0) return false;
                     const retryButton = [...document.querySelectorAll(
@@ -1759,11 +1812,19 @@ def _extract_clean_markdown_text(node) -> str:
 
 
 def _read_assistant_message(message) -> str:
-    markdown_nodes = message.locator('.markdown')
+    markdown_nodes = message.locator(
+        '.markdown, [data-markdown-text-style="assistant-message"], [class*="MarkdownRoot"]'
+    )
     markdown_parts = []
-    markdown_count = markdown_nodes.count()
+    try:
+        markdown_count = markdown_nodes.count()
+    except Exception:
+        markdown_count = 0
     if not isinstance(markdown_count, int):
-        markdown_count = 1 if markdown_nodes.first.count() > 0 else 0
+        try:
+            markdown_count = 1 if markdown_nodes.first.count() > 0 else 0
+        except Exception:
+            markdown_count = 0
     for index in range(markdown_count):
         try:
             markdown_node = (
@@ -1805,30 +1866,100 @@ def get_assistant_response_after_latest_user(
 ) -> str:
     """Read the reply following the latest user message without count baselines."""
     try:
-        messages = page.locator('[data-message-author-role]')
+        messages = page.locator(
+            '[data-message-author-role], [data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"]'
+        )
+        try:
+            msg_count = messages.count()
+        except Exception:
+            msg_count = 0
+
+        if msg_count > 0:
+            latest_user_index = -1
+            for index in range(msg_count):
+                node = messages.nth(index)
+                role = (
+                    node.get_attribute("data-message-author-role")
+                    or node.get_attribute("data-conversation-role")
+                    or ("user" if node.get_attribute("data-user-message-bubble") == "true" else "")
+                )
+                if role == "user":
+                    latest_user_index = index
+            if latest_user_index >= 0:
+                latest_user = messages.nth(latest_user_index)
+                if not expected_user_text or history_prompt_text_matches(
+                    expected_user_text,
+                    clean_text(latest_user.inner_text()),
+                ):
+                    response_text = ""
+                    for index in range(latest_user_index + 1, msg_count):
+                        message = messages.nth(index)
+                        role = (
+                            message.get_attribute("data-message-author-role")
+                            or message.get_attribute("data-conversation-role")
+                            or ("assistant" if message.get_attribute("data-markdown-text-style") == "assistant-message" else "")
+                        )
+                        if role != "assistant":
+                            continue
+                        candidate = _read_assistant_message(message)
+                        if candidate:
+                            response_text = candidate
+                    if response_text:
+                        return response_text
+
+        # Modern JS fallback
+        data = page.evaluate("""() => {
+            const cleanNode = (el) => {
+                if (!el) return '';
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation').forEach(b => b.remove());
+                return (clone.innerText || clone.textContent || '').trim();
+            };
+
+            const legacy = [...document.querySelectorAll('[data-message-author-role]')];
+            if (legacy.length > 0) {
+                return legacy.map(el => ({
+                    role: el.getAttribute('data-message-author-role') || '',
+                    text: cleanNode(el)
+                }));
+            }
+
+            const units = [...document.querySelectorAll(
+                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"]'
+            )];
+            return units.map(u => ({
+                role: u.getAttribute('data-user-message-bubble') === 'true' ? 'user' : 'assistant',
+                text: cleanNode(u)
+            }));
+        }""")
+
+        if not data:
+            return ""
+
         latest_user_index = -1
-        for index in range(messages.count()):
-            role = messages.nth(index).get_attribute("data-message-author-role")
-            if role == "user":
+        for index, item in enumerate(data):
+            if item.get("role") == "user":
                 latest_user_index = index
+
         if latest_user_index < 0:
             return ""
 
-        latest_user = messages.nth(latest_user_index)
+        latest_user = data[latest_user_index]
         if expected_user_text and not history_prompt_text_matches(
             expected_user_text,
-            clean_text(latest_user.inner_text()),
+            clean_text(latest_user.get("text", "")),
         ):
             return ""
 
         response_text = ""
-        for index in range(latest_user_index + 1, messages.count()):
-            message = messages.nth(index)
-            if message.get_attribute("data-message-author-role") != "assistant":
+        for index in range(latest_user_index + 1, len(data)):
+            item = data[index]
+            if item.get("role") != "assistant":
                 continue
-            candidate = _read_assistant_message(message)
-            if candidate:
+            candidate = clean_text(item.get("text", ""))
+            if candidate and not _is_pure_thinking_indicator(candidate):
                 response_text = candidate
+
         return response_text
     except Exception:
         return ""
@@ -1850,9 +1981,13 @@ def get_new_assistant_response(
                 f'[data-testid="conversation-turn-{max(new_assistant_turns)}"]'
             )
             assistant_nodes = turn.locator(
-                '[data-message-author-role="assistant"]'
+                '[data-message-author-role="assistant"], [data-markdown-text-style="assistant-message"], .markdown'
             )
-            if assistant_nodes.count() > 0:
+            try:
+                assistant_count = assistant_nodes.count()
+            except Exception:
+                assistant_count = 0
+            if assistant_count > 0:
                 response_text = _read_assistant_message(assistant_nodes.last)
                 if response_text:
                     return response_text
@@ -1861,7 +1996,7 @@ def get_new_assistant_response(
         # turns. The count baseline survives React DOM re-renders, unlike a
         # temporary CSS marker attached to old message nodes.
         assistant_messages = page.locator(
-            '[data-message-author-role="assistant"]'
+            '[data-message-author-role="assistant"], [data-markdown-text-style="assistant-message"]'
         )
         assistant_count = assistant_messages.count()
         if (
@@ -2116,11 +2251,28 @@ def wait_for_valid_chapter_response(
 
 def get_reusable_chapter_response(page: Page) -> str:
     conversation_turns = page.evaluate(
-        """() => [...document.querySelectorAll('[data-message-author-role]')]
-            .map((element) => [
-                element.getAttribute('data-message-author-role') || '',
-                element.innerText || ''
-            ])"""
+        """() => {
+            const cleanNode = (el) => {
+                if (!el) return '';
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"]').forEach(b => b.remove());
+                return (clone.innerText || clone.textContent || '').trim();
+            };
+            const legacy = [...document.querySelectorAll('[data-message-author-role]')];
+            if (legacy.length > 0) {
+                return legacy.map(el => [
+                    el.getAttribute('data-message-author-role') || '',
+                    cleanNode(el)
+                ]);
+            }
+            const units = [...document.querySelectorAll(
+                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"]'
+            )];
+            return units.map(u => [
+                u.getAttribute('data-user-message-bubble') === 'true' ? 'user' : 'assistant',
+                cleanNode(u)
+            ]);
+        }"""
     )
     return select_reusable_chapter_response(
         [(role, text) for role, text in conversation_turns]
@@ -2129,11 +2281,28 @@ def get_reusable_chapter_response(page: Page) -> str:
 
 def get_reusable_outline_response(page: Page) -> str:
     conversation_turns = page.evaluate(
-        """() => [...document.querySelectorAll('[data-message-author-role]')]
-            .map((element) => [
-                element.getAttribute('data-message-author-role') || '',
-                element.innerText || ''
-            ])"""
+        """() => {
+            const cleanNode = (el) => {
+                if (!el) return '';
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"]').forEach(b => b.remove());
+                return (clone.innerText || clone.textContent || '').trim();
+            };
+            const legacy = [...document.querySelectorAll('[data-message-author-role]')];
+            if (legacy.length > 0) {
+                return legacy.map(el => [
+                    el.getAttribute('data-message-author-role') || '',
+                    cleanNode(el)
+                ]);
+            }
+            const units = [...document.querySelectorAll(
+                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"]'
+            )];
+            return units.map(u => [
+                u.getAttribute('data-user-message-bubble') === 'true' ? 'user' : 'assistant',
+                cleanNode(u)
+            ]);
+        }"""
     )
     return select_reusable_outline_response(
         [(role, text) for role, text in conversation_turns]
@@ -2153,8 +2322,10 @@ def wait_for_conversation_history(
             )];
             const roles = turns.map((turn) =>
                 turn.getAttribute('data-turn')
-                || turn.querySelector('[data-message-author-role]')
+                || turn.querySelector('[data-message-author-role], [data-conversation-role]')
                     ?.getAttribute('data-message-author-role')
+                || turn.querySelector('[data-message-author-role], [data-conversation-role]')
+                    ?.getAttribute('data-conversation-role')
                 || ''
             );
             if (roles.includes('user') && roles.includes('assistant')) {
@@ -2165,8 +2336,16 @@ def wait_for_conversation_history(
             )].map((message) =>
                 message.getAttribute('data-message-author-role') || ''
             );
-            return fallbackRoles.includes('user')
-                && fallbackRoles.includes('assistant');
+            if (fallbackRoles.includes('user') && fallbackRoles.includes('assistant')) {
+                return true;
+            }
+            const modernUser = document.querySelector(
+                '[data-user-message-bubble="true"], [data-content-search-unit-key*="user"], [data-conversation-role="user"]'
+            );
+            const modernAssistant = document.querySelector(
+                '[data-markdown-text-style="assistant-message"], [data-content-search-unit-key*="assistant"], [data-conversation-role="assistant"]'
+            );
+            return Boolean(modernUser && modernAssistant);
         }""",
         timeout=60000,
     )
@@ -2208,7 +2387,7 @@ def send_prompt(
     previous_user_count = get_user_message_count(page)
 
     # Mark existing messages so we can identify the new one
-    page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"]').forEach(el => el.classList.add('my-old-msg'))")
+    page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-markdown-text-style=\"assistant-message\"]').forEach(el => el.classList.add('my-old-msg'))")
 
     # Use real editor input events so ChatGPT updates its internal composer state.
     try:
@@ -2318,7 +2497,7 @@ def send_prompt(
 
                 # Reload removes the marker classes, so mark the existing replies
                 # again before sending to avoid returning an earlier response.
-                page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"]').forEach(el => el.classList.add('my-old-msg'))")
+                page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-markdown-text-style=\"assistant-message\"]').forEach(el => el.classList.add('my-old-msg'))")
                 page.wait_for_function(send_button_ready_script, timeout=30000)
                 send_btn = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first
             except Exception as recovery_error:
@@ -2354,7 +2533,7 @@ def send_prompt(
                     '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
                 );
                 const userTurns = document.querySelectorAll(
-                    '[data-message-author-role="user"]'
+                    '[data-message-author-role="user"], [data-user-message-bubble="true"], [data-content-search-unit-key*="user"]'
                 ).length;
                 const generationStarted = Boolean(
                     document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="Dừng"]')
@@ -2415,19 +2594,27 @@ def _pending_prompt_matches(state: dict, step: str, prompt_text: str) -> bool:
 
 def is_prompt_in_conversation(page: Page, expected_user_text: str) -> bool:
     try:
-        messages = page.locator('[data-message-author-role]')
-        latest_user_index = -1
-        for index in range(messages.count()):
-            role = messages.nth(index).get_attribute("data-message-author-role")
-            if role == "user":
-                latest_user_index = index
-        if latest_user_index < 0:
+        user_texts = page.evaluate("""() => {
+            const cleanNode = (el) => {
+                if (!el) return '';
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('button, .sr-only').forEach(b => b.remove());
+                return (clone.innerText || clone.textContent || '').trim();
+            };
+
+            const legacy = [...document.querySelectorAll('[data-message-author-role="user"]')];
+            if (legacy.length > 0) return legacy.map(cleanNode);
+
+            const modern = [...document.querySelectorAll('[data-user-message-bubble="true"]')];
+            return modern.map(cleanNode);
+        }""")
+        if not user_texts:
             return False
 
-        latest_user = messages.nth(latest_user_index)
+        latest_user_text = user_texts[-1]
         return history_prompt_text_matches(
             expected_user_text,
-            clean_text(latest_user.inner_text()),
+            clean_text(latest_user_text),
         )
     except Exception:
         return False

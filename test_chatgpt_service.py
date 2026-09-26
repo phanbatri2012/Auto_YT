@@ -406,7 +406,7 @@ class ChatGptServiceTests(unittest.TestCase):
         page.locator.side_effect = lambda selector: Mock(
             first=(
                 send_button
-                if selector == '[data-testid="send-button"]'
+                if "send-button" in selector or "Send" in selector
                 else prompt_textarea
             )
         )
@@ -894,6 +894,7 @@ class ChatGptServiceTests(unittest.TestCase):
                 "title": True,
                 "slug": False,
                 "description": False,
+                "hashtags": False,
                 "tags": False,
                 "pinned_comment": False,
                 "quiz": False,
@@ -1114,6 +1115,7 @@ class ChatGptServiceTests(unittest.TestCase):
             "title": False,
             "slug": False,
             "description": False,
+            "hashtags": False,
             "tags": False,
             "pinned_comment": False,
             "quiz": False,

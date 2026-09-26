@@ -437,6 +437,50 @@ def purge_all_scene_artifacts(video_id: int) -> int:
     return removed_count
 
 
+def purge_scene_artifacts_from_index(video_id: int, from_index: int) -> int:
+    """Purge scene artifacts from DB and disk starting from a specific scene index."""
+    artifacts = list(db.list_video_artifacts(video_id, "scene:")) + list(db.list_video_artifacts(video_id, "scene_video:"))
+    removed_count = 0
+    for art in artifacts:
+        art_type = str(art.get("artifact_type") or "")
+        try:
+            idx_str = art_type.split(":", 1)[1]
+            scene_idx = int(idx_str)
+        except (IndexError, ValueError):
+            continue
+
+        if scene_idx >= from_index:
+            art_path = art.get("path")
+            if art_path:
+                try:
+                    Path(art_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if art.get("id"):
+                db.delete_video_artifact(art["id"])
+                removed_count += 1
+
+    # Also purge final MP4 if any, so it will be re-rendered cleanly
+    final_mp4 = db.get_latest_video_artifact(video_id, "final_mp4")
+    if final_mp4:
+        mp4_path = final_mp4.get("path")
+        if mp4_path:
+            try:
+                Path(mp4_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        if final_mp4.get("id"):
+            db.delete_video_artifact(final_mp4["id"])
+
+    logger.info(
+        "Purged %d scene artifacts for video %s starting from index %d",
+        removed_count,
+        video_id,
+        from_index,
+    )
+    return removed_count
+
+
 def _generate_scene_image(
     *,
     video_id: int,
@@ -576,13 +620,13 @@ def _generate_scene_image(
                 )
                 raw_style = str(settings.get("style_prompt") or profile.get("style_prompt") or "").strip()
                 concise_style = raw_style.split("\n")[0][:200].strip() if raw_style else "Cinematic documentary visual style, photorealistic, 8k resolution"
-                context_desc = f"Scene depiction: {safe_clean_subject}. " if safe_clean_subject else ""
+                context_desc = f"Cinematic visual illustrating: {safe_clean_subject}. " if safe_clean_subject else ""
                 safe_prompt = (
                     f"A cinematic still photograph: {concise_style}. "
                     f"{context_desc}"
-                    f"16:9 widescreen still photograph, authentic realism, dramatic atmospheric lighting."
+                    f"16:9 widescreen still photograph, authentic realism, dramatic atmospheric lighting, clean visual without text."
                 ).replace("  ", " ").strip()
-                asset_url = await worker.generate_scene(safe_prompt, "", refs)
+                asset_url = await worker.generate_scene(safe_prompt, avoid, refs)
 
             await worker.download_image(asset_url, str(target))
             
@@ -1731,6 +1775,12 @@ def _sanitize_scene_prompt_context(text: str, max_chars: int = 140) -> str:
         return _SENSITIVE_REPLACEMENTS.get(w, "")
 
     clean = _SENSITIVE_WORDS_RE.sub(_sub, clean)
+    # Remove question marks, exclamation marks, and quotes that evoke typography / title banners
+    clean = re.sub(r'[\?\!\"“”«»]', '', clean)
+    # If text is in ALL CAPS or mostly uppercase (like a video title headline), convert to lowercase
+    letters = [c for c in clean if c.isalpha()]
+    if letters and (sum(1 for c in letters if c.isupper()) / len(letters)) > 0.5:
+        clean = clean.lower()
     clean = re.sub(r"\s+", " ", clean).strip()
     if len(clean) > max_chars:
         clean = clean[:max_chars].rsplit(" ", 1)[0]
@@ -1863,11 +1913,13 @@ def build_default_visual_scene_plan(
                     f"16:9 widescreen, photorealistic 8k, authentic documentary realism, clean framing without text."
                 ).replace("  ", " ").strip()
             else:
+                clean_title = _sanitize_scene_prompt_context(title, max_chars=80)
                 prompt = (
-                    f"A cinematic movie still: {style}, dramatic opening scene hook for '{title}'. "
+                    f"A cinematic movie still: {style}, dramatic opening scene hook. "
                     f"{ref_note}"
+                    f"Story theme: {clean_title}. "
                     f"{context_part}"
-                    f"16:9 widescreen, photorealistic 8k, authentic documentary realism."
+                    f"16:9 widescreen, photorealistic 8k, authentic documentary realism, clean visual without text."
                 ).replace("  ", " ").strip()
         elif is_video:
             # Subsequent intro video scenes: Story-aware dramatic continuation
@@ -1875,7 +1927,7 @@ def build_default_visual_scene_plan(
                 f"A cinematic documentary photograph: {style}, scene {w['index'] + 1} dramatic storytelling. "
                 f"{ref_note}"
                 f"{context_part}"
-                f"16:9 widescreen still photograph, authentic realism, dramatic lighting."
+                f"16:9 widescreen still photograph, authentic realism, dramatic lighting, clean visual without text."
             ).replace("  ", " ").strip()
         else:
             # Standard body/outro scene
@@ -1883,7 +1935,7 @@ def build_default_visual_scene_plan(
                 f"A still photograph: {style}, scene {w['index'] + 1}. "
                 f"{ref_note}"
                 f"{context_part}"
-                f"16:9 widescreen still photograph, authentic documentary realism, natural lighting."
+                f"16:9 widescreen still photograph, authentic documentary realism, natural lighting, clean visual without text."
             ).replace("  ", " ").strip()
 
         scenes.append(
@@ -1895,7 +1947,7 @@ def build_default_visual_scene_plan(
                 "transcript": transcript_snippet,
                 "is_video": is_video,
                 "media_type": "video" if is_video else "image",
-                "subject": matched["display_name"] if matched else title,
+                "subject": matched["display_name"] if matched else (clean_context[:60] if clean_context else f"Scene {w['index'] + 1}"),
                 "action": clean_context[:100] if clean_context else transcript_snippet[:100],
                 "setting": "cinematic scene",
                 "era": "contemporary",

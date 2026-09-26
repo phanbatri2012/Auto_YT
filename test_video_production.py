@@ -752,6 +752,66 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertIn("Mở đầu câu chuyện hấp dẫn", plan_intro["scenes"][0]["prompt"])
 
 
+    def test_sanitize_scene_prompt_context_lowercases_headline_and_strips_punctuation(self):
+        raw_headline = "18 SƯ ĐOÀN VIỆT NAM TỔNG PHẢN CÔNG, KHMER ĐỎ SỤP ĐỔ RA SAO?"
+        cleaned = video_production._sanitize_scene_prompt_context(raw_headline)
+        self.assertNotIn("?", cleaned)
+        self.assertTrue(cleaned.islower())
+        self.assertIn("18 sư đoàn việt nam", cleaned)
+
+    def test_build_default_visual_scene_plan_decouples_subject_from_title(self):
+        windows = [
+            {"index": 0, "start": 0.0, "end": 8.0, "duration": 8.0, "transcript": "Khởi đầu trận chiến"},
+            {"index": 1, "start": 8.0, "end": 38.0, "duration": 30.0, "transcript": "Các đoàn xe tăng tiến về phía trước"},
+        ]
+        title = "18 SƯ ĐOÀN VIỆT NAM TỔNG PHẢN CÔNG, KHMER ĐỎ SỤP ĐỔ RA SAO?"
+        plan = video_production.build_default_visual_scene_plan(windows, title)
+        scene1 = plan["scenes"][1]
+        self.assertNotEqual(scene1["subject"], title)
+        self.assertIn("đoàn xe tăng", scene1["action"].lower())
+        self.assertIn("clean visual without text", scene1["prompt"])
+
+    def test_purge_scene_artifacts_from_index(self):
+        video_id = 999
+        temp_dir = Path(self.temporary_directory.name)
+        paths = []
+        for i in range(4):
+            f = temp_dir / f"scene_{i}.png"
+            f.write_text(f"mock image {i}")
+            paths.append(f)
+            database.upsert_video_artifact(
+                video_id=video_id,
+                artifact_type=f"scene:{i}",
+                path=str(f),
+                content_hash=f"hash_{i}",
+                status="completed",
+            )
+        mp4_path = temp_dir / "final.mp4"
+        mp4_path.write_text("mock mp4")
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="final_mp4",
+            path=str(mp4_path),
+            content_hash="mp4_hash",
+            status="ready",
+        )
+
+        removed = video_production.purge_scene_artifacts_from_index(video_id, from_index=2)
+        self.assertEqual(removed, 2)
+
+        self.assertTrue(paths[0].exists())
+        self.assertTrue(paths[1].exists())
+        self.assertFalse(paths[2].exists())
+        self.assertFalse(paths[3].exists())
+        self.assertFalse(mp4_path.exists())
+
+        art0 = database.get_latest_video_artifact(video_id, "scene:0")
+        art1 = database.get_latest_video_artifact(video_id, "scene:1")
+        art2 = database.get_latest_video_artifact(video_id, "scene:2")
+        self.assertIsNotNone(art0)
+        self.assertIsNotNone(art1)
+        self.assertIsNone(art2)
+
 if __name__ == "__main__":
     unittest.main()
 

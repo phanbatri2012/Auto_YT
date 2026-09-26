@@ -662,9 +662,13 @@ class GoogleFlowWorker:
         # Synchronize reference image ingredients with the prompt bar
         await self.sync_reference_ingredients(reference_ids)
 
-        full_prompt = clean_prompt
-        if avoid_prompt:
-            full_prompt = f"{clean_prompt}. Avoid: {avoid_prompt}"
+        strict_avoid = "text, letters, words, typography, watermark, logo, headline, caption, subtitle, poster text, overlay, title banner"
+        if avoid_prompt and avoid_prompt.strip():
+            combined_avoid = f"{avoid_prompt.strip()}, {strict_avoid}"
+        else:
+            combined_avoid = strict_avoid
+
+        full_prompt = f"{clean_prompt}. Avoid: {combined_avoid}"
 
         # Locate prompt editor
         editor = await self.wait_for_editor(timeout=25.0)

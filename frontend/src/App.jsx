@@ -220,6 +220,7 @@ function App() {
   const [currentVideoPublications, setCurrentVideoPublications] = useState([])
   const [currentVideoDefaultChannelTitle, setCurrentVideoDefaultChannelTitle] = useState('')
   const [publicationDialog, setPublicationDialog] = useState(null)
+  const [sceneResetDialog, setSceneResetDialog] = useState(null)
   const [currentVideoHasCheckpoint, setCurrentVideoHasCheckpoint] = useState(false)
   const [chatGptStatus, setChatGptStatus] = useState({
     busy: false,
@@ -1376,6 +1377,35 @@ function App() {
       alert('Lỗi dừng render: ' + error.message);
     } finally {
       setIsCancelingRender(false);
+    }
+  };
+
+  const handleResetScenesFrom = async (fromIndex) => {
+    if (!currentVideoId || isRendering || currentVideoIsError) return;
+    setSceneResetDialog(prev => ({ ...(prev || {}), isSubmitting: true, error: '' }));
+    setIsRendering(true);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/reset-scenes-from?from_index=${encodeURIComponent(fromIndex)}`,
+        { method: 'POST' }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể tạo lại từ cảnh.');
+      }
+      setSceneResetDialog(null);
+      setRenderInfo(prev => ({
+        ...(prev || {}),
+        video_id: currentVideoId,
+        has_mp4: false,
+        job: {
+          status: 'queued',
+          title: `Dựng video MP4 cho #${currentVideoId} (Tạo lại từ cảnh ${Number(fromIndex) + 1})`
+        }
+      }));
+    } catch (error) {
+      setIsRendering(false);
+      setSceneResetDialog(prev => ({ ...(prev || {}), isSubmitting: false, error: error.message }));
     }
   };
 
@@ -2643,6 +2673,33 @@ function App() {
                                       </button>
                                       <button
                                         className="btn-secondary"
+                                        onClick={() => setSceneResetDialog({
+                                          videoId: currentVideoId,
+                                          videoTitle: videoTitle || `Video #${currentVideoId}`,
+                                          fromSceneNumber: 17,
+                                          isSubmitting: false,
+                                          error: ''
+                                        })}
+                                        disabled={currentVideoIsError}
+                                        title="Xóa và tạo lại từ một phân cảnh bất kỳ"
+                                        style={{
+                                          padding: '4px 14px',
+                                          fontSize: '0.82em',
+                                          background: 'rgba(241, 196, 15, 0.15)',
+                                          border: '1px solid #f1c40f',
+                                          color: '#f1c40f',
+                                          cursor: 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                      >
+                                        🎯 Tạo lại từ cảnh...
+                                      </button>
+                                      <button
+                                        className="btn-secondary"
                                         onClick={() => handleRenderVideo('recreate')}
                                         disabled={currentVideoIsError}
                                         title="Tạo mới một project trên Google Flow và tạo lại toàn bộ từ cảnh 1"
@@ -2660,7 +2717,7 @@ function App() {
                                           gap: '4px'
                                         }}
                                       >
-                                        🔄 Tạo lại
+                                        🔄 Tạo lại toàn bộ
                                       </button>
                                     </>
                                   ) : !renderInfo?.has_mp4 ? (
@@ -2686,12 +2743,39 @@ function App() {
                                     <>
                                       <button
                                         className="btn-secondary"
+                                        onClick={() => setSceneResetDialog({
+                                          videoId: currentVideoId,
+                                          videoTitle: videoTitle || `Video #${currentVideoId}`,
+                                          fromSceneNumber: 1,
+                                          isSubmitting: false,
+                                          error: ''
+                                        })}
+                                        disabled={isRendering || currentVideoIsError}
+                                        style={{
+                                          padding: '4px 12px',
+                                          fontSize: '0.8em',
+                                          background: 'rgba(241, 196, 15, 0.15)',
+                                          border: '1px solid #f1c40f',
+                                          color: '#f1c40f',
+                                          cursor: 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                        title="Xóa và tạo lại từ một phân cảnh bất kỳ"
+                                      >
+                                        🎯 Tạo lại từ cảnh...
+                                      </button>
+                                      <button
+                                        className="btn-secondary"
                                         onClick={() => handleRenderVideo('recreate')}
                                         disabled={isRendering || currentVideoIsError}
                                         style={{ padding: '4px 12px', fontSize: '0.8em' }}
                                         title="Tạo mới 1 project trên Google Flow và dựng lại toàn bộ từ cảnh 1"
                                       >
-                                        {isRendering ? '⏳ Đang dựng...' : '🔄 Tạo lại'}
+                                        {isRendering ? '⏳ Đang dựng...' : '🔄 Tạo lại toàn bộ'}
                                       </button>
                                       <a
                                         href={`http://127.0.0.1:8080/api/videos/${currentVideoId}/download-mp4`}
@@ -3053,6 +3137,104 @@ function App() {
           </form>
         </div>
       )}
+        {sceneResetDialog && (
+          <div
+            className="dialog-backdrop"
+            onClick={(e) => {
+              if (e.target === e.currentTarget && !sceneResetDialog.isSubmitting) {
+                setSceneResetDialog(null)
+              }
+            }}
+            style={{
+              position: 'fixed', inset: 0, zIndex: 1000,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              padding: '20px', background: 'rgba(0, 0, 0, 0.72)'
+            }}
+          >
+            <form
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="scene-reset-dialog-title"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const sceneNum = parseInt(sceneResetDialog.fromSceneNumber, 10);
+                if (Number.isNaN(sceneNum) || sceneNum < 1) {
+                  setSceneResetDialog(prev => ({ ...prev, error: 'Số thứ tự cảnh phải từ 1 trở lên.' }));
+                  return;
+                }
+                handleResetScenesFrom(sceneNum - 1);
+              }}
+              style={{
+                width: 'min(520px, 100%)', padding: '24px', borderRadius: '14px',
+                border: '1px solid rgba(241, 196, 15, 0.6)', background: '#181612',
+                boxShadow: '0 24px 80px rgba(0, 0, 0, 0.65)'
+              }}
+            >
+              <h3 id="scene-reset-dialog-title" style={{ margin: '0 0 8px', color: '#f1c40f', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                🎯 Tạo lại từ phân cảnh bất kỳ
+              </h3>
+              <p style={{ margin: '0 0 16px', color: '#ccc', fontSize: '0.9em', lineHeight: 1.45 }}>
+                {sceneResetDialog.videoTitle}
+              </p>
+              
+              <label htmlFor="scene-number-input" style={{ display: 'block', marginBottom: '8px', color: '#ddd', fontWeight: 600 }}>
+                Số thứ tự cảnh muốn bắt đầu tạo lại (ví dụ: 17):
+              </label>
+              <input
+                id="scene-number-input"
+                type="number"
+                min="1"
+                max="200"
+                autoFocus
+                required
+                value={sceneResetDialog.fromSceneNumber}
+                onChange={(event) => setSceneResetDialog(dialog => ({
+                  ...dialog,
+                  fromSceneNumber: event.target.value,
+                  error: ''
+                }))}
+                disabled={sceneResetDialog.isSubmitting}
+                style={{
+                  width: '100%', boxSizing: 'border-box', padding: '12px 14px',
+                  borderRadius: '8px', border: '1px solid #7d6608',
+                  background: '#242014', color: '#fff', fontSize: '1.05em', fontWeight: 'bold'
+                }}
+              />
+              {sceneResetDialog.error && (
+                <p role="alert" style={{ margin: '12px 0 0', color: '#ff6b6b', lineHeight: 1.4 }}>
+                  {sceneResetDialog.error}
+                </p>
+              )}
+              <div style={{
+                margin: '14px 0 0', padding: '12px', borderRadius: '8px',
+                background: 'rgba(241, 196, 15, 0.08)', border: '1px solid rgba(241, 196, 15, 0.2)',
+                color: '#ddd', fontSize: '0.85em', lineHeight: 1.5
+              }}>
+                ℹ️ <strong>Nguyên lý hoạt động:</strong><br />
+                • Các cảnh từ <strong>1 đến {Math.max(1, (parseInt(sceneResetDialog.fromSceneNumber, 10) || 1) - 1)}</strong> sẽ được <strong>giữ nguyên vẹn</strong>.<br />
+                • Hệ thống sẽ xóa các ảnh lỗi từ cảnh <strong>{sceneResetDialog.fromSceneNumber || 1}</strong> trở đi và tiếp tục tạo mới với bộ lọc cấm chữ đã nâng cấp.
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  disabled={sceneResetDialog.isSubmitting}
+                  onClick={() => setSceneResetDialog(null)}
+                >
+                  Hủy
+                </button>
+                <button
+                  type="submit"
+                  className="btn-run"
+                  disabled={sceneResetDialog.isSubmitting || !sceneResetDialog.fromSceneNumber}
+                  style={{ width: 'auto', padding: '10px 20px', background: 'linear-gradient(135deg, #f1c40f, #d4ac0d)', color: '#000', fontWeight: 'bold' }}
+                >
+                  {sceneResetDialog.isSubmitting ? '⏳ Đang khởi chạy...' : '🚀 Xác nhận & Tạo tiếp'}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
     </div>
   )
 }

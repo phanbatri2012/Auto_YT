@@ -64,6 +64,7 @@ from auto_yt.services import (
     prompt_assets,
     publication_scheduler,
     production_coordinator as production_coordinator_service,
+    video_production,
     youtube_comments,
     youtube_publish_workflow,
     youtube_publisher,
@@ -7529,6 +7530,32 @@ def cancel_render_video(video_id: int):
             db.request_cancel_system_job(job_id)
 
     return {"success": True, "message": "Đã yêu cầu dừng tác vụ dựng video."}
+
+
+@app.post("/api/videos/{video_id}/reset-scenes-from")
+def reset_scenes_from(video_id: int, from_index: int = 0):
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video.")
+    if from_index < 0:
+        raise HTTPException(status_code=400, detail="Chỉ số cảnh phải lớn hơn hoặc bằng 0.")
+
+    # 1. Cancel any active render job first
+    cancel_render_video(video_id)
+
+    # 2. Purge artifacts from index
+    purged_count = video_production.purge_scene_artifacts_from_index(video_id, from_index)
+
+    # 3. Trigger video render in resume mode
+    render_res = trigger_render_video(video_id, mode="resume")
+    return {
+        "success": True,
+        "video_id": video_id,
+        "from_index": from_index,
+        "purged_count": purged_count,
+        "job_id": render_res.get("job_id"),
+        "status": render_res.get("status"),
+    }
 
 
 @app.get("/api/videos/{video_id}/render-status")

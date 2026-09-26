@@ -546,6 +546,53 @@ def _sanitize_scene_prompt_for_generation(
     return clean
 
 
+def _format_scene_video_prompt(
+    raw_prompt: str = "",
+    *,
+    scene_action: str = "",
+    style_prompt: str = "",
+    video_title: str = "",
+    has_start_frame: bool = True,
+    has_end_frame: bool = False,
+) -> str:
+    """Format an explicit, generic video generation prompt for Google Flow Agent / Veo."""
+    # 1. Determine frame interpolation / animation directive based on attached images
+    if has_start_frame and has_end_frame:
+        frame_directive = (
+            "Using the first attached image as the starting frame and "
+            "the second attached image as the ending frame, generate a seamless "
+            "cinematic video transition from the first frame to the second frame."
+        )
+    elif has_start_frame:
+        frame_directive = "Using the attached image as the starting frame, animate it into a cinematic video clip."
+    else:
+        frame_directive = "Generate a high-quality cinematic video clip."
+
+    # 2. Extract and sanitize action context (completely topic-agnostic)
+    action_clean = _sanitize_scene_prompt_context(scene_action or raw_prompt, max_chars=140)
+    action_directive = f"Scene action: {action_clean}." if action_clean else ""
+
+    # 3. Clean style prompt without still photo keywords
+    style_clean = (style_prompt or "").split("\n")[0][:180].strip()
+    style_clean = re.sub(
+        r"(?i)\b(?:still photograph|photography|35mm photography|photo|film still|raw photo|movie still|still photo)\b",
+        "cinematic video",
+        style_clean,
+    )
+    style_clean = re.sub(r"\s+", " ", style_clean).strip()
+    style_directive = f"Visual style: {style_clean}." if style_clean else "Visual style: cinematic documentary film, atmospheric natural lighting."
+
+    # 4. Cinematic motion and technical specs (generic 100%)
+    motion_directive = "Motion: smooth cinematic camera movement, natural realistic motion, 4k 24fps high-fidelity video."
+
+    # 5. Anti-text instruction
+    anti_text_directive = "Clean video without any text, letters, watermark, or subtitles."
+
+    full_video_prompt = f"{frame_directive} {action_directive} {style_directive} {motion_directive} {anti_text_directive}"
+    full_video_prompt = re.sub(r"\s+", " ", full_video_prompt).strip()
+    return full_video_prompt
+
+
 def _generate_scene_image(
     *,
     video_id: int,
@@ -908,7 +955,19 @@ def _generate_scene_video(
             project_name = f"auto_yt_{video_id}"
             await worker.ensure_project(project_name, force_new=force_new_project)
             
-            prompt = scene.get("prompt", "")
+            video_rec = db.get_video(video_id) or {}
+            video_title = str(video_rec.get("title") or video_rec.get("generated_title") or "")
+            scene_action = str(scene.get("action") or scene.get("transcript") or "")
+            style_str = str(settings.get("style_prompt") or profile.get("style_prompt") or "")
+
+            video_prompt = _format_scene_video_prompt(
+                scene.get("prompt", ""),
+                scene_action=scene_action,
+                style_prompt=style_str,
+                video_title=video_title,
+                has_start_frame=bool(start_frame_path and start_frame_path.is_file()),
+                has_end_frame=bool(end_frame_path and end_frame_path.is_file()),
+            )
             avoid = negative_prompt
             
             ref_ids = []
@@ -916,7 +975,7 @@ def _generate_scene_video(
                 ref_ids.append(str(scene["primary_reference_id"]))
                 
             video_url = await worker.generate_scene_video(
-                prompt=prompt,
+                prompt=video_prompt,
                 avoid_prompt=avoid,
                 start_frame_path=start_frame_path,
                 end_frame_path=end_frame_path,

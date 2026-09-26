@@ -467,13 +467,29 @@ class GoogleFlowWorker:
                 await self.dismiss_blocking_dialogs()
 
     async def _get_existing_images(self) -> set[str]:
-        """Collect all flow-content image URLs currently rendered on the page."""
+        """Collect all flow-content image URLs currently rendered on the page, strictly excluding Google account avatars."""
         try:
             imgs = await self.page.evaluate('''() => {
                 return Array.from(
                     document.querySelectorAll("img[src*='flow-content.google/image'], img.image, img[src*='googleusercontent.com']")
-                ).map(i => i.src)
-                 .filter(src => src && !src.includes('s32-c-mo') && !src.includes('pr_32px'));
+                ).map(i => ({
+                    src: i.src,
+                    alt: i.alt || '',
+                    className: i.className || '',
+                    parentRole: (i.parentElement && i.parentElement.getAttribute('role')) || '',
+                    parentAria: (i.parentElement && i.parentElement.getAttribute('aria-label')) || ''
+                })).filter(item => {
+                    if (!item.src || item.src.startsWith('data:')) return false;
+                    const s = item.src.toLowerCase();
+                    const alt = item.alt.toLowerCase();
+                    const aria = item.parentAria.toLowerCase();
+                    // Blacklist all Google Account avatars and profile icons
+                    if (s.includes('s32-c-mo') || s.includes('s96-c') || s.includes('pr_32px') || s.includes('/a/acg8oc') || s.includes('/a/')) return false;
+                    if (alt.includes('google account') || alt.includes('tài khoản google') || alt.includes('profile')) return false;
+                    if (aria.includes('google account') || aria.includes('tài khoản google') || aria.includes('profile')) return false;
+                    if (item.className.includes('avatar') || item.className.includes('profile')) return false;
+                    return true;
+                }).map(item => item.src);
             }''')
             return set(imgs) if isinstance(imgs, list) else set()
         except Exception:
@@ -504,37 +520,73 @@ class GoogleFlowWorker:
 
     async def clear_ingredient_chips(self) -> None:
         """Clear all ingredient chips currently attached to the prompt box."""
-        chips = self.page.locator("flow-ingredient-chip")
-        try:
-            chip_count = await chips.count()
-        except Exception:
-            chip_count = 0
-        if chip_count == 0:
-            return
+        chip_selectors = [
+            "flow-ingredient-chip",
+            ".ingredient-chip",
+            "mat-chip",
+            ".mat-mdc-chip",
+            "[data-chip]",
+            ".chip-item",
+            ".reference-chip",
+            "flow-prompt-box flow-ingredient-chip",
+        ]
 
-        clear_btn = self.page.locator("button.clear-button, button[aria-label*='Clear prompt' i]").first
-        try:
-            if await clear_btn.is_visible(timeout=1500):
-                await clear_btn.click()
-                await asyncio.sleep(0.4)
-                return
-        except Exception:
-            pass
+        clear_btn_selectors = [
+            "button.clear-button",
+            "button[aria-label*='Clear prompt' i]",
+            "button[aria-label*='Clear all' i]",
+            "button[aria-label*='Xóa câu lệnh' i]",
+            "button[aria-label*='Xóa tất cả' i]",
+        ]
 
-        try:
-            for _ in range(chip_count):
-                c = self.page.locator("flow-ingredient-chip").first
-                if not await c.is_visible(timeout=1000):
-                    break
-                await c.hover()
-                del_btn = self.page.locator(
-                    "flow-ingredient-chip mat-icon:has-text('cancel'), flow-ingredient-chip .hover-icon-overlay"
-                ).first
-                if await del_btn.is_visible(timeout=1000):
-                    await del_btn.click()
+        for c_sel in clear_btn_selectors:
+            try:
+                c_btn = self.page.locator(c_sel).first
+                if await c_btn.is_visible(timeout=500):
+                    await c_btn.click()
                     await asyncio.sleep(0.3)
-        except Exception as exc:
-            logger.warning("Could not clear ingredient chips: %s", exc)
+                    break
+            except Exception:
+                pass
+
+        # Dismiss / remove individual chips
+        for _ in range(8):
+            found_any = False
+            for sel in chip_selectors:
+                try:
+                    chips = self.page.locator(sel)
+                    count = await chips.count()
+                    if count > 0:
+                        found_any = True
+                        for i in range(count):
+                            c = chips.nth(i)
+                            if await c.is_visible(timeout=300):
+                                await c.hover()
+                                await asyncio.sleep(0.1)
+                                del_btn_selectors = [
+                                    "mat-icon:has-text('cancel')",
+                                    "mat-icon:has-text('close')",
+                                    "mat-icon:has-text('clear')",
+                                    ".hover-icon-overlay",
+                                    "button.delete-button",
+                                    "button[aria-label*='Remove' i]",
+                                    "button[aria-label*='Delete' i]",
+                                    "button[aria-label*='Xóa' i]",
+                                    ".remove-chip-button",
+                                ]
+                                for d_sel in del_btn_selectors:
+                                    try:
+                                        d_btn = c.locator(d_sel).first
+                                        if await d_btn.is_visible(timeout=300):
+                                            await d_btn.click()
+                                            await asyncio.sleep(0.2)
+                                            break
+                                    except Exception:
+                                        pass
+                except Exception:
+                    pass
+            if not found_any:
+                break
 
     async def sync_reference_ingredients(self, reference_ids: list[str] | None) -> None:
         """Ensure the prompt box has the desired reference image attached as an ingredient chip."""
@@ -612,19 +664,8 @@ class GoogleFlowWorker:
             except Exception:
                 pass
 
-        # Fallback to first asset item in Uploads if still not found
         if not found:
-            try:
-                first_asset = self.page.locator(".cdk-overlay-container button.asset-item").first
-                if await first_asset.is_visible(timeout=1500):
-                    await first_asset.click()
-                    await asyncio.sleep(0.5)
-                    found = True
-            except Exception as exc:
-                logger.warning("Could not click fallback asset item: %s", exc)
-
-        if not found:
-            logger.warning("Asset item for reference '%s' not found in Uploads menu.", target_ref)
+            logger.warning("Asset item for reference '%s' not found in Uploads menu. Skipping reference attachment without fallback.", target_ref)
             await self.dismiss_blocking_dialogs()
             return
 
@@ -1005,12 +1046,18 @@ class GoogleFlowWorker:
         all_refs = upload_refs + [r for r in (reference_ids or []) if r not in upload_refs]
         await self.sync_reference_ingredients(all_refs)
 
-        # 2. Add strict negative prompt for text/watermarks
-        strict_avoid = "text, letters, words, typography, watermark, logo, headline, caption, subtitle, poster text"
+        # 2. Add strict negative prompt for text/watermarks and static still frames
+        strict_avoid = "still frame, static image, cartoon, text, letters, words, typography, watermark, logo, headline, caption, subtitle, poster text"
         combined_avoid = f"{avoid_prompt}, {strict_avoid}" if avoid_prompt else strict_avoid
         clean_prompt = re.sub(r"\[IMAGE_URL:[^\]]*\]", "", prompt)
         clean_prompt = re.sub(r"https?://\S+", "", clean_prompt)
         clean_prompt = re.sub(r"/api/thumbnails/\S+", "", clean_prompt).strip()
+        clean_prompt = re.sub(
+            r"(?i)\b(?:still photograph|photography|35mm photography|photo|film still|raw photo|movie still|still photo)\b",
+            "cinematic video",
+            clean_prompt,
+        )
+        clean_prompt = re.sub(r"\s+", " ", clean_prompt).strip()
         full_prompt = f"{clean_prompt}. Avoid: {combined_avoid}"
 
         # 3. Locate prompt editor

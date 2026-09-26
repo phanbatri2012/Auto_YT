@@ -24,8 +24,7 @@ const GOOGLE_FLOW_IMAGE_MODELS = [
     badge: '🟢 Chuẩn Google Flow',
     creditLabel: '🟢 Tiết kiệm (~1 credit/ảnh)',
     speed: '⚡ 3–5s',
-    description: '⭐ Model tạo ảnh mặc định mới nhất trên Google Flow. Tốc độ sinh nhanh, màu sắc chân thực, chi tiết sắc nét, phù hợp tạo 30–50 cảnh visual cho video dài.',
-    recommended: true
+    description: '⭐ Model tạo ảnh mặc định mới nhất trên Google Flow. Tốc độ sinh nhanh, màu sắc chân thực, chi tiết sắc nét, phù hợp tạo 30–50 cảnh visual cho video dài.'
   },
   {
     id: 'nano_banana_pro',
@@ -33,7 +32,8 @@ const GOOGLE_FLOW_IMAGE_MODELS = [
     badge: '🟢 Tiết kiệm Credit',
     creditLabel: '🟢 Thấp nhất (~1 credit/ảnh)',
     speed: '⚡ 3–5s',
-    description: 'Model thế hệ tiền nhiệm, tương thích hoàn toàn với các prompt version cũ.'
+    description: 'Model thế hệ tiền nhiệm, tương thích hoàn toàn với các prompt version cũ.',
+    recommended: true
   },
   {
     id: 'imagen_3_standard',
@@ -60,8 +60,7 @@ const GOOGLE_FLOW_VIDEO_MODELS = [
     badge: '⚡ Mặc định / Siêu tốc',
     creditLabel: '🟡 Tiêu chuẩn (~10 credit/clip)',
     speed: '⚡ 15–25s',
-    description: '⭐ Model tạo video AI mặc định mới nhất của Google Flow. Tốc độ sinh siêu nhanh, chuyển động mượt mà và phối cảnh nhất quán.',
-    recommended: true
+    description: '⭐ Model tạo video AI mặc định mới nhất của Google Flow. Tốc độ sinh siêu nhanh, chuyển động mượt mà và phối cảnh nhất quán.'
   },
   {
     id: 'veo_3_1_lite',
@@ -69,7 +68,8 @@ const GOOGLE_FLOW_VIDEO_MODELS = [
     badge: '🟢 Tiết kiệm Credit',
     creditLabel: '🟢 Thấp (~8 credit/clip)',
     speed: '⏳ 20–30s',
-    description: 'Bản rút gọn của Veo 3.1, tối ưu chi phí credit cho các cảnh intro ngắn.'
+    description: 'Bản rút gọn của Veo 3.1, tối ưu chi phí credit cho các cảnh intro ngắn.',
+    recommended: true
   },
   {
     id: 'veo_3_1_fast',
@@ -101,15 +101,15 @@ const GOOGLE_FLOW_MODELS = [...GOOGLE_FLOW_IMAGE_MODELS, ...GOOGLE_FLOW_VIDEO_MO
 
 const DEFAULT_IMAGE_GENERATION_SETTINGS = {
   provider: 'google_flow',
-  model: 'nano_banana_2',
+  model: 'nano_banana_pro',
   aspect_ratio: '16:9',
-  output_count: 2,
-  video_model: 'omni_1_1_flash',
+  output_count: 1,
+  video_model: 'veo_3_1_lite',
   video_aspect_ratio: '16:9',
   video_output_count: 1,
-  style_prompt: '',
-  avoid_prompt: '',
-  negative_prompt: '',
+  style_prompt: 'Cinematic documentary film still, 35mm photography, atmospheric natural lighting, realistic textures, cinematic composition, shallow depth of field, balanced color grading, high visual fidelity, 8k raw photo.',
+  avoid_prompt: 'cartoon, anime, 3D CGI render, illustration, drawing, plastic skin, oversaturated, blown-out highlights, deformed hands, extra fingers, missing limbs, duplicate faces, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.',
+  negative_prompt: 'cartoon, anime, 3D CGI render, illustration, drawing, plastic skin, oversaturated, blown-out highlights, deformed hands, extra fingers, missing limbs, duplicate faces, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.',
   thumbnail_variant: 'with_text',
   scene_0_source: 'from_thumbnail_without_text',
   enable_intro_video: true,

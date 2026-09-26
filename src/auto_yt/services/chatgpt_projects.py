@@ -32,8 +32,8 @@ THUMBNAIL_VARIANTS = {"with_text", "without_text"}
 DEFAULT_THUMBNAIL_VARIANT = "with_text"
 SCENE_0_SOURCES = {"from_thumbnail_without_text", "from_thumbnail_with_text", "from_intro_transcript"}
 DEFAULT_SCENE_0_SOURCE = "from_thumbnail_without_text"
-DEFAULT_IMAGE_MODEL = "nano_banana_2"
-DEFAULT_VIDEO_MODEL = "omni_1_1_flash"
+DEFAULT_IMAGE_MODEL = "nano_banana_pro"
+DEFAULT_VIDEO_MODEL = "veo_3_1_lite"
 
 SUPPORTED_ASPECT_RATIOS = {"16:9", "4:3", "1:1", "3:4", "9:16"}
 SUPPORTED_VIDEO_ASPECT_RATIOS = {"16:9", "9:16"}
@@ -49,18 +49,18 @@ GOOGLE_FLOW_IMAGE_MODELS = {
         "credit_label": "🟢 Tiết kiệm (~1 credit/ảnh)",
         "speed": "⚡ 3–5s",
         "description": "⭐ Model tạo ảnh mặc định mới nhất trên Google Flow. Tốc độ sinh nhanh, màu sắc chân thực, chi tiết sắc nét, phù hợp tạo 30–50 cảnh visual cho video dài.",
-        "is_default": True,
+        "is_default": False,
     },
     "nano_banana_pro": {
         "id": "nano_banana_pro",
-        "name": "Nano Banana Pro (Imagen 3 Fast)",
+        "name": "Nano Banana Pro (Legacy)",
         "provider": "google_flow",
         "badge": "🟢 Tiết kiệm Credit",
         "credit_tier": "low",
         "credit_label": "🟢 Thấp nhất (~1 credit/ảnh)",
         "speed": "⚡ 3–5s",
         "description": "Model thế hệ tiền nhiệm, tương thích hoàn toàn với các prompt version cũ.",
-        "is_default": False,
+        "is_default": True,
     },
     "imagen_3_standard": {
         "id": "imagen_3_standard",
@@ -96,7 +96,7 @@ GOOGLE_FLOW_VIDEO_MODELS = {
         "credit_label": "🟡 Tiêu chuẩn (~10 credit/clip)",
         "speed": "⚡ 15–25s",
         "description": "⭐ Model tạo video AI mặc định mới nhất của Google Flow. Tốc độ sinh siêu nhanh, chuyển động mượt mà và phối cảnh nhất quán.",
-        "is_default": True,
+        "is_default": False,
     },
     "veo_3_1_lite": {
         "id": "veo_3_1_lite",
@@ -107,7 +107,7 @@ GOOGLE_FLOW_VIDEO_MODELS = {
         "credit_label": "🟢 Thấp (~8 credit/clip)",
         "speed": "⏳ 20–30s",
         "description": "Bản rút gọn của Veo 3.1, tối ưu chi phí credit cho các cảnh intro ngắn.",
-        "is_default": False,
+        "is_default": True,
     },
     "veo_3_1_fast": {
         "id": "veo_3_1_fast",
@@ -150,13 +150,13 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "provider": "google_flow",
     "model": DEFAULT_IMAGE_MODEL,
     "aspect_ratio": "16:9",
-    "output_count": 2,
+    "output_count": 1,
     "video_model": DEFAULT_VIDEO_MODEL,
     "video_aspect_ratio": "16:9",
     "video_output_count": 1,
-    "style_prompt": "",
-    "avoid_prompt": "",
-    "negative_prompt": "",  # alias for avoid_prompt, kept for frontend compatibility
+    "style_prompt": "Cinematic documentary film still, 35mm photography, atmospheric natural lighting, realistic textures, cinematic composition, shallow depth of field, balanced color grading, high visual fidelity, 8k raw photo.",
+    "avoid_prompt": "cartoon, anime, 3D CGI render, illustration, drawing, plastic skin, oversaturated, blown-out highlights, deformed hands, extra fingers, missing limbs, duplicate faces, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.",
+    "negative_prompt": "cartoon, anime, 3D CGI render, illustration, drawing, plastic skin, oversaturated, blown-out highlights, deformed hands, extra fingers, missing limbs, duplicate faces, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.",
     "density": 30,
     "outputs_per_scene": 1,
     "thumbnail_variant": DEFAULT_THUMBNAIL_VARIANT,
@@ -164,6 +164,9 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "enable_intro_video": True,
     "intro_scene_target_seconds": 8.0,
     "intro_crop_watermark": True,
+    "scene_duration_min_seconds": 25,
+    "scene_duration_target_seconds": 30,
+    "scene_duration_max_seconds": 35,
 }
 DEFAULT_PUBLISHING_SETTINGS = {
     "category_id": "",
@@ -275,12 +278,9 @@ def normalize_image_generation_settings(value: object) -> dict:
     settings = value if isinstance(value, dict) else {}
     normalized = dict(DEFAULT_IMAGE_GENERATION_SETTINGS)
 
-    # Image Model normalization with migration mapping
+    # Image Model normalization
     model = str(settings.get("model") or "").strip()
-    # Migration aliases for legacy models
-    if model in ("nano_banana_pro", "imagen_3_standard", "imagen_3_photoreal"):
-        normalized["model"] = "nano_banana_2"
-    elif model in GOOGLE_FLOW_IMAGE_MODELS:
+    if model in GOOGLE_FLOW_IMAGE_MODELS:
         normalized["model"] = model
     elif model == "google_veo_intro":
         normalized["model"] = DEFAULT_IMAGE_MODEL
@@ -302,10 +302,10 @@ def normalize_image_generation_settings(value: object) -> dict:
     normalized["aspect_ratio"] = aspect_ratio if aspect_ratio in SUPPORTED_ASPECT_RATIOS else "16:9"
 
     try:
-        output_count = int(settings.get("output_count", 2))
-        normalized["output_count"] = output_count if output_count in SUPPORTED_OUTPUT_COUNTS else 2
+        output_count = int(settings.get("output_count", 1))
+        normalized["output_count"] = output_count if output_count in SUPPORTED_OUTPUT_COUNTS else 1
     except (TypeError, ValueError):
-        normalized["output_count"] = 2
+        normalized["output_count"] = 1
 
     # Aspect Ratio & Output Count (Video)
     video_aspect_ratio = str(settings.get("video_aspect_ratio") or "").strip()

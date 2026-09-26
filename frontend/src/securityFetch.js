@@ -46,15 +46,33 @@ async function ensureLocalSession(nativeFetch, force = false) {
   await sessionPromise
 }
 
-function protectedRequest(baseRequest) {
-  const headers = new Headers(baseRequest.headers)
+function buildProtectedRequest(input, init) {
+  let url = input
+  let method = init?.method || 'GET'
+  let body = init?.body
+  const baseHeaders = init?.headers || (input instanceof Request ? input.headers : undefined)
+  const headers = new Headers(baseHeaders)
+
   if (csrfToken) {
     headers.set(CSRF_HEADER, csrfToken)
   }
-  return new Request(baseRequest, {
+
+  if (input instanceof Request) {
+    url = input.url
+    method = input.method || method
+  }
+
+  const reqInit = {
+    method,
     headers,
     credentials: 'include',
-  })
+  }
+
+  if (body !== undefined && body !== null && method !== 'GET' && method !== 'HEAD') {
+    reqInit.body = body
+  }
+
+  return new Request(url, reqInit)
 }
 
 export function installSecurityFetch() {
@@ -67,12 +85,19 @@ export function installSecurityFetch() {
       return nativeFetch(input, init)
     }
 
-    const baseRequest = new Request(input, init)
     await ensureLocalSession(nativeFetch)
-    let response = await nativeFetch(protectedRequest(baseRequest.clone()))
+    let response
+    try {
+      response = await nativeFetch(buildProtectedRequest(input, init))
+    } catch (err) {
+      // Network error or connection reset during restart, retry once after renewing session
+      await ensureLocalSession(nativeFetch, true)
+      return nativeFetch(buildProtectedRequest(input, init))
+    }
+
     if (response.status === 401 || response.status === 403) {
       await ensureLocalSession(nativeFetch, true)
-      response = await nativeFetch(protectedRequest(baseRequest.clone()))
+      response = await nativeFetch(buildProtectedRequest(input, init))
     }
     return response
   }

@@ -195,13 +195,19 @@ if (-not $createdNew) {
 try {
     Write-Step "Analyzing running Auto_YT services and processes..."
 
-    if ($env:AUTOYT_REQUIRE_GPM_IDLE -eq "1") {
+    if ($env:AUTOYT_REQUIRE_GPM_IDLE -eq "1" -or $env:AUTOYT_REQUIRE_IDLE -eq "1") {
         $maintenanceStatus = Get-RestartMaintenanceStatus
         if ($maintenanceStatus -and -not $maintenanceStatus.safe_to_restart) {
-            foreach ($job in @($maintenanceStatus.gpm_blocking_jobs) | Select-Object -First 5) {
-                Write-Warning "GPM job is not idle: $($job.status) - $($job.channel_title) - $($job.title)"
+            Write-Host "`n[Auto_YT] [CANH BAO AN TOAN] He thong dang co $($maintenanceStatus.total_blocking_jobs) tac vu dang chay:" -ForegroundColor Yellow
+            foreach ($reason in @($maintenanceStatus.reasons)) {
+                Write-Host "  - $reason" -ForegroundColor Red
             }
-            throw "Restart blocked because a queued or active job can open a channel GPM profile. Let the job finish or pause it, then retry."
+            foreach ($job in @($maintenanceStatus.blocking_jobs) | Select-Object -First 5) {
+                $desc = if ($job.title) { $job.title } elseif ($job.video_title) { $job.video_title } else { "ID: $($job.id)" }
+                Write-Host "    * [$($job.type)] $($job.status): $desc" -ForegroundColor Yellow
+            }
+            Write-Host ""
+            throw "Auto_YT restart/stop bi chan an toan vi he thong dang thuc hien tac vu quan trong (render, upload YouTube, dang bai, hoac GPM). Vui long doi cac job tren hoan tat truoc khi restart!"
         }
     }
     

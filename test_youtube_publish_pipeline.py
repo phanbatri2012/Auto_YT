@@ -987,6 +987,20 @@ class YouTubePublishPipelineTests(unittest.TestCase):
         self.assertEqual(result["youtube_video_id"], "dyn-yt-id")
         self.assertEqual(result["stage"], "uploaded_private")
 
+    def test_build_upload_metadata_includes_audio_and_text_languages(self):
+        video = {
+            "title": "Tiêu đề video mẫu",
+            "description": "Mô tả video mẫu",
+            "generated_script": "",
+        }
+        metadata = youtube_publisher.build_upload_metadata(
+            video,
+            {"language": "vi", "category_id": "22", "made_for_kids": False},
+        )
+        self.assertEqual(metadata["snippet"]["defaultLanguage"], "vi")
+        self.assertEqual(metadata["snippet"]["defaultAudioLanguage"], "vi")
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -208,13 +208,17 @@ def build_upload_metadata(video: dict, publishing_settings: dict) -> dict:
             tags_extracted.append(t)
     tags = tags_extracted[:30]
 
+    language = str(publishing_settings.get("language") or "vi").strip() or "vi"
+    audio_language = str(publishing_settings.get("audio_language") or language).strip() or language
+
     return {
         "snippet": {
             "title": title,
             "description": description,
             "tags": tags,
             "categoryId": category_id,
-            "defaultLanguage": str(publishing_settings.get("language") or "vi"),
+            "defaultLanguage": language,
+            "defaultAudioLanguage": audio_language,
         },
         "status": {
             "privacyStatus": "private",

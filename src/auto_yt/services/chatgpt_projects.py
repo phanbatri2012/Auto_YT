@@ -29,6 +29,7 @@ DEFAULT_PROMPT_PIPELINE = {
 }
 
 THUMBNAIL_VARIANTS = {"with_text", "without_text"}
+DEFAULT_THUMBNAIL_VARIANT = "with_text"
 SCENE_0_SOURCES = {"from_thumbnail_without_text", "from_thumbnail_with_text", "from_intro_transcript"}
 DEFAULT_SCENE_0_SOURCE = "from_thumbnail_without_text"
 DEFAULT_IMAGE_MODEL = "nano_banana_2"
@@ -158,7 +159,7 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "negative_prompt": "",  # alias for avoid_prompt, kept for frontend compatibility
     "density": 30,
     "outputs_per_scene": 1,
-    "thumbnail_variant": "without_text",
+    "thumbnail_variant": DEFAULT_THUMBNAIL_VARIANT,
     "scene_0_source": DEFAULT_SCENE_0_SOURCE,
     "enable_intro_video": True,
     "intro_scene_target_seconds": 8.0,
@@ -189,11 +190,11 @@ def _pipeline_dependencies(thumbnail_variant: str) -> dict[str, tuple[str, ...]]
 
 def resolve_prompt_pipeline_dependencies(
     pipeline: dict[str, bool],
-    thumbnail_variant: str = "without_text",
+    thumbnail_variant: str = DEFAULT_THUMBNAIL_VARIANT,
 ) -> tuple[dict[str, bool], list[str]]:
     """Enable every prerequisite required by the selected terminal stages."""
     variant = (
-        thumbnail_variant if thumbnail_variant in THUMBNAIL_VARIANTS else "without_text"
+        thumbnail_variant if thumbnail_variant in THUMBNAIL_VARIANTS else DEFAULT_THUMBNAIL_VARIANT
     )
     resolved = dict(pipeline)
     auto_enabled: list[str] = []
@@ -334,7 +335,7 @@ def normalize_image_generation_settings(value: object) -> dict:
     normalized["thumbnail_variant"] = (
         settings.get("thumbnail_variant")
         if settings.get("thumbnail_variant") in THUMBNAIL_VARIANTS
-        else "without_text"
+        else DEFAULT_THUMBNAIL_VARIANT
     )
     normalized["scene_0_source"] = (
         settings.get("scene_0_source")
@@ -370,7 +371,7 @@ def validate_image_generation_settings(value: object) -> dict:
             "Cấu hình tạo ảnh chứa trường không được hỗ trợ: "
             + ", ".join(sorted(unknown))
         )
-    if settings.get("thumbnail_variant", "without_text") not in THUMBNAIL_VARIANTS:
+    if settings.get("thumbnail_variant", DEFAULT_THUMBNAIL_VARIANT) not in THUMBNAIL_VARIANTS:
         raise ValueError("Loại thumbnail upload không được hỗ trợ.")
     if settings.get("scene_0_source", DEFAULT_SCENE_0_SOURCE) not in SCENE_0_SOURCES:
         raise ValueError("Nguồn ảnh Scene 0 không được hỗ trợ.")

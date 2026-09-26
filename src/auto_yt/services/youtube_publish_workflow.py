@@ -356,7 +356,7 @@ def _build_preflight_context(
     if not isinstance(image_settings, dict):
         image_settings = {}
     thumbnail_variant = str(
-        image_settings.get("thumbnail_variant") or "without_text"
+        image_settings.get("thumbnail_variant") or "with_text"
     )
     thumbnail_path = _resolve_thumbnail_path(
         str(video.get("generated_script") or ""),

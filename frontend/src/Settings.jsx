@@ -110,7 +110,7 @@ const DEFAULT_IMAGE_GENERATION_SETTINGS = {
   style_prompt: '',
   avoid_prompt: '',
   negative_prompt: '',
-  thumbnail_variant: 'without_text',
+  thumbnail_variant: 'with_text',
   scene_0_source: 'from_thumbnail_without_text',
   enable_intro_video: true,
   intro_scene_target_seconds: 8.0,

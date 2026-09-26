@@ -798,20 +798,42 @@ def open_configured_project_from_sidebar(page: Page, project_url: str) -> bool:
                 .trim();
             const normalizedSlug = normalize(projectSlug.replace(/-/g, ' '));
 
+            // 1. Try modern ChatGPT sidebar project data attributes
+            const modernRows = [...document.querySelectorAll(
+                '[data-app-action-sidebar-project-id], [data-app-action-sidebar-project-label], [data-sidebar-project-container-id]'
+            )];
+            for (const row of modernRows) {
+                const rowId = normalize(row.getAttribute('data-app-action-sidebar-project-id') || '');
+                const rowLabel = normalize(row.getAttribute('data-app-action-sidebar-project-label') || row.innerText || '');
+                if (rowId.includes(normalizedId) || rowLabel.includes(normalizedSlug) || normalizedSlug.includes(rowLabel)) {
+                    const newChatBtn = row.querySelector('button[aria-label*="New chat in "]')
+                        || row.parentElement?.querySelector('button[aria-label*="New chat in "]');
+                    if (newChatBtn) {
+                        newChatBtn.click();
+                        await delay(200);
+                        return true;
+                    }
+                    row.click();
+                    await delay(200);
+                    return true;
+                }
+            }
+
             const getRows = () => [...document.querySelectorAll(
-                'button[aria-label^="Open project options for "]'
+                'button[aria-label^="Open project options for "], button[aria-label^="Project actions for "]'
             )].map((optionsButton) => {
                 const controls = optionsButton.parentElement;
                 const group = controls?.parentElement;
                 const row = group?.querySelector(
                     '[data-sidebar-item][role="button"]'
-                );
+                ) || group?.querySelector('[role="button"]') || controls;
                 const homeButton = controls?.querySelector(
                     'button[aria-label="Open project home"]'
-                );
+                ) || controls?.querySelector('button[aria-label*="New chat in "]') || optionsButton;
                 const label = row?.innerText?.trim()
                     || optionsButton.getAttribute('aria-label')
                         ?.replace(/^Open project options for\s+/, '')
+                        ?.replace(/^Project actions for\s+/, '')
                     || '';
                 return { group, row, homeButton, label };
             }).filter((item) => item.row && item.homeButton);
@@ -850,7 +872,7 @@ def open_configured_project_from_sidebar(page: Page, project_url: str) -> bool:
             // expanding it and checking its project-scoped conversation links.
             if (!selected) {
                 for (const item of rows) {
-                    if (item.row.getAttribute('aria-expanded') !== 'true') {
+                    if (item.row && item.row.getAttribute('aria-expanded') !== 'true') {
                         item.row.click();
                         await delay(200);
                     }
@@ -875,11 +897,13 @@ def open_configured_project_from_sidebar(page: Page, project_url: str) -> bool:
             }
 
             if (!selected) return false;
-            if (selected.row.getAttribute('aria-expanded') !== 'true') {
+            if (selected.row && selected.row.getAttribute('aria-expanded') !== 'true') {
                 selected.row.click();
                 await delay(200);
             }
-            selected.homeButton.click();
+            if (selected.homeButton) {
+                selected.homeButton.click();
+            }
             return true;
         }""",
         {
@@ -895,17 +919,33 @@ def navigate_to_chatgpt_project(
     project_url: str,
     bootstrap_url: str = DEFAULT_CHATGPT_BOOTSTRAP_URL,
 ) -> None:
-    """Open a configured Project from the healthy global ChatGPT shell.
+    """Open a configured Project from direct route or healthy sidebar shell.
 
     The exact Project route is validated before the caller can send a prompt.
-    There is deliberately no direct ``/project`` fallback: direct loads are the
-    failure mode this bootstrap flow is designed to avoid.
     """
     expected_path = urlparse(project_url).path.rstrip("/")
     last_error: Exception | None = None
 
     for attempt in range(CHATGPT_PROJECT_NAVIGATION_ATTEMPTS):
         try:
+            # 1. Direct navigation first (standard & fast)
+            try:
+                page.goto(
+                    project_url,
+                    wait_until="domcontentloaded",
+                    timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+                )
+                check_chatgpt_page_attention(page)
+                actual_path = urlparse(page.url).path.rstrip("/")
+                if actual_path == expected_path:
+                    wait_for_chatgpt_composer(page)
+                    return
+            except ChatGPTAttentionRequiredError:
+                raise
+            except Exception as direct_exc:
+                last_error = direct_exc
+
+            # 2. Sidebar bootstrap navigation fallback
             page.goto(
                 bootstrap_url,
                 wait_until="domcontentloaded",
@@ -914,10 +954,13 @@ def navigate_to_chatgpt_project(
             wait_for_chatgpt_composer(page)
 
             if not open_configured_project_from_sidebar(page, project_url):
-                raise RuntimeError(
-                    "Configured ChatGPT Project was not found in the sidebar. "
-                    "No prompt was sent."
+                # Fallback: navigate directly to project URL
+                page.goto(
+                    project_url,
+                    wait_until="domcontentloaded",
+                    timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
                 )
+
             page.wait_for_function(
                 """(path) => location.pathname.replace(/\/+$/, '') === path""",
                 arg=expected_path,

@@ -812,6 +812,56 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertIsNotNone(art1)
         self.assertIsNone(art2)
 
+    def test_sanitize_scene_prompt_for_generation_removes_title_across_all_niches(self):
+        # 1. Finance Niche
+        finance_title = "CUỘC KHỦNG HOẢNG NGÂN HÀNG TOÀN CẦU 2026 SẼ DIỄN RA NHƯ THẾ NÀO?"
+        legacy_prompt = (
+            "A cinematic still photograph: Moody finance style. "
+            "Cinematic visual illustrating: Cuộc khủng hoảng ngân hàng toàn cầu 2026 sẽ diễn ra như thế nào?. "
+            "Narrative scene: Ngân hàng trung ương họp khẩn cấp. "
+            "16:9 widescreen, clean visual without text."
+        )
+        cleaned = video_production._sanitize_scene_prompt_for_generation(
+            legacy_prompt,
+            video_title=finance_title,
+            scene_action="Ngân hàng trung ương họp khẩn cấp",
+            style_prompt="Moody finance style",
+        )
+        self.assertNotIn("khủng hoảng ngân hàng", cleaned.lower())
+        self.assertNotIn("cinematic visual illustrating", cleaned.lower())
+        self.assertIn("ngân hàng trung ương họp khẩn cấp", cleaned.lower())
+        self.assertIn("clean visual without text", cleaned.lower())
+
+        # 2. Space Science Niche
+        science_title = "BÍ ẨN HỐ ĐEN SIÊU KHỐI VỪA ĐƯỢC KÍNH JAMES WEBB PHÁT HIỆN"
+        legacy_prompt2 = (
+            "A cinematic photograph: Sci-fi 8k. "
+            "Story theme: Bí ẩn hố đen siêu khối vừa được kính James Webb phát hiện. "
+            "Narrative scene: Kính viễn vọng quan sát thiên hà cổ đại. "
+            "16:9 widescreen."
+        )
+        cleaned2 = video_production._sanitize_scene_prompt_for_generation(
+            legacy_prompt2,
+            video_title=science_title,
+            scene_action="Kính viễn vọng quan sát thiên hà cổ đại",
+            style_prompt="Sci-fi 8k",
+        )
+        self.assertNotIn("hố đen siêu khối", cleaned2.lower())
+        self.assertNotIn("story theme", cleaned2.lower())
+        self.assertIn("kính viễn vọng quan sát thiên hà cổ đại", cleaned2.lower())
+        self.assertIn("clean visual without text", cleaned2.lower())
+
+    def test_build_default_visual_scene_plan_scene0_has_no_title_hook(self):
+        windows = [
+            {"index": 0, "start": 0.0, "end": 8.0, "duration": 8.0, "transcript": "Khởi đầu phân tích tài chính"},
+        ]
+        title = "DỰ BÁO KINH TẾ NĂM 2026"
+        plan = video_production.build_default_visual_scene_plan(windows, title)
+        scene0 = plan["scenes"][0]
+        self.assertNotIn("Story theme:", scene0["prompt"])
+        self.assertNotIn("dramatic opening scene hook for", scene0["prompt"])
+        self.assertIn("clean visual without text", scene0["prompt"])
+
 if __name__ == "__main__":
     unittest.main()
 

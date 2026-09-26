@@ -472,6 +472,18 @@ def purge_scene_artifacts_from_index(video_id: int, from_index: int) -> int:
         if final_mp4.get("id"):
             db.delete_video_artifact(final_mp4["id"])
 
+    # Also purge visual_scene_plan artifact so it will rebuild clean title-free prompts
+    scene_plan_art = db.get_latest_video_artifact(video_id, "visual_scene_plan")
+    if scene_plan_art:
+        plan_path = scene_plan_art.get("path")
+        if plan_path:
+            try:
+                Path(plan_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        if scene_plan_art.get("id"):
+            db.delete_video_artifact(scene_plan_art["id"])
+
     logger.info(
         "Purged %d scene artifacts for video %s starting from index %d",
         removed_count,
@@ -479,6 +491,59 @@ def purge_scene_artifacts_from_index(video_id: int, from_index: int) -> int:
         from_index,
     )
     return removed_count
+
+
+def _sanitize_scene_prompt_for_generation(
+    raw_prompt: str,
+    *,
+    video_title: str = "",
+    scene_action: str = "",
+    style_prompt: str = "",
+) -> str:
+    """Sanitize and ensure scene prompt is 100% free of video titles and legacy anchoring."""
+    clean = (raw_prompt or "").strip()
+
+    # 1. Strip legacy title-injecting prefixes and patterns
+    legacy_patterns = [
+        r"(?i)\b(?:scene depiction|cinematic visual illustrating|story visual core|story theme|dramatic opening scene hook for)\s*[:：\-–—]?\s*",
+        r"(?i)\bdramatic opening scene hook for\s+[\'\"“«][^\'\"”»]+[\'\"”»]\.?",
+        r"(?i)\bopening scene hook for\s+[\'\"“«][^\'\"”»]+[\'\"”»]\.?",
+    ]
+    for pat in legacy_patterns:
+        clean = re.sub(pat, "", clean)
+
+    # 2. If video_title is given and appears in the prompt, strip it completely
+    if video_title and len(video_title.strip()) >= 4:
+        clean = re.sub(re.escape(video_title.strip()), "", clean, flags=re.IGNORECASE)
+        sanitized_title = _sanitize_scene_prompt_context(video_title.strip())
+        if sanitized_title and len(sanitized_title) >= 4:
+            clean = re.sub(re.escape(sanitized_title), "", clean, flags=re.IGNORECASE)
+
+    # 3. Clean up punctuation artifacts, dangling quotes, double periods, multiple spaces
+    clean = re.sub(r"[\'\"“”«»]", "", clean)
+    clean = re.sub(r"\s*,\s*,\s*", ", ", clean)
+    clean = re.sub(r"\s*\.\s*\.\s*", ". ", clean)
+    clean = re.sub(r"\s*:\s*:", ":", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    clean = re.sub(r"^\s*[,.:;\-–—]\s*", "", clean).strip()
+
+    # 4. If prompt became too short or empty, reconstruct from style + scene action
+    if len(clean) < 30:
+        style = (style_prompt or "").split("\n")[0][:200].strip() or "Cinematic documentary visual style, photorealistic, 8k resolution"
+        action = _sanitize_scene_prompt_context(scene_action, max_chars=120)
+        action_part = f"Narrative action: {action}. " if action else ""
+        clean = (
+            f"A cinematic photograph: {style}. "
+            f"{action_part}"
+            f"16:9 widescreen still photograph, authentic realism, dramatic lighting, clean visual without text."
+        )
+
+    # 5. Ensure clean visual without text directive is present
+    if "clean visual without text" not in clean.lower() and "without text" not in clean.lower():
+        clean = f"{clean.rstrip('. ')}. Clean visual without text."
+
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
 
 
 def _generate_scene_image(
@@ -602,25 +667,34 @@ def _generate_scene_image(
             if reference_path and reference_id:
                 await worker.upload_reference(str(reference_path), reference_id)
                 
-            prompt = scene.get("prompt", "")
+            video_rec = db.get_video(video_id) or {}
+            video_title = str(video_rec.get("title") or video_rec.get("generated_title") or "")
+            scene_action = str(scene.get("action") or scene.get("transcript") or "")
+            style_str = str(settings.get("style_prompt") or profile.get("style_prompt") or "")
+
+            clean_prompt = _sanitize_scene_prompt_for_generation(
+                scene.get("prompt", ""),
+                video_title=video_title,
+                scene_action=scene_action,
+                style_prompt=style_str,
+            )
             avoid = negative_prompt
             refs = [reference_id] if reference_id else []
             
             try:
-                asset_url = await worker.generate_scene(prompt, avoid, refs)
+                asset_url = await worker.generate_scene(clean_prompt, avoid, refs)
             except Exception as first_err:
                 logger.warning(
                     "First attempt generate_scene for scene %d failed (%s). Retrying with generic context-aware fallback prompt...",
                     scene.get("index", 0),
                     first_err,
                 )
-                safe_clean_subject = _sanitize_scene_prompt_context(
-                    scene.get("subject") or scene.get("transcript", "") or "",
+                concise_style = style_str.split("\n")[0][:200].strip() if style_str else "Cinematic documentary visual style, photorealistic, 8k resolution"
+                clean_action = _sanitize_scene_prompt_context(
+                    scene_action,
                     max_chars=120,
                 )
-                raw_style = str(settings.get("style_prompt") or profile.get("style_prompt") or "").strip()
-                concise_style = raw_style.split("\n")[0][:200].strip() if raw_style else "Cinematic documentary visual style, photorealistic, 8k resolution"
-                context_desc = f"Cinematic visual illustrating: {safe_clean_subject}. " if safe_clean_subject else ""
+                context_desc = f"Narrative action: {clean_action}. " if clean_action else ""
                 safe_prompt = (
                     f"A cinematic still photograph: {concise_style}. "
                     f"{context_desc}"
@@ -1913,11 +1987,9 @@ def build_default_visual_scene_plan(
                     f"16:9 widescreen, photorealistic 8k, authentic documentary realism, clean framing without text."
                 ).replace("  ", " ").strip()
             else:
-                clean_title = _sanitize_scene_prompt_context(title, max_chars=80)
                 prompt = (
                     f"A cinematic movie still: {style}, dramatic opening scene hook. "
                     f"{ref_note}"
-                    f"Story theme: {clean_title}. "
                     f"{context_part}"
                     f"16:9 widescreen, photorealistic 8k, authentic documentary realism, clean visual without text."
                 ).replace("  ", " ").strip()

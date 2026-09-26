@@ -479,6 +479,29 @@ class GoogleFlowWorker:
         except Exception:
             return set()
 
+    async def _get_existing_error_texts(self) -> set[str]:
+        """Snapshot all existing error tile texts currently rendered on the page."""
+        err_texts = set()
+        canvas_err_selectors = [
+            "flow-error-tile",
+            ".canvas flow-error-tile",
+            "flow-media-tile.error",
+            "flow-media-tile[data-error='true']",
+            "[data-tile-state='error']",
+            ".error-tile",
+        ]
+        for sel in canvas_err_selectors:
+            try:
+                locs = self.page.locator(sel)
+                count = await locs.count()
+                for i in range(min(count, 10)):
+                    t = (await locs.nth(i).inner_text() or "").strip()
+                    if t:
+                        err_texts.add(t)
+            except Exception:
+                pass
+        return err_texts
+
     async def clear_ingredient_chips(self) -> None:
         """Clear all ingredient chips currently attached to the prompt box."""
         chips = self.page.locator("flow-ingredient-chip")
@@ -632,8 +655,9 @@ class GoogleFlowWorker:
         clean_prompt = re.sub(r"https?://\S+", "", clean_prompt)
         clean_prompt = re.sub(r"/api/thumbnails/\S+", "", clean_prompt).strip()
 
-        # Snapshot existing generated images on the page
+        # Snapshot existing generated images and error tiles on the page before submitting prompt
         existing_imgs = await self._get_existing_images()
+        initial_error_texts = await self._get_existing_error_texts()
 
         # Synchronize reference image ingredients with the prompt bar
         await self.sync_reference_ingredients(reference_ids)
@@ -791,26 +815,7 @@ class GoogleFlowWorker:
                 except Exception:
                     continue
 
-            # If generation is actively running (Stop button visible), never interrupt on text matches
-            if is_generating:
-                continue
-
-            # Check for explicit canvas error tile ONLY when generation is not active
-            for err_sel in canvas_err_selectors:
-                try:
-                    err_loc = self.page.locator(err_sel).first
-                    if await err_loc.is_visible(timeout=200):
-                        err_text = (await err_loc.inner_text() or "").strip()
-                        if _is_valid_flow_error_text(err_text):
-                            logger.error("Google Flow canvas error tile detected: %s", err_text)
-                            await self._save_debug_screenshot("flow_error_tile")
-                            raise RuntimeError(f"Google Flow báo lỗi khi tạo ảnh: {err_text}")
-                except RuntimeError:
-                    raise
-                except Exception:
-                    pass
-
-            # Query all current images
+            # 1. ALWAYS check for brand-new images FIRST before any error tile evaluation
             try:
                 current_imgs_info = await self.page.evaluate('''() => {
                     return Array.from(
@@ -859,9 +864,39 @@ class GoogleFlowWorker:
                 new_src = brand_new[-1]["src"]
 
             if new_src:
+                logger.info("Found newly generated Google Flow image: %s", new_src)
                 break
 
-            # If generation started and stop button disappeared, check again after a short delay
+            # If generation is actively running (Stop button visible), keep waiting
+            if is_generating:
+                continue
+
+            # 2. Check for NEW canvas error tiles ONLY when generation stopped and NO new image was found
+            current_error_texts = await self._get_existing_error_texts()
+            new_errors = [
+                e for e in current_error_texts
+                if e not in initial_error_texts and _is_valid_flow_error_text(e)
+            ]
+            if new_errors and generation_started:
+                logger.error("Google Flow new error tile detected: %s", new_errors[0])
+                await self._save_debug_screenshot("flow_error_tile")
+                raise RuntimeError(f"Google Flow báo lỗi khi tạo ảnh: {new_errors[0]}")
+
+            # 3. Check for active snackbar error
+            try:
+                error_loc = self.page.locator(".mat-mdc-snack-bar-container [role='alert'], .mat-mdc-snack-bar-container, flow-toast-notification").first
+                if await error_loc.is_visible(timeout=200):
+                    txt = (await error_loc.inner_text() or "").strip()
+                    if _is_valid_flow_error_text(txt) and txt not in initial_error_texts:
+                        logger.error("Google Flow snackbar alert detected: %s", txt)
+                        await self._save_debug_screenshot("flow_snackbar_error")
+                        raise RuntimeError(f"Google Flow báo lỗi khi tạo ảnh: {txt}")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+
+            # 4. If generation started and stop button disappeared, check again with diff
             if generation_started and not is_generating:
                 await asyncio.sleep(3)
                 # Re-query

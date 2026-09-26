@@ -43,6 +43,11 @@ class TestFlowErrorFiltering(unittest.TestCase):
         self.assertNotIn("p:has-text('safety filters')", src)
         self.assertIn("canvas_err_selectors", src)
         self.assertIn("flow-error-tile", src)
+        self.assertIn("initial_error_texts", src)
+        self.assertIn("_get_existing_error_texts", src)
+
+    def test_worker_has_error_snapshot_helper(self):
+        self.assertTrue(hasattr(GoogleFlowWorker, "_get_existing_error_texts"))
 
 if __name__ == "__main__":
     unittest.main()

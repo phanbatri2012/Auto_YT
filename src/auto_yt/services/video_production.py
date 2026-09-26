@@ -1763,6 +1763,7 @@ def build_default_visual_scene_plan(
     style_prompt: str = "",
     prompt_version: str = "",
     generated_script: str = "",
+    scene_0_source: str = "from_thumbnail_without_text",
 ) -> dict:
     from auto_yt.services import prompt_assets
     assets = []
@@ -1790,20 +1791,33 @@ def build_default_visual_scene_plan(
     clean_thumb_concept = ""
     thumb_ref_path = ""
     thumb_ref_id = ""
-    if generated_script:
-        # Priority 1: Thumbnail KHÔNG CHỮ (clean visual without text overlay)
-        thumb_img_match = re.search(
-            r"### \[(?:THUMBNAIL KHÔNG CHỮ|THUMBNAIL_WITHOUT_TEXT|THUMBNAIL NOTEXT)\]\s*\n(.*?)(?=\n### \[|\Z)",
-            generated_script,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        if not thumb_img_match:
-            # Priority 2: Fallback to other thumbnail section if notext not found
+    if generated_script and scene_0_source != "from_intro_transcript":
+        if scene_0_source == "from_thumbnail_with_text":
             thumb_img_match = re.search(
                 r"### \[(?:THUMBNAIL CÓ CHỮ|THUMBNAIL)\]\s*\n(.*?)(?=\n### \[|\Z)",
                 generated_script,
                 flags=re.DOTALL | re.IGNORECASE,
             )
+            if not thumb_img_match:
+                thumb_img_match = re.search(
+                    r"### \[(?:THUMBNAIL KHÔNG CHỮ|THUMBNAIL_WITHOUT_TEXT|THUMBNAIL NOTEXT)\]\s*\n(.*?)(?=\n### \[|\Z)",
+                    generated_script,
+                    flags=re.DOTALL | re.IGNORECASE,
+                )
+        else:
+            # Priority 1: Thumbnail KHÔNG CHỮ (clean visual without text overlay)
+            thumb_img_match = re.search(
+                r"### \[(?:THUMBNAIL KHÔNG CHỮ|THUMBNAIL_WITHOUT_TEXT|THUMBNAIL NOTEXT)\]\s*\n(.*?)(?=\n### \[|\Z)",
+                generated_script,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            if not thumb_img_match:
+                # Priority 2: Fallback to other thumbnail section if notext not found
+                thumb_img_match = re.search(
+                    r"### \[(?:THUMBNAIL CÓ CHỮ|THUMBNAIL)\]\s*\n(.*?)(?=\n### \[|\Z)",
+                    generated_script,
+                    flags=re.DOTALL | re.IGNORECASE,
+                )
         if thumb_img_match:
             sec_content = thumb_img_match.group(1)
             url_match = re.search(r"\[IMAGE_URL:(?:/api/thumbnails/)?([a-zA-Z0-9_\-\.]+)\]", sec_content)
@@ -1927,7 +1941,9 @@ def produce_video(
 
     if plan_payload is None:
         title = video.get("generated_title") or video.get("title") or ""
-        style = (snapshot.get("image_generation_settings") or {}).get("style_prompt") or ""
+        img_settings = snapshot.get("image_generation_settings") or {}
+        style = img_settings.get("style_prompt") or ""
+        scene_0_source = img_settings.get("scene_0_source") or "from_thumbnail_without_text"
         prompt_version = snapshot.get("prompt_version") or snapshot.get("version") or video.get("prompt_version") or ""
         generated_script = video.get("generated_script") or ""
         plan_payload = build_default_visual_scene_plan(
@@ -1936,6 +1952,7 @@ def produce_video(
             style,
             prompt_version=prompt_version,
             generated_script=generated_script,
+            scene_0_source=scene_0_source,
         )
         save_visual_scene_plan(video_id, prepared["plan_hash"], plan_payload)
 

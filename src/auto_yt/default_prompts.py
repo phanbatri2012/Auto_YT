@@ -35,6 +35,7 @@ DEFAULT_PROMPTS_DATA = {
                 "negative_prompt": "",
                 "seed_mode": "random",
                 "thumbnail_variant": "without_text",
+                "scene_0_source": "from_thumbnail_without_text",
                 "enable_intro_video": True,
                 "intro_scene_target_seconds": 8.0,
                 "intro_crop_watermark": True,

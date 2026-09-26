@@ -300,6 +300,7 @@ class PromptImageGenerationData(BaseModel):
     outputs_per_scene: int = 1
     seed_mode: str = "random"
     thumbnail_variant: Literal["with_text", "without_text"] = "without_text"
+    scene_0_source: Literal["from_thumbnail_without_text", "from_thumbnail_with_text", "from_intro_transcript"] = "from_thumbnail_without_text"
     enable_intro_video: bool = True
     intro_scene_target_seconds: float = 8.0
     intro_crop_watermark: bool = True

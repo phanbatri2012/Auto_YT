@@ -29,6 +29,8 @@ DEFAULT_PROMPT_PIPELINE = {
 }
 
 THUMBNAIL_VARIANTS = {"with_text", "without_text"}
+SCENE_0_SOURCES = {"from_thumbnail_without_text", "from_thumbnail_with_text", "from_intro_transcript"}
+DEFAULT_SCENE_0_SOURCE = "from_thumbnail_without_text"
 DEFAULT_IMAGE_MODEL = "nano_banana_2"
 DEFAULT_VIDEO_MODEL = "omni_1_1_flash"
 
@@ -157,6 +159,7 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "density": 30,
     "outputs_per_scene": 1,
     "thumbnail_variant": "without_text",
+    "scene_0_source": DEFAULT_SCENE_0_SOURCE,
     "enable_intro_video": True,
     "intro_scene_target_seconds": 8.0,
     "intro_crop_watermark": True,
@@ -333,6 +336,11 @@ def normalize_image_generation_settings(value: object) -> dict:
         if settings.get("thumbnail_variant") in THUMBNAIL_VARIANTS
         else "without_text"
     )
+    normalized["scene_0_source"] = (
+        settings.get("scene_0_source")
+        if settings.get("scene_0_source") in SCENE_0_SOURCES
+        else DEFAULT_SCENE_0_SOURCE
+    )
     normalized["enable_intro_video"] = bool(settings.get("enable_intro_video", True))
     try:
         normalized["intro_scene_target_seconds"] = max(4.0, min(15.0, float(settings.get("intro_scene_target_seconds", 8.0) or 8.0)))
@@ -364,6 +372,8 @@ def validate_image_generation_settings(value: object) -> dict:
         )
     if settings.get("thumbnail_variant", "without_text") not in THUMBNAIL_VARIANTS:
         raise ValueError("Loại thumbnail upload không được hỗ trợ.")
+    if settings.get("scene_0_source", DEFAULT_SCENE_0_SOURCE) not in SCENE_0_SOURCES:
+        raise ValueError("Nguồn ảnh Scene 0 không được hỗ trợ.")
     return normalize_image_generation_settings(settings)
 
 

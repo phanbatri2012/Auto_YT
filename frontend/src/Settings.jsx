@@ -111,6 +111,7 @@ const DEFAULT_IMAGE_GENERATION_SETTINGS = {
   avoid_prompt: '',
   negative_prompt: '',
   thumbnail_variant: 'without_text',
+  scene_0_source: 'from_thumbnail_without_text',
   enable_intro_video: true,
   intro_scene_target_seconds: 8.0,
   intro_crop_watermark: true,
@@ -881,6 +882,14 @@ export default function Settings({
 
   const handleSavePublishing = async () => {
     const versionId = activeVersion;
+    const currentImg = promptsData.versions[versionId]?.image_generation_settings || {};
+    const negPrompt = currentImg.negative_prompt ?? currentImg.avoid_prompt ?? '';
+    const imgSettings = {
+      ...DEFAULT_IMAGE_GENERATION_SETTINGS,
+      ...currentImg,
+      negative_prompt: negPrompt,
+      avoid_prompt: negPrompt
+    };
     const settings = {
       ...DEFAULT_PUBLISHING_SETTINGS,
       ...promptsData.versions[versionId].publishing_settings,
@@ -890,14 +899,24 @@ export default function Settings({
       'publishing',
       'Đang lưu cấu hình đăng YouTube...',
       'Đã lưu cấu hình đăng YouTube.',
-      () => fetch(
-        `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/publishing`,
-        {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(settings)
-        }
-      )
+      async () => {
+        await fetch(
+          `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/image-generation`,
+          {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(imgSettings)
+          }
+        );
+        return fetch(
+          `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/publishing`,
+          {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(settings)
+          }
+        );
+      }
     );
     if (result?.version && activeVersion === versionId) {
       setPromptsData(prev => ({
@@ -1491,15 +1510,18 @@ export default function Settings({
               </label>
 
               <label>
-                Thumbnail dùng để upload
+                Nguồn ảnh Scene 0 (Ảnh mở đầu)
                 <select
                   className="version-select"
-                  value={currentImageGeneration.thumbnail_variant}
-                  onChange={event => handleThumbnailVariantChange(event.target.value)}
+                  value={currentImageGeneration.scene_0_source || 'from_thumbnail_without_text'}
+                  onChange={event => handlePromptSettingChange(
+                    'image_generation_settings', 'scene_0_source', event.target.value
+                  )}
                   disabled={activeVersionLocked}
                 >
-                  <option value="without_text">Không chữ</option>
-                  <option value="with_text">Có chữ</option>
+                  <option value="from_thumbnail_without_text">Từ Thumbnail không chữ (Đồng bộ ảnh bìa - Khuyên dùng)</option>
+                  <option value="from_thumbnail_with_text">Từ Thumbnail có chữ</option>
+                  <option value="from_intro_transcript">Theo kịch bản Intro (Không dùng Thumbnail)</option>
                 </select>
               </label>
 
@@ -1837,6 +1859,18 @@ export default function Settings({
             </button>
           </div>
           <div className="production-settings-grid">
+            <label>
+              Thumbnail dùng để upload
+              <select
+                className="version-select"
+                value={currentImageGeneration.thumbnail_variant}
+                onChange={event => handleThumbnailVariantChange(event.target.value)}
+                disabled={activeVersionLocked}
+              >
+                <option value="without_text">Không chữ</option>
+                <option value="with_text">Có chữ</option>
+              </select>
+            </label>
             <label>
               YouTube Category ID
               <input

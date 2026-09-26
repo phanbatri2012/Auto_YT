@@ -714,5 +714,18 @@ class PromptSettingsTests(unittest.TestCase):
             main._finish_chatgpt_operation()
 
 
+    def test_image_generation_saves_and_validates_scene_0_source(self):
+        result = main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                scene_0_source="from_intro_transcript",
+            ),
+        )
+        saved = self.read_saved_data()
+        saved_img = saved["versions"]["default"]["image_generation_settings"]
+        self.assertEqual(saved_img["scene_0_source"], "from_intro_transcript")
+        self.assertEqual(result["version"]["image_generation_settings"]["scene_0_source"], "from_intro_transcript")
+
+
 if __name__ == "__main__":
     unittest.main()

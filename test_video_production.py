@@ -727,6 +727,31 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertIn("y='(ih-ih/zoom)*(on/900)'", f4)
 
 
+    def test_scene_0_source_variants(self):
+        windows = [{"index": 0, "start": 0.0, "end": 8.0, "duration": 8.0, "transcript": "Mở đầu câu chuyện hấp dẫn"}]
+        script = (
+            "### [THUMBNAIL KHÔNG CHỮ]\n"
+            "Mô tả visual thumbnail không chữ cực đẹp [IMAGE_URL:/api/thumbnails/clean.png]\n\n"
+            "### [THUMBNAIL CÓ CHỮ]\n"
+            "Mô tả visual thumbnail có chữ giật gân [IMAGE_URL:/api/thumbnails/text.png]\n"
+        )
+        plan_clean = video_production.build_default_visual_scene_plan(
+            windows, "Tiêu đề", scene_0_source="from_thumbnail_without_text", generated_script=script
+        )
+        self.assertIn("Mô tả visual không chữ cực đẹp", plan_clean["scenes"][0]["prompt"])
+
+        plan_text = video_production.build_default_visual_scene_plan(
+            windows, "Tiêu đề", scene_0_source="from_thumbnail_with_text", generated_script=script
+        )
+        self.assertIn("Mô tả visual giật gân", plan_text["scenes"][0]["prompt"])
+
+        plan_intro = video_production.build_default_visual_scene_plan(
+            windows, "Tiêu đề", scene_0_source="from_intro_transcript", generated_script=script
+        )
+        self.assertNotIn("không chữ cực đẹp", plan_intro["scenes"][0]["prompt"])
+        self.assertIn("Mở đầu câu chuyện hấp dẫn", plan_intro["scenes"][0]["prompt"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

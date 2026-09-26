@@ -51,7 +51,10 @@ function getMetadataLabel(line) {
   if (['mo ta', 'mo ta video', 'description'].includes(label)) {
     return { type: 'description', value }
   }
-  if (['tag', 'tags', 'hashtag', 'hashtags'].includes(label)) {
+  if (['hashtag', 'hashtags'].includes(label)) {
+    return { type: 'hashtags', value }
+  }
+  if (['tag', 'tags', 'the tu khoa', 'the'].includes(label)) {
     return { type: 'tags', value }
   }
   if (['binh luan ghim', 'pinned comment'].includes(label)) {
@@ -95,6 +98,7 @@ function parseMetadataContent(content) {
     title: [],
     slug: [],
     description: [],
+    hashtags: [],
     tags: [],
     quiz: [],
     pinnedComment: []
@@ -132,7 +136,7 @@ function parseMetadataContent(content) {
     }
 
     if (/#[\p{L}\p{N}_-]+/u.test(trimmed) && currentField !== 'quiz') {
-      fields.tags.push(line)
+      fields.hashtags.push(line)
       hashtagsSeen = true
       currentField = null
       return
@@ -160,7 +164,8 @@ function buildDescriptionSection(metadata, chaptersContent) {
   const parts = []
   if (metadata.description) parts.push(metadata.description)
   if (chaptersContent) parts.push(chaptersContent)
-  if (metadata.tags) parts.push(metadata.tags)
+  if (metadata.hashtags) parts.push(metadata.hashtags)
+  else if (metadata.tags && metadata.tags.includes('#')) parts.push(metadata.tags)
 
   if (!parts.length) return null
   return {
@@ -179,6 +184,7 @@ export function parseVideoSections(text) {
     title: '',
     slug: '',
     description: '',
+    hashtags: '',
     tags: '',
     quiz: '',
     pinnedComment: ''
@@ -201,8 +207,10 @@ export function parseVideoSections(text) {
       metadata.slug = content.replace(/^[-*\s]+(?:url\s+)?slug:\s*/i, '').trim()
     } else if (tag === 'MÔ TẢ' || tag === 'MO TA' || tag === 'DESCRIPTION') {
       metadata.description = content.replace(/^[-*\s]+(?:mô\s+tả(?:\s+video)?|description):\s*/i, '').trim()
-    } else if (tag === 'TAGS' || tag === 'TAG' || tag === 'HASHTAGS' || tag === 'HASHTAG') {
-      metadata.tags = content.replace(/^[-*\s]+(?:tags?|hashtags?):\s*/i, '').trim()
+    } else if (tag === 'HASHTAGS' || tag === 'HASHTAG') {
+      metadata.hashtags = content.replace(/^[-*\s]+(?:hashtags?):\s*/i, '').trim()
+    } else if (tag === 'TAGS' || tag === 'TAG' || tag === 'THẺ TỪ KHÓA' || tag === 'THE TU KHOA') {
+      metadata.tags = content.replace(/^[-*\s]+(?:tags?|thẻ(?:\s+từ\s+khóa)?):\s*/i, '').trim()
     } else if (tag === 'BÌNH LUẬN GHIM' || tag === 'BINH LUAN GHIM' || tag === 'PINNED COMMENT') {
       metadata.pinnedComment = content.replace(/^[-*\s]+(?:bình\s+luận\s+ghim|pinned\s+comment):\s*/i, '').trim()
     } else if (tag === 'QUIZ' || tag === 'QUIZ TƯƠNG TÁC' || tag === 'QUIZ TUONG TAC') {
@@ -232,6 +240,9 @@ export function parseVideoSections(text) {
   const descriptionSection = buildDescriptionSection(metadata, chaptersContent)
   if (descriptionSection) sections.push(descriptionSection)
 
+  if (metadata.tags && !metadata.tags.includes('#')) {
+    sections.push({ title: 'THẺ TỪ KHÓA (TAGS)', content: metadata.tags })
+  }
   if (metadata.quiz) {
     sections.push({ title: 'QUIZ', content: metadata.quiz })
   }

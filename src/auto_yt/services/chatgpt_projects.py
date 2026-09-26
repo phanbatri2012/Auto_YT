@@ -16,6 +16,7 @@ DEFAULT_PROMPT_PIPELINE = {
     "title": True,
     "slug": True,
     "description": True,
+    "hashtags": True,
     "tags": True,
     "pinned_comment": True,
     "quiz": True,
@@ -173,8 +174,10 @@ DEFAULT_PUBLISHING_SETTINGS = {
     "language": "vi",
     "made_for_kids": None,
     "notify_subscribers": True,
+    "include_tags": True,
+    "default_tags": "",
     "contains_synthetic_media": True,
-    "description_template": "{description}\n\n{chapters}\n\n{tags}",
+    "description_template": "{description}\n\n{chapters}\n\n{hashtags}",
 }
 
 
@@ -229,7 +232,7 @@ def normalize_prompt_pipeline(
         if isinstance(pipeline.get(key), bool):
             normalized[key] = pipeline[key]
         elif (
-            key in {"title", "slug", "description", "tags", "pinned_comment", "quiz"}
+            key in {"title", "slug", "description", "hashtags", "tags", "pinned_comment", "quiz"}
             and isinstance(legacy_metadata, bool)
         ):
             normalized[key] = legacy_metadata
@@ -394,6 +397,12 @@ def normalize_publishing_settings(value: object) -> dict:
         if isinstance(settings.get("notify_subscribers"), bool)
         else True
     )
+    normalized["include_tags"] = (
+        settings.get("include_tags")
+        if isinstance(settings.get("include_tags"), bool)
+        else True
+    )
+    normalized["default_tags"] = str(settings.get("default_tags") or "").strip()
     # All videos produced by this pipeline use synthetic scene images.
     normalized["contains_synthetic_media"] = True
     template_val = settings.get("description_template")
@@ -426,6 +435,14 @@ def validate_publishing_settings(value: object) -> dict:
     notify_subscribers = settings.get("notify_subscribers", True)
     if not isinstance(notify_subscribers, bool):
         raise ValueError("Thiết lập thông báo người đăng ký không hợp lệ.")
+    include_tags = settings.get("include_tags", True)
+    if not isinstance(include_tags, bool):
+        raise ValueError("Thiết lập đính kèm thẻ từ khóa (include_tags) phải là Có hoặc Không.")
+    default_tags = settings.get("default_tags", "")
+    if default_tags is not None and not isinstance(default_tags, str):
+        raise ValueError("Thẻ từ khóa mặc định phải là chuỗi ký tự.")
+    if isinstance(default_tags, str) and len(default_tags) > 500:
+        raise ValueError("Thẻ từ khóa mặc định không được vượt quá 500 ký tự.")
     desc_template = settings.get("description_template")
     if desc_template is not None and not isinstance(desc_template, str):
         raise ValueError("Mẫu mô tả YouTube phải là chuỗi ký tự.")

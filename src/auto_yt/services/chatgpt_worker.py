@@ -1243,13 +1243,14 @@ def build_metadata_generation_prompt(metadata_prompt: str) -> str:
         f"{metadata_prompt.strip()}\n\n"
         "LƯU Ý QUAN TRỌNG: Hãy tạo lại đầy đủ toàn bộ phần metadata theo "
         "đúng yêu cầu trên, bao gồm TIÊU ĐỀ, URL SLUG, MÔ TẢ, HASHTAG, "
-        "BÌNH LUẬN GHIM và QUIZ. Trả lời trực tiếp, không chào hỏi, không "
+        "TAGS, BÌNH LUẬN GHIM và QUIZ. Trả lời trực tiếp, không chào hỏi, không "
         "giải thích và không thêm nội dung ngoài metadata.\n\n"
         "BẮT BUỘC trình bày theo đúng mẫu nhãn sau:\n"
         "TIÊU ĐỀ: ...\n"
         "URL SLUG: ...\n"
         "MÔ TẢ VIDEO: ...\n"
         "HASHTAG: #... #... #...\n"
+        "TAGS: từ khóa 1, từ khóa 2, từ khóa 3, ...\n"
         "BÌNH LUẬN GHIM: ...\n"
         "CÂU HỎI: ...\n"
         "A. ...\nB. ...\nC. ...\nD. ...\n"
@@ -1297,7 +1298,7 @@ def build_metadata_retry_prompt(missing_sections: list[str]) -> str:
         + ", ".join(missing_sections)
         + ". Hãy tạo lại TOÀN BỘ metadata, không chỉ bổ sung phần thiếu. "
         "BẮT BUỘC xuất đủ các nhãn: TIÊU ĐỀ, URL SLUG, MÔ TẢ VIDEO, "
-        "HASHTAG, BÌNH LUẬN GHIM, CÂU HỎI, bốn lựa chọn A/B/C/D, "
+        "HASHTAG, TAGS, BÌNH LUẬN GHIM, CÂU HỎI, bốn lựa chọn A/B/C/D, "
         "CÂU TRẢ LỜI ĐÚNG và GIẢI THÍCH. Trả lời trực tiếp, không chào hỏi "
         "và không thêm nội dung ngoài metadata."
     )
@@ -2434,13 +2435,15 @@ def build_video_script(state: dict) -> str:
         sections.append(f"### [SLUG]\n{state.get('slug', '').strip()}")
     if state.get("description"):
         sections.append(f"### [MÔ TẢ]\n{state.get('description', '').strip()}")
+    if state.get("hashtags"):
+        sections.append(f"### [HASHTAGS]\n{state.get('hashtags', '').strip()}")
     if state.get("tags"):
         sections.append(f"### [TAGS]\n{state.get('tags', '').strip()}")
     if state.get("pinned_comment"):
         sections.append(f"### [BÌNH LUẬN GHIM]\n{state.get('pinned_comment', '').strip()}")
     if state.get("quiz"):
         sections.append(f"### [QUIZ]\n{state.get('quiz', '').strip()}")
-    if not any(state.get(k) for k in ("title", "slug", "description", "tags", "pinned_comment", "quiz")) and state.get("metadata"):
+    if not any(state.get(k) for k in ("title", "slug", "description", "hashtags", "tags", "pinned_comment", "quiz")) and state.get("metadata"):
         sections.append(f"### [METADATA & QUIZ]\n{state.get('metadata', '').strip()}")
     if state.get("chapters"):
         sections.append(f"### [CHAPTERS]\n{state.get('chapters', '').strip()}")
@@ -2750,9 +2753,24 @@ def _run_complete(transcript: str, state: dict) -> dict:
             clear_pending_generation_prompt(state, "description", prompt_desc)
             persist_generation_state(state)
 
-        # Step 9: Tags / Hashtags
+        # Step 9: Hashtags (cho mô tả)
+        if pipeline.get("hashtags", True) and not state.get("hashtags"):
+            print(">>> BƯỚC 9: TẠO HASHTAGS", file=sys.stderr)
+            prompt_hashtags = (prompts.get("hashtags", "") or prompts.get("tags", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "hashtags"
+            hashtags = send_or_recover_generation_prompt(
+                page,
+                state,
+                "hashtags",
+                prompt_hashtags,
+            )
+            state["hashtags"] = hashtags
+            clear_pending_generation_prompt(state, "hashtags", prompt_hashtags)
+            persist_generation_state(state)
+
+        # Step 10: Thẻ từ khóa (Tags YouTube)
         if pipeline.get("tags", True) and not state.get("tags"):
-            print(">>> BƯỚC 9: TẠO TAGS / HASHTAGS", file=sys.stderr)
+            print(">>> BƯỚC 10: TẠO THẺ TỪ KHÓA (TAGS)", file=sys.stderr)
             prompt_tags = (prompts.get("tags", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
             state["current_step"] = "tags"
             tags = send_or_recover_generation_prompt(
@@ -2765,9 +2783,9 @@ def _run_complete(transcript: str, state: dict) -> dict:
             clear_pending_generation_prompt(state, "tags", prompt_tags)
             persist_generation_state(state)
 
-        # Step 10: Bình luận ghim (Pinned comment)
+        # Step 11: Bình luận ghim (Pinned comment)
         if pipeline.get("pinned_comment", True) and not state.get("pinned_comment"):
-            print(">>> BƯỚC 10: TẠO BÌNH LUẬN GHIM", file=sys.stderr)
+            print(">>> BƯỚC 11: TẠO BÌNH LUẬN GHIM", file=sys.stderr)
             prompt_pinned = (prompts.get("pinned_comment", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
             state["current_step"] = "pinned_comment"
             pinned = send_or_recover_generation_prompt(
@@ -2780,9 +2798,9 @@ def _run_complete(transcript: str, state: dict) -> dict:
             clear_pending_generation_prompt(state, "pinned_comment", prompt_pinned)
             persist_generation_state(state)
 
-        # Step 11: Quiz tương tác
+        # Step 12: Quiz tương tác
         if pipeline.get("quiz", True) and not state.get("quiz"):
-            print(">>> BƯỚC 11: TẠO QUIZ TƯƠNG TÁC", file=sys.stderr)
+            print(">>> BƯỚC 12: TẠO QUIZ TƯƠNG TÁC", file=sys.stderr)
             prompt_quiz = (prompts.get("quiz", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
             state["current_step"] = "quiz"
             quiz = send_or_recover_generation_prompt(
@@ -2796,7 +2814,7 @@ def _run_complete(transcript: str, state: dict) -> dict:
             persist_generation_state(state)
 
         # Legacy metadata fallback if individual steps are not configured but metadata is on
-        if pipeline.get("metadata") and not any(state.get(k) for k in ("title", "slug", "description", "tags", "pinned_comment", "quiz")) and not state.get("metadata"):
+        if pipeline.get("metadata") and not any(state.get(k) for k in ("title", "slug", "description", "hashtags", "tags", "pinned_comment", "quiz")) and not state.get("metadata"):
             print(">>> BƯỚC CŨ: TẠO METADATA & QUIZ", file=sys.stderr)
             prompt6 = prompts.get("metadata", "") + STRICT_NO_FILLER
             state["current_step"] = "metadata"
@@ -2810,9 +2828,9 @@ def _run_complete(transcript: str, state: dict) -> dict:
             clear_pending_generation_prompt(state, "metadata", prompt6)
             persist_generation_state(state)
 
-        # Step 12: Chapters
+        # Step 13: Chapters
         if pipeline.get("chapters", True) and not state.get("chapters"):
-            print(">>> BƯỚC 12: TẠO CHAPTERS", file=sys.stderr)
+            print(">>> BƯỚC 13: TẠO CHAPTERS", file=sys.stderr)
             prompt7 = prompts.get("chapters", "") + STRICT_NO_FILLER
             state["current_step"] = "chapters"
             try:

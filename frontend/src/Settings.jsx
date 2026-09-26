@@ -5,6 +5,7 @@ const DEFAULT_PIPELINE = {
   title: true,
   slug: true,
   description: true,
+  hashtags: true,
   tags: true,
   pinned_comment: true,
   quiz: true,
@@ -125,6 +126,8 @@ const DEFAULT_PUBLISHING_SETTINGS = {
   language: 'vi',
   made_for_kids: null,
   notify_subscribers: true,
+  include_tags: true,
+  default_tags: '',
   contains_synthetic_media: true,
   description_template: ''
 };
@@ -164,9 +167,14 @@ const PIPELINE_STEPS = [
     description: 'Tự động tạo đoạn mô tả video chuẩn SEO.'
   },
   {
+    key: 'hashtags',
+    label: 'Hashtags (cho mô tả)',
+    description: 'Tự động tạo 3–5 hashtag #... chèn vào mô tả video.'
+  },
+  {
     key: 'tags',
-    label: 'Tags & Hashtags',
-    description: 'Tự động tạo tags và hashtags liên quan.'
+    label: 'Thẻ từ khóa (Tags YouTube)',
+    description: 'Tự động tạo danh sách 10–15 tags tối ưu SEO tìm kiếm YouTube.'
   },
   {
     key: 'pinned_comment',
@@ -1049,12 +1057,13 @@ export default function Settings({
     { key: 'title', label: '5. Tiêu đề (Title)' },
     { key: 'slug', label: '6. URL Slug (Dùng đặt tên file render MP4)' },
     { key: 'description', label: '7. Mô tả video (Description)' },
-    { key: 'tags', label: '8. Tags & Hashtags' },
-    { key: 'pinned_comment', label: '9. Bình luận ghim' },
-    { key: 'quiz', label: '10. Quiz tương tác' },
-    { key: 'chapters', label: '11. Phân đoạn (Chapters)' },
-    { key: 'thumb_text', label: '12. Thumbnail (Có chữ)' },
-    { key: 'thumb_notext', label: '13. Thumbnail (Không chữ)' },
+    { key: 'hashtags', label: '8. Hashtags (cho mô tả)' },
+    { key: 'tags', label: '9. Thẻ từ khóa (Tags YouTube)' },
+    { key: 'pinned_comment', label: '10. Bình luận ghim' },
+    { key: 'quiz', label: '11. Quiz tương tác' },
+    { key: 'chapters', label: '12. Phân đoạn (Chapters)' },
+    { key: 'thumb_text', label: '13. Thumbnail (Có chữ)' },
+    { key: 'thumb_notext', label: '14. Thumbnail (Không chữ)' },
   ];
 
 
@@ -1924,8 +1933,8 @@ export default function Settings({
           <div className="help-text" style={{ marginTop: 8, fontSize: '0.84rem', color: '#94a3b8', lineHeight: 1.5 }}>
             💡 <strong>YouTube Category ID:</strong> Nếu để trống, hệ thống sẽ tự động dùng mặc định là <strong>22 (People & Blogs / Mọi người & Blog)</strong>. Bạn có thể chọn nhanh từ danh sách gợi ý hoặc nhập ID tùy chỉnh (VD: <code>22</code>: Blogs, <code>24</code>: Giải trí, <code>27</code>: Giáo dục, <code>28</code>: Khoa học & CN, <code>10</code>: Âm nhạc, <code>20</code>: Trò chơi, <code>1</code>: Phim).
           </div>
-          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 12 }}>
-            <label>
+          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 12, alignItems: 'center' }}>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
               <input
                 type="checkbox"
                 checked={currentPublishing.notify_subscribers}
@@ -1935,8 +1944,39 @@ export default function Settings({
                 disabled={activeVersionLocked}
               /> Thông báo người đăng ký khi video được công khai
             </label>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={currentPublishing.include_tags ?? true}
+                onChange={event => handlePromptSettingChange(
+                  'publishing_settings', 'include_tags', event.target.checked
+                )}
+                disabled={activeVersionLocked}
+              /> Đính kèm thẻ từ khóa (Tags) khi upload video
+            </label>
             <span style={{ color: '#4dd0e1' }}>✓ Luôn khai báo nội dung tổng hợp bằng AI</span>
           </div>
+          {currentPublishing.include_tags !== false && (
+            <div style={{ marginTop: 12 }}>
+              <label style={{ fontWeight: 600, color: '#fff', display: 'block', marginBottom: 6 }}>
+                🏷️ Thẻ từ khóa mặc định / cố định (Default Tags)
+              </label>
+              <input
+                type="text"
+                className="version-select"
+                style={{ width: '100%' }}
+                value={currentPublishing.default_tags || ''}
+                onChange={event => handlePromptSettingChange(
+                  'publishing_settings', 'default_tags', event.target.value
+                )}
+                placeholder="Ví dụ: dinh doan phan tich, đinh đoàn, tam ly hoc, ke chuyen gia dinh"
+                disabled={activeVersionLocked}
+              />
+              <div className="help-text" style={{ marginTop: 4 }}>
+                Các thẻ này sẽ được tự động gộp chung với tags do AI sinh ra khi upload lên YouTube (phân cách bằng dấu phẩy, tối đa 500 ký tự).
+              </div>
+            </div>
+          )}
           <div style={{ marginTop: 16, paddingTop: 14, borderTop: '1px solid rgba(255, 255, 255, 0.1)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, flexWrap: 'wrap', gap: 8 }}>
               <label style={{ fontWeight: 600, color: '#fff', margin: 0 }}>
@@ -1947,6 +1987,7 @@ export default function Settings({
                   { tag: '{title}', label: '+ Tiêu đề' },
                   { tag: '{slug}', label: '+ Slug' },
                   { tag: '{description}', label: '+ Mô tả' },
+                  { tag: '{hashtags}', label: '+ Hashtags' },
                   { tag: '{tags}', label: '+ Tags' },
                   { tag: '{pinned_comment}', label: '+ Ghim' },
                   { tag: '{quiz}', label: '+ Quiz' },
@@ -1971,7 +2012,7 @@ export default function Settings({
               </div>
             </div>
             <div className="help-text" style={{ marginBottom: 8 }}>
-              Tùy biến nội dung mô tả sẽ được dùng khi upload lên YouTube. Nhấp các nút trên để chèn nhanh biến động. Nếu để trống, hệ thống sẽ tự động ghép theo thứ tự mặc định: Mô tả → Chapters → Tags.
+              Tùy biến nội dung mô tả sẽ được dùng khi upload lên YouTube. Nhấp các nút trên để chèn nhanh biến động. Nếu để trống, hệ thống sẽ tự động ghép theo thứ tự mặc định: Mô tả → Chapters → Hashtags.
             </div>
             <textarea
               className="prompt-textarea"
@@ -1980,7 +2021,7 @@ export default function Settings({
               onChange={event => handlePromptSettingChange(
                 'publishing_settings', 'description_template', event.target.value
               )}
-              placeholder="Ví dụ:\n{description}\n\n--- DANH SÁCH PHÂN ĐOẠN ---\n{chapters}\n\n--- TƯƠNG TÁC CÙNG KÊNH ---\n{pinned_comment}\n\n{quiz}\n\n{tags}"
+              placeholder="Ví dụ:\n{description}\n\n--- DANH SÁCH PHÂN ĐOẠN ---\n{chapters}\n\n--- TƯƠNG TÁC CÙNG KÊNH ---\n{pinned_comment}\n\n{quiz}\n\n{hashtags}"
               disabled={activeVersionLocked}
             />
           </div>

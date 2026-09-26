@@ -151,20 +151,24 @@ def build_actual_youtube_description(video: dict, publishing_settings: dict | No
     title = str(video.get("generated_title") or db.extract_generated_video_title(script) or video.get("title") or "").strip()
     slug = db.extract_generated_video_slug(script, default_title=title)
     description = db.extract_generated_video_description(script)
+    hashtags = db.extract_generated_video_hashtags(script)
     tags = db.extract_generated_video_tags(script)
+    if not hashtags and tags and "#" in tags:
+        hashtags = tags
     pinned_comment = db.extract_generated_video_pinned_comment(script)
     quiz = db.extract_generated_video_quiz(script)
     chapters = db.extract_generated_video_chapters(script)
 
     template = str(settings.get("description_template") or "").strip()
     if not template:
-        template = "{description}\n\n{chapters}\n\n{tags}"
+        template = "{description}\n\n{chapters}\n\n{hashtags}"
 
     replacements = {
         "{title}": title,
         "{slug}": slug,
         "{description}": description,
-        "{tags}": tags,
+        "{hashtags}": hashtags,
+        "{tags}": hashtags or tags,  # Fallback for templates using {tags}
         "{pinned_comment}": pinned_comment,
         "{quiz}": quiz,
         "{chapters}": chapters,
@@ -197,16 +201,51 @@ def build_upload_metadata(video: dict, publishing_settings: dict) -> dict:
     category_id = str(publishing_settings.get("category_id") or "22").strip() or "22"
     made_for_kids = bool(publishing_settings.get("made_for_kids", False))
 
-    tags_extracted: list[str] = []
-    script_tags = db.extract_generated_video_tags(video.get("generated_script") or "")
-    if script_tags:
-        for t in re.findall(r"(?<!\w)#([\w-]+)", script_tags):
-            if t not in tags_extracted:
-                tags_extracted.append(t)
-    for t in re.findall(r"(?<!\w)#([\w-]+)", description):
-        if t not in tags_extracted:
-            tags_extracted.append(t)
-    tags = tags_extracted[:30]
+    include_tags = bool(publishing_settings.get("include_tags", True))
+    tags: list[str] = []
+
+    if include_tags:
+        script = video.get("generated_script") or ""
+        tags_raw: list[str] = []
+
+        # 1. AI Video Tags from script
+        script_tags = db.extract_generated_video_tags(script)
+        if script_tags:
+            parts = re.split(r"[,;\n]+", script_tags)
+            tags_raw.extend([p.strip().lstrip("#").strip() for p in parts if p.strip()])
+        else:
+            # Fallback to hashtags if no dedicated TAGS section
+            script_hashtags = db.extract_generated_video_hashtags(script)
+            if script_hashtags:
+                tags_raw.extend(re.findall(r"(?<!\w)#([\w-]+)", script_hashtags))
+            elif description:
+                tags_raw.extend(re.findall(r"(?<!\w)#([\w-]+)", description))
+
+        # 2. Default tags from publishing_settings
+        default_tags_str = str(publishing_settings.get("default_tags") or "").strip()
+        if default_tags_str:
+            parts = re.split(r"[,;\n]+", default_tags_str)
+            tags_raw.extend([p.strip().lstrip("#").strip() for p in parts if p.strip()])
+
+        # 3. Deduplicate preserving order and enforce YouTube limits (<= 30 tags, <= 480 total chars)
+        seen_lower = set()
+        deduped_tags: list[str] = []
+        total_len = 0
+        for tag in tags_raw:
+            cleaned = tag.strip().strip('"\'`')
+            if not cleaned or len(cleaned) > 100:
+                continue
+            cleaned_lower = cleaned.lower()
+            if cleaned_lower in seen_lower:
+                continue
+            if total_len + len(cleaned) + 1 > 480:
+                break
+            seen_lower.add(cleaned_lower)
+            deduped_tags.append(cleaned)
+            total_len += len(cleaned) + 1
+            if len(deduped_tags) >= 30:
+                break
+        tags = deduped_tags
 
     language = str(publishing_settings.get("language") or "vi").strip() or "vi"
     audio_language = str(publishing_settings.get("audio_language") or language).strip() or language

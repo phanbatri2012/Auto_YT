@@ -26,7 +26,14 @@ METADATA_FIELD_LABELS = GENERATED_TITLE_LABELS | GENERATED_DESCRIPTION_LABELS | 
     "URL SLUG",
     "SLUG",
     "HASHTAG",
+    "HASHTAGS",
+    "TAG",
+    "TAGS",
+    "THE TU KHOA",
+    "THE",
     "BINH LUAN GHIM",
+    "PINNED COMMENT",
+    "PINNED_COMMENT",
     "CAU HOI",
     "CAU HOI KHAN GIA",
     "DAP AN DUNG",
@@ -52,8 +59,12 @@ DESCRIPTION_SECTION_PATTERN = re.compile(
     r"### \[(?:MÔ TẢ|DESCRIPTION|MÔ TẢ VIDEO)\]\n(.*?)(?=\n### \[|\Z)",
     flags=re.DOTALL,
 )
+HASHTAGS_SECTION_PATTERN = re.compile(
+    r"### \[(?:HASHTAGS|HASHTAG)\]\n(.*?)(?=\n### \[|\Z)",
+    flags=re.DOTALL,
+)
 TAGS_SECTION_PATTERN = re.compile(
-    r"### \[(?:TAGS|HASHTAG|HASHTAGS|TAG)\]\n(.*?)(?=\n### \[|\Z)",
+    r"### \[(?:TAGS|TAG|THẺ TỪ KHÓA|THE TU KHOA|THẺ)\]\n(.*?)(?=\n### \[|\Z)",
     flags=re.DOTALL,
 )
 PINNED_COMMENT_SECTION_PATTERN = re.compile(
@@ -191,22 +202,43 @@ def extract_generated_video_description(generated_script: str) -> str:
     return ""
 
 
-def extract_generated_video_tags(generated_script: str) -> str:
+def extract_generated_video_hashtags(generated_script: str) -> str:
     if not generated_script:
         return ""
-    tags_match = TAGS_SECTION_PATTERN.search(generated_script)
-    if tags_match:
-        return tags_match.group(1).strip()
+    hashtags_match = HASHTAGS_SECTION_PATTERN.search(generated_script)
+    if hashtags_match:
+        val = hashtags_match.group(1).strip()
+        return re.sub(r"^[-*\s]*(?:hashtags?|thẻ\s+hashtag):\s*", "", val, flags=re.IGNORECASE).strip()
     metadata_match = METADATA_SECTION_PATTERN.search(generated_script)
     if metadata_match:
         lines = metadata_match.group(1).splitlines()
         for line in lines:
             line_clean = line.strip().strip("#*` ")
             label, separator, inline_value = line_clean.partition(":")
-            if separator and _normalize_metadata_label(label) in {"TAG", "TAGS", "HASHTAG", "HASHTAGS"}:
+            if separator and _normalize_metadata_label(label) in {"HASHTAG", "HASHTAGS"}:
                 return inline_value.strip()
-            if "#" in line and not line.startswith("###"):
-                return line.strip()
+            if "#" in line and not line.startswith("###") and not line.upper().startswith("TAGS:"):
+                matches = re.findall(r"(?<!\w)#[\w-]+", line)
+                if matches:
+                    return " ".join(matches)
+    return ""
+
+
+def extract_generated_video_tags(generated_script: str) -> str:
+    if not generated_script:
+        return ""
+    tags_match = TAGS_SECTION_PATTERN.search(generated_script)
+    if tags_match:
+        val = tags_match.group(1).strip()
+        return re.sub(r"^[-*\s]*(?:tags?|thẻ(?:\s+từ\s+khóa)?):\s*", "", val, flags=re.IGNORECASE).strip()
+    metadata_match = METADATA_SECTION_PATTERN.search(generated_script)
+    if metadata_match:
+        lines = metadata_match.group(1).splitlines()
+        for line in lines:
+            line_clean = line.strip().strip("#*` ")
+            label, separator, inline_value = line_clean.partition(":")
+            if separator and _normalize_metadata_label(label) in {"TAG", "TAGS", "THE TU KHOA", "THE"}:
+                return inline_value.strip()
     return ""
 
 

@@ -60,10 +60,35 @@ class TestSanitizeCitations(unittest.TestCase):
         self.assertIn("Đoạn văn thứ nhất.", cleaned)
         self.assertIn("Đoạn văn thứ hai.", cleaned)
 
+    def test_remove_searched_websites_variants(self):
+        raw = (
+            "Searched 15 websites\n"
+            "[Searched 8 websites]\n"
+            "Xin chào quý vị khán giả đang theo dõi kênh Đinh Đoàn Phân Tích."
+        )
+        cleaned = clean_text(raw)
+        self.assertNotIn("Searched 15 websites", cleaned)
+        self.assertNotIn("Searched 8 websites", cleaned)
+        self.assertEqual(
+            cleaned,
+            "Xin chào quý vị khán giả đang theo dõi kênh Đinh Đoàn Phân Tích.",
+        )
+
+    def test_remove_canvas_headers(self):
+        cases = [
+            ("Mở đầu video: Xin chào quý vị khán giả.", "Xin chào quý vị khán giả."),
+            ("Mở đầu:\nXin chào quý vị khán giả.", "Xin chào quý vị khán giả."),
+            ("Thân bài video: Khi quân đội Mỹ trực tiếp đưa lực lượng...", "Khi quân đội Mỹ trực tiếp đưa lực lượng..."),
+            ("Nội dung chính: Đây là câu chuyện về...", "Đây là câu chuyện về..."),
+        ]
+        for raw, expected in cases:
+            self.assertEqual(clean_text(raw), expected)
+
     def test_sanitize_generated_script_with_citations(self):
         script = (
             "### [INTRO]\n"
-            "Chào mừng quý vị đến với phân tích lịch sử.\n\n"
+            "Searched 15 websites\n"
+            "Mở đầu video: Chào mừng quý vị đến với phân tích lịch sử.\n\n"
             "### [BODY]\n"
             "Liên minh nhận được sự hậu thuẫn quốc tế.\n"
             "Digital Library\n"
@@ -77,6 +102,9 @@ class TestSanitizeCitations(unittest.TestCase):
         result = sanitize_generated_script(script)
         self.assertNotIn("Digital Library", result)
         self.assertNotIn("+1", result)
+        self.assertNotIn("Searched 15 websites", result)
+        self.assertNotIn("Mở đầu video:", result)
+        self.assertIn("Chào mừng quý vị đến với phân tích lịch sử.", result)
         self.assertIn("Liên minh nhận được sự hậu thuẫn quốc tế.", result)
         self.assertIn("Bên trong Khmer Đỏ, sự suy yếu ngày càng lộ rõ.", result)
         self.assertIn("### [TIÊU ĐỀ]\nPÔN PỐT VÀ SỰ SỤP ĐỔ CỦA KHMER ĐỎ", result)

@@ -373,6 +373,7 @@ class PromptSettingsTests(unittest.TestCase):
             "title": True,
             "slug": True,
             "description": True,
+            "hashtags": True,
             "tags": True,
             "pinned_comment": True,
             "quiz": True,

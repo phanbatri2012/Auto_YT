@@ -156,6 +156,7 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
             "title": True,
             "slug": True,
             "description": True,
+            "hashtags": True,
             "tags": True,
             "pinned_comment": True,
             "quiz": True,
@@ -211,7 +212,7 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
 
     def test_partial_body_is_saved_as_draft_without_audio_submission(self):
         partial_script = (
-            "### [INTRO]\nIntro\n\n"
+            "### [INTRO]\nIntro câu chuyện bắt đầu.\n\n"
             "### [BODY]\nOnly body one\n\n"
             "### [OUTRO]\n\n"
             "### [METADATA & QUIZ]\n\n"
@@ -258,7 +259,7 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
                 return_value={
                     "chat_url": "https://chatgpt.com/c/test",
                     "current_step": "body 2/3",
-                    "intro": "Intro",
+                    "intro": "Intro câu chuyện bắt đầu.",
                     "body_parts": ["Only body one"],
                 },
             ),
@@ -655,6 +656,7 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
             "title": False,
             "slug": False,
             "description": False,
+            "hashtags": False,
             "tags": False,
             "pinned_comment": False,
             "quiz": False,

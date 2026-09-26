@@ -105,9 +105,16 @@ THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS = 5 * 60
 THUMBNAIL_TURN_WAIT_TIMEOUT_SECONDS = 30
 MAX_THUMBNAIL_IMAGES_PER_RESPONSE = 2
 NARRATIVE_ONLY_INSTRUCTION = (
-    "\n\nYÊU CẦU ĐẦU RA CHO PHẦN NỘI DUNG: Chỉ viết văn xuôi liền mạch. "
+    "\n\nYÊU CẦU ĐẦU RA CHO PHẦN NỘI DUNG: Chỉ viết văn xuôi liền mạch trong tin nhắn chat thông thường. "
+    "TUYỆT ĐỐI KHÔNG mở Canvas, KHÔNG tạo document/tài liệu rời hay artifact riêng. "
     "Không chèn tiêu đề, nhãn chuyển đoạn, dàn ý, ghi chú biên tập hoặc "
     "chỉ dẫn về cách viết."
+)
+STRICT_NO_FILLER = (
+    "\n\nLƯU Ý QUAN TRỌNG: TRẢ LỜI TRỰC TIẾP VÀO NỘI DUNG BẰNG TIN NHẮN VĂN BẢN THƯỜNG TRONG KHUNG CHAT. "
+    "TUYỆT ĐỐI KHÔNG MỞ CANVAS, KHÔNG TẠO DOCUMENT/TÀI LIỆU RỜI. "
+    "TUYỆT ĐỐI KHÔNG CHÀO HỎI, KHÔNG DẠ VÂNG, KHÔNG THÊM BẤT KỲ CÂU DẪN HAY GIẢI THÍCH NÀO "
+    "(VD: 'Dưới đây là...', 'Trân trọng gửi bạn...'). CHỈ IN RA ĐÚNG NỘI DUNG CẦN VIẾT."
 )
 THUMBNAIL_IMAGE_SELECTOR = (
     'img[src*="backend-api/estuary"], '
@@ -1445,17 +1452,28 @@ def remove_citation_artifacts(text: str) -> str:
     cleaned = re.sub(r"【\d+(?::\d+)?†[a-zA-Z]+】", "", text)
     # 2. Web search status/indicator lines
     cleaned = re.sub(
-        r"(?im)^\s*(?:Searched\s+\d+\s+sites?|Đã tìm kiếm\s+\d+\s+trang web|Tìm kiếm:\s*.+|Search results?|Sources?|Nguồn(?:\s+tham khảo)?)(?::)?\s*$",
+        r"(?im)^\s*(?:\[?\s*Searched\s+\d+\s+(?:sites?|websites?)\s*\]?|\[?\s*Đã tìm kiếm\s+\d+\s+(?:trang\s*web|website|trang)\s*\]?|Tìm kiếm:\s*.+|Search results?|Sources?|Nguồn(?:\s+tham khảo)?)(?::)?\s*$",
         "",
         cleaned,
     )
-    # 3. Citation pill badges: e.g. "Digital Library\n+1" or "Wikipedia\n+2"
+    # 3. Inline search indicator badges if attached anywhere
+    cleaned = re.sub(
+        r"(?i)\[?\bSearched\s+\d+\s+(?:sites?|websites?)\b\]?",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?i)\[?\bĐã tìm kiếm\s+\d+\s+(?:trang\s*web|website|trang)\b\]?",
+        "",
+        cleaned,
+    )
+    # 4. Citation pill badges: e.g. "Digital Library\n+1" or "Wikipedia\n+2"
     cleaned = re.sub(
         r"(?im)(?:(?<=\n)|\s+)[A-Za-z0-9\s.,'’\-–—&/]{1,80}\s*\n\s*\+[0-9]+\s*(?=\n|$)",
         "",
         cleaned,
     )
-    # 4. Isolated line with +N or [+N]
+    # 5. Isolated line with +N or [+N]
     cleaned = re.sub(r"(?m)^\s*\[?\+[0-9]+\]?\s*$", "", cleaned)
     return cleaned
 
@@ -1464,7 +1482,10 @@ def looks_like_citation_artifact(text: str) -> bool:
     lowered = text.strip().lower()
     if re.match(r"^\[?\+[0-9]+\]?$", lowered):
         return True
-    if re.match(r"^(?:searched\s+\d+\s+sites?|đã tìm kiếm\s+\d+\s+trang web|tìm kiếm:|search results?|sources?|nguồn(?:\s+tham khảo)?)\b", lowered):
+    if re.match(
+        r"^(?:\[?\s*searched\s+\d+\s+(?:sites?|websites?)|\[?\s*đã tìm kiếm\s+\d+\s+(?:trang\s*web|website|trang)|tìm kiếm:|search results?|sources?|nguồn(?:\s+tham khảo)?)\b",
+        lowered,
+    ):
         return True
     return False
 
@@ -1475,9 +1496,9 @@ def clean_text(text: str) -> str:
         return ""
     text = remove_citation_artifacts(text)
     
-    # Strip inline structural/canvas headers prepended to paragraphs (e.g. "Nội dung chính: ...", "Mở đầu video: ...")
+    # Strip inline structural/canvas headers prepended to paragraphs (e.g. "Nội dung chính: ...", "Mở đầu video: ...", "Mở đầu:")
     canvas_inline_header = re.compile(
-        r"^(?:(?:mở\s+(?:đầu|bài)|kết\s+(?:thúc|bài|luận)|intro|body|outro|thân\s+bài)\s+(?:video|kịch\s+bản|bài\s+viết)|nội\s+dung\s+chính)\s*[:\-–—]?\s*",
+        r"^(?:(?:mở\s+(?:đầu|bài)|kết\s+(?:thúc|bài|luận)|intro|body|outro|thân\s+bài)\s+(?:video|kịch\s+bản|bài\s+viết)\s*[:\-–—]?|(?:mở\s+(?:đầu|bài)|kết\s+(?:thúc|bài|luận)|intro|body|outro|thân\s+bài|nội\s+dung\s+chính|dàn\s+ý(?:\s+chi\s+tiết)?)\s*[:\-–—])\s*",
         flags=re.IGNORECASE,
     )
     
@@ -2800,8 +2821,6 @@ def _run_complete(transcript: str, state: dict) -> dict:
             )
         else:
             navigate_to_chatgpt_project(page, project_url)
-
-        STRICT_NO_FILLER = "\n\nLƯU Ý QUAN TRỌNG: TRẢ LỜI TRỰC TIẾP VÀO NỘI DUNG. TUYỆT ĐỐI KHÔNG CHÀO HỎI, KHÔNG DẠ VÂNG, KHÔNG THÊM BẤT KỲ CÂU DẪN HAY GIẢI THÍCH NÀO (VD: 'Dưới đây là...', 'Trân trọng gửi bạn...'). CHỈ IN RA ĐÚNG NỘI DUNG CẦN VIẾT."
 
         prompts = get_active_prompts()
         pipeline = normalize_prompt_pipeline(state.get("pipeline"))

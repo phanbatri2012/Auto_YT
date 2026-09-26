@@ -107,8 +107,23 @@ class ChatGPTProjectTests(unittest.TestCase):
                 PROJECT_URL,
             )
 
-    def test_project_navigation_starts_from_global_bootstrap(self):
+    def test_project_navigation_direct_success(self):
         page = unittest.mock.Mock()
+        page.url = PROJECT_URL
+
+        with patch.object(chatgpt_worker, "wait_for_chatgpt_composer"):
+            chatgpt_worker.navigate_to_chatgpt_project(page, PROJECT_URL)
+
+        page.goto.assert_called_once_with(
+            PROJECT_URL,
+            wait_until="domcontentloaded",
+            timeout=chatgpt_worker.CHATGPT_NAVIGATION_TIMEOUT_MS,
+        )
+
+    def test_project_navigation_fallback_to_sidebar(self):
+        page = unittest.mock.Mock()
+        # Direct navigation raises exception or doesn't land on project URL
+        page.goto.side_effect = [Exception("Direct navigation failed"), None]
         page.url = PROJECT_URL
 
         with (
@@ -121,16 +136,11 @@ class ChatGPTProjectTests(unittest.TestCase):
         ):
             chatgpt_worker.navigate_to_chatgpt_project(page, PROJECT_URL)
 
-        page.goto.assert_called_once_with(
-            chatgpt_projects.DEFAULT_CHATGPT_BOOTSTRAP_URL,
-            wait_until="domcontentloaded",
-            timeout=chatgpt_worker.CHATGPT_NAVIGATION_TIMEOUT_MS,
-        )
         click_project.assert_called_once_with(page, PROJECT_URL)
-        page.wait_for_function.assert_called_once()
 
     def test_project_navigation_does_not_retry_when_login_is_required(self):
         page = unittest.mock.Mock()
+        page.url = PROJECT_URL
         attention_error = chatgpt_worker.ChatGPTAttentionRequiredError(
             "Phiên ChatGPT cần được xác minh."
         )
@@ -146,30 +156,6 @@ class ChatGPTProjectTests(unittest.TestCase):
             chatgpt_worker.navigate_to_chatgpt_project(page, PROJECT_URL)
 
         page.goto.assert_called_once()
-
-    def test_project_navigation_never_falls_back_to_direct_project_url(self):
-        page = unittest.mock.Mock()
-        page.url = chatgpt_projects.DEFAULT_CHATGPT_BOOTSTRAP_URL
-
-        with (
-            patch.object(chatgpt_worker, "wait_for_chatgpt_composer"),
-            patch.object(
-                chatgpt_worker,
-                "open_configured_project_from_sidebar",
-                return_value=False,
-            ),
-            self.assertRaisesRegex(RuntimeError, "No prompt was sent"),
-        ):
-            chatgpt_worker.navigate_to_chatgpt_project(page, PROJECT_URL)
-
-        self.assertEqual(
-            page.goto.call_count,
-            chatgpt_worker.CHATGPT_PROJECT_NAVIGATION_ATTEMPTS,
-        )
-        self.assertTrue(all(
-            call.args[0] == chatgpt_projects.DEFAULT_CHATGPT_BOOTSTRAP_URL
-            for call in page.goto.call_args_list
-        ))
 
     def test_project_sidebar_slug_matches_accented_project_name(self):
         self.assertEqual(

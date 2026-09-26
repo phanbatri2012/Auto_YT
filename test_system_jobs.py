@@ -104,9 +104,9 @@ class SystemJobTests(unittest.TestCase):
         status = main.get_maintenance_status()
 
         self.assertFalse(status["safe_to_restart"])
-        self.assertEqual(status["gpm_blocking_job_count"], 1)
+        self.assertEqual(status["summary"]["gpm_browsers"], 1)
         self.assertEqual(
-            status["gpm_blocking_jobs"][0]["id"],
+            status["blocking_jobs"][0]["id"],
             "comment-publish-maintenance",
         )
 
@@ -127,7 +127,7 @@ class SystemJobTests(unittest.TestCase):
         status = main.get_maintenance_status()
 
         self.assertTrue(status["safe_to_restart"])
-        self.assertEqual(status["gpm_blocking_job_count"], 0)
+        self.assertEqual(status["summary"]["gpm_browsers"], 0)
 
     def test_claims_video_jobs_in_fifo_order(self):
         self.create_job("first")

@@ -32,6 +32,7 @@ def list_system_job_blockers() -> list[dict[str, Any]]:
             FROM system_jobs
             LEFT JOIN videos ON videos.id = system_jobs.video_id
             WHERE system_jobs.status IN ('running', 'processing', 'in_progress', 'queued')
+              AND system_jobs.job_type != 'comment_publish'
             ORDER BY system_jobs.created_at ASC
             """
         ).fetchall()

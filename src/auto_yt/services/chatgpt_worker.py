@@ -121,6 +121,28 @@ THUMBNAIL_REPAIR_PROMPT = (
 THUMBNAIL_REGENERATE_PROMPT = (
     "Tạo ảnh theo prompt vừa được sửa ở ngay trên. Lưu ý: chỉ cần xuất ảnh của prompt mới sửa"
 )
+CHATGPT_COMPOSER_SELECTOR = (
+    "#prompt-textarea, "
+    "div.ProseMirror, "
+    "div[role='textbox'][contenteditable='true'], "
+    "div[data-composer-markdown], "
+    "textarea[placeholder*='Ask']"
+)
+CHATGPT_SEND_BUTTON_SELECTOR = (
+    'button[data-testid="send-button"], '
+    'button[aria-label="Send"], '
+    'button[aria-label="Gửi"], '
+    'button[aria-label="Send prompt"], '
+    'button[aria-label="Send message"], '
+    'button.bg-composer-primary'
+)
+CHATGPT_STOP_BUTTON_SELECTOR = (
+    'button[data-testid="stop-button"], '
+    'button[aria-label*="Stop generating"], '
+    'button[aria-label*="Stop streaming"], '
+    'button[aria-label*="Dừng tạo"], '
+    'button[aria-label*="Dừng phản hồi"]'
+)
 URL_LIKE_TOKEN_PATTERN = re.compile(
     r"(?:https?://|www\.)[^\s<>{}\[\]\"']+"
     r"|\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
@@ -562,7 +584,7 @@ def wait_for_thumbnail_images(
                     """
                 )
                 generation_active = (
-                    page.locator('[data-testid="stop-button"]').count() > 0
+                    page.locator(CHATGPT_STOP_BUTTON_SELECTOR).count() > 0
                 )
                 snapshot_error_logged = False
             except PlaywrightError as exc:
@@ -950,7 +972,9 @@ def get_chatgpt_load_state(page: Page) -> dict:
                     'security check', 'cloudflare', 'captcha', 'just a moment',
                     'xác minh bạn là con người', 'đang kiểm tra trình duyệt'
                 ];
-                const editor = document.querySelector('#prompt-textarea');
+                const editor = document.querySelector(
+                    '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
+                );
                 const turns = document.querySelectorAll(
                     '[data-testid^="conversation-turn-"], '
                     + '[data-message-author-role]'
@@ -1046,7 +1070,9 @@ def click_chatgpt_full_page_retry(page: Page) -> bool:
                         .trim()
                         .toLowerCase();
                     const retryLabels = ['try again', 'retry', 'thử lại'];
-                    const editor = document.querySelector('#prompt-textarea');
+                    const editor = document.querySelector(
+                        '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
+                    );
                     const turns = document.querySelectorAll(
                         '[data-testid^="conversation-turn-"], '
                         + '[data-message-author-role]'
@@ -1083,7 +1109,7 @@ def wait_for_chatgpt_composer(
     duplicate a prompt, and reload always stays in the current project or
     conversation instead of opening a new chat.
     """
-    prompt_textarea = page.locator('#prompt-textarea').first
+    prompt_textarea = page.locator(CHATGPT_COMPOSER_SELECTOR).first
     retry_clicked = False
     last_state: dict = {}
     last_error: Exception | None = None
@@ -1575,7 +1601,9 @@ def history_prompt_text_matches(expected_text: str, rendered_text: str) -> bool:
 
 def replace_prompt_text_with_javascript(page: Page, prompt_text: str) -> None:
     page.evaluate("""(text) => {
-        const el = document.querySelector('#prompt-textarea');
+        const el = document.querySelector(
+            '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
+        );
         if (!el) return;
         el.focus();
         const selection = window.getSelection();
@@ -1994,7 +2022,7 @@ def recover_assistant_response_after_reload(
         )
         check_chatgpt_page_attention(page)
         ensure_expected_conversation_page(page.url, expected_url)
-        page.locator('#prompt-textarea').first.wait_for(
+        page.locator(CHATGPT_COMPOSER_SELECTOR).first.wait_for(
             state="visible",
             timeout=CHATGPT_COMPOSER_WAIT_PER_ATTEMPT_MS,
         )
@@ -2120,7 +2148,7 @@ def send_prompt(
     try:
         page.wait_for_function(
             """() => {
-                return document.querySelector('[data-testid="stop-button"]') === null;
+                return document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="Dừng"]') === null;
             }""",
             timeout=CHATGPT_RESPONSE_TIMEOUT_SECONDS * 1000
         )
@@ -2179,24 +2207,32 @@ def send_prompt(
                 dt.items.add(file);
             });
 
-            const textarea = document.querySelector('#prompt-textarea');
-            textarea.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+            const textarea = document.querySelector(
+                '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
+            );
+            if (textarea) {
+                textarea.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+            }
         }
         """
         page.evaluate(js, reference_image_base64)
         page.wait_for_timeout(2000)
 
     # Now wait for the send button to appear and be enabled
-    send_btn = page.locator('[data-testid="send-button"]').first
+    send_btn = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first
     send_button_ready_script = """() => {
-        const btn = document.querySelector('[data-testid="send-button"]');
+        const btn = document.querySelector(
+            'button[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Gửi"], button[aria-label="Send prompt"], button[aria-label="Send message"], button.bg-composer-primary'
+        );
         return btn && !btn.disabled;
     }"""
     try:
         page.wait_for_function(send_button_ready_script, timeout=30000)
     except Exception as e:
         page.evaluate("""() => {
-            const el = document.querySelector('#prompt-textarea');
+            const el = document.querySelector(
+                '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
+            );
             if (!el) return;
             el.dispatchEvent(new InputEvent('input', {
                 bubbles: true,
@@ -2209,8 +2245,12 @@ def send_prompt(
             page.wait_for_function(send_button_ready_script, timeout=10000)
         except Exception:
             diagnostics = page.evaluate("""() => {
-                const editor = document.querySelector('#prompt-textarea');
-                const button = document.querySelector('[data-testid="send-button"]');
+                const editor = document.querySelector(
+                    '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
+                );
+                const button = document.querySelector(
+                    'button[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Gửi"], button[aria-label="Send prompt"], button[aria-label="Send message"], button.bg-composer-primary'
+                );
                 return {
                     editorTextLength: editor?.innerText?.length ?? 0,
                     sendButtonFound: Boolean(button),
@@ -2224,7 +2264,7 @@ def send_prompt(
                 # ChatGPT occasionally leaves the composer unmounted after a long
                 # insert. Reloading the same conversation restores its saved draft.
                 page.reload(wait_until="domcontentloaded", timeout=60000)
-                prompt_textarea = page.locator('#prompt-textarea').first
+                prompt_textarea = page.locator(CHATGPT_COMPOSER_SELECTOR).first
                 prompt_textarea.wait_for(state="visible", timeout=60000)
 
                 restored_draft = prompt_textarea.inner_text().strip()
@@ -2237,11 +2277,15 @@ def send_prompt(
                 # again before sending to avoid returning an earlier response.
                 page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"]').forEach(el => el.classList.add('my-old-msg'))")
                 page.wait_for_function(send_button_ready_script, timeout=30000)
-                send_btn = page.locator('[data-testid="send-button"]').first
+                send_btn = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first
             except Exception as recovery_error:
                 recovery_diagnostics = page.evaluate("""() => {
-                    const editor = document.querySelector('#prompt-textarea');
-                    const button = document.querySelector('[data-testid="send-button"]');
+                    const editor = document.querySelector(
+                        '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
+                    );
+                    const button = document.querySelector(
+                        'button[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Gửi"], button[aria-label="Send prompt"], button[aria-label="Send message"], button.bg-composer-primary'
+                    );
                     return {
                         editorTextLength: editor?.innerText?.length ?? 0,
                         sendButtonFound: Boolean(button),
@@ -2263,12 +2307,14 @@ def send_prompt(
     try:
         page.wait_for_function(
             """(baseline) => {
-                const editor = document.querySelector('#prompt-textarea');
+                const editor = document.querySelector(
+                    '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
+                );
                 const userTurns = document.querySelectorAll(
                     '[data-message-author-role="user"]'
                 ).length;
                 const generationStarted = Boolean(
-                    document.querySelector('[data-testid="stop-button"]')
+                    document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="Dừng"]')
                 );
                 const editorCleared = Boolean(
                     editor && (editor.innerText || editor.textContent || '').trim() === ''
@@ -3049,7 +3095,7 @@ def generate_chapters_only(
                 try:
                     page.wait_for_function(
                         """() => document.querySelector(
-                            '[data-testid="stop-button"]'
+                            '[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="Dừng"]'
                         ) === null""",
                         timeout=CHATGPT_RESPONSE_TIMEOUT_SECONDS * 1000,
                     )

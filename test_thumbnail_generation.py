@@ -9,7 +9,10 @@ from playwright.sync_api import Error as PlaywrightError
 
 from auto_yt import main
 from auto_yt.services.chatgpt_worker import (
+    CHATGPT_COMPOSER_SELECTOR,
     CHATGPT_RESPONSE_TIMEOUT_SECONDS,
+    CHATGPT_SEND_BUTTON_SELECTOR,
+    CHATGPT_STOP_BUTTON_SELECTOR,
     ChatGPTGenerationTimeoutError,
     THUMBNAIL_REGENERATE_PROMPT,
     THUMBNAIL_REPAIR_PROMPT,
@@ -373,7 +376,9 @@ class ThumbnailGenerationTests(unittest.TestCase):
         ]
         stop_button.count.return_value = 0
         page.locator.side_effect = lambda selector: (
-            stop_button if selector == '[data-testid="stop-button"]' else turn
+            stop_button
+            if selector in (CHATGPT_STOP_BUTTON_SELECTOR, '[data-testid="stop-button"]')
+            else turn
         )
         download_image = MagicMock(
             side_effect=(
@@ -421,7 +426,9 @@ class ThumbnailGenerationTests(unittest.TestCase):
         }]
         stop_button.count.side_effect = (1, 0)
         page.locator.side_effect = lambda selector: (
-            stop_button if selector == '[data-testid="stop-button"]' else turn
+            stop_button
+            if selector in (CHATGPT_STOP_BUTTON_SELECTOR, '[data-testid="stop-button"]')
+            else turn
         )
 
         with (
@@ -459,7 +466,9 @@ class ThumbnailGenerationTests(unittest.TestCase):
         )
         stop_button.count.return_value = 0
         page.locator.side_effect = lambda selector: (
-            stop_button if selector == '[data-testid="stop-button"]' else turn
+            stop_button
+            if selector in (CHATGPT_STOP_BUTTON_SELECTOR, '[data-testid="stop-button"]')
+            else turn
         )
 
         with (
@@ -489,7 +498,9 @@ class ThumbnailGenerationTests(unittest.TestCase):
         prompt_locator.first = prompt_textarea
         send_locator.first = send_button
         page.locator.side_effect = lambda selector: (
-            prompt_locator if selector == "#prompt-textarea" else send_locator
+            prompt_locator
+            if selector in (CHATGPT_COMPOSER_SELECTOR, "#prompt-textarea")
+            else send_locator
         )
         page.wait_for_function.side_effect = (None, None, None)
 
@@ -525,7 +536,9 @@ class ThumbnailGenerationTests(unittest.TestCase):
         prompt_locator.first = prompt_textarea
         send_locator.first = send_button
         page.locator.side_effect = lambda selector: (
-            prompt_locator if selector == "#prompt-textarea" else send_locator
+            prompt_locator
+            if selector in (CHATGPT_COMPOSER_SELECTOR, "#prompt-textarea")
+            else send_locator
         )
 
         with (
@@ -554,7 +567,9 @@ class ThumbnailGenerationTests(unittest.TestCase):
         prompt_locator.first = prompt_textarea
         send_locator.first = send_button
         page.locator.side_effect = lambda selector: (
-            prompt_locator if selector == "#prompt-textarea" else send_locator
+            prompt_locator
+            if selector in (CHATGPT_COMPOSER_SELECTOR, "#prompt-textarea")
+            else send_locator
         )
 
         with (
